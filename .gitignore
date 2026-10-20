@@ -9,6 +9,32 @@ coverage/
 .env.*
 !.env.example
 .npmrc
+# Local Electron profiles must never be published, even after a misconfigured launch.
+/state*.json
+/state.json.corrupt-*
+/.backup-*.tmp
+/attachments/
+/.state-*.tmp
+/.file-edit-*/
+/files/
+/text/
+/Cache/
+/Code Cache/
+/DawnGraphiteCache/
+/DawnWebGPUCache/
+/GPUCache/
+/GPUPersistentCache/
+/GrShaderCache/
+/Local Storage/
+/Session Storage/
+/Network/
+/ShaderCache/
+/Shared Dictionary/
+/DIPS*
+/Local State
+/Preferences
+/lockfile
+/declarative_performance_observer.db*
 .DS_Store
 Thumbs.db
 *.dmp

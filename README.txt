@@ -1,7 +1,7 @@
-Muse Windows — 可运行的桌面重建版本 0.1.1
+Muse Windows — 可运行的桌面重建版本 0.2.0
 
 开始使用
-1. 打开 release\Muse-Windows-0.1.1-win32-x64\Muse.exe。
+1. 打开 release\Muse-Windows-0.2.0-win32-x64\Muse.exe。
    或把同目录 ZIP 完整解压后，双击其中的 Muse.exe。请保留整个文件夹。
 2. 打开左下角“设置”，填写自己的模型 API 地址、模型名称和 API Key。
    支持 OpenAI 兼容的 /chat/completions 服务；本地无密钥服务可留空 Key。
@@ -15,6 +15,7 @@ Muse Windows — 可运行的桌面重建版本 0.1.1
 - 工作区名称、描述、颜色、资料和关联对话。
 - 文件选择/拖放、本地副本、文本预览；文本、Markdown、代码、CSV/JSON、DOCX及文字PDF提取。
 - 工作区参考文档与显式附件参与模型上下文。
+- 工作区内新建文本文件、多标签编辑、Markdown预览、Ctrl+S保存、冲突保护和关闭前提示。
 - 模型列表、连接检查、系统提示词、温度、浅色/深色/系统主题。
 - Markdown/JSON对话导出、全部数据备份、安全合并导入。
 - Windows本机密钥加密；API Key不会出现在界面快照或数据备份里。
@@ -32,7 +33,7 @@ Muse Windows — 可运行的桌面重建版本 0.1.1
   此程序是按已恢复交互模型独立实现的Windows客户端，不宣称与原产品功能完全相同。
 
 验证
-- 36项后端/宿主回归检查通过：流、取消、密钥隔离、请求配置冻结、工作区隔离、附件优先、备份及真实文档提取。
+- 50项后端/宿主检查通过，另有32项真实Electron桌面检查通过；模型服务仍使用本机模拟。
 - 真实Electron桌面验收覆盖设置表单、工作区创建、聊天、文件上下文、重试/停止、DPAPI和PDF/DOCX。
 - 桌面验收使用独立目录和本机确定性模拟服务；尚未使用你的真实API凭据做请求。
 - 运行桌面验收后，截图和结构化结果保存在本地 test-results 目录，此目录不提交到仓库。
@@ -50,5 +51,5 @@ Muse Windows — 可运行的桌面重建版本 0.1.1
 
 源码：main.cjs / preload.cjs / backend / renderer。
 公共接口契约：CONTRACT.txt。
-公开文档：README.md。
+公开文档：README.md；完整目标现状：docs\reconstruction-status.md。
 项目源码采用MIT许可，第三方依赖遵循各自许可。此项目与原Muse产品无隶属关系。

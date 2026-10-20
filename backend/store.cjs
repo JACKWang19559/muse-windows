@@ -3,19 +3,42 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { MAX_FILE_BYTES, MAX_TEXT_CHARS, describeFile, extractDocument } = require('./documents.cjs');
+const { TextDecoder } = require('node:util');
+const { MAX_FILE_BYTES, MAX_TEXT_CHARS, TEXT_EXTENSIONS, describeFile, extractDocument } = require('./documents.cjs');
 
 const STATE_VERSION = 1;
 const BACKUP_FORMAT = 'muse-windows-backup';
 const MAX_BACKUP_BYTES = 250 * 1024 * 1024;
 const MAX_BACKUP_JSON_BYTES = 150 * 1024 * 1024;
 const MAX_STATE_BYTES = 100 * 1024 * 1024;
+const MAX_EDITABLE_FILE_BYTES = 1024 * 1024;
+const FILE_EDIT_DIRECTORY = /^\.file-edit-[0-9a-f-]{36}$/;
 const ID = /^[A-Za-z0-9_-]{1,100}$/;
 const DEFAULTS = { baseUrl: 'https://api.openai.com/v1', model: '', systemPrompt: '你是一位认真、清晰、乐于协作的 AI 助手。请优先使用中文回答，并明确区分事实与推测。', temperature: 0.7, theme: 'system', language: 'zh', transcriptionModel: '' };
 const SETTINGS_KEYS = Object.keys(DEFAULTS);
 const stamp = () => new Date().toISOString();
 const uid = kind => `${kind}_${crypto.randomUUID()}`;
 const copy = value => structuredClone(value);
+const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
+
+function safeTextName(value) {
+  const name = safeName(value), stem = name.split('.')[0].replace(/[. ]+$/, '');
+  if (/[\p{Cc}\p{Cf}]/u.test(name) || /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])$/i.test(stem)) fail('文件名包含控制字符或 Windows 保留名称。');
+  if (!TEXT_EXTENSIONS.has(describeFile(name).ext)) fail('只能创建文本、Markdown、代码、JSON 或 CSV 等文本文件。');
+  return name;
+}
+function decodeEditableText(bytes) {
+  const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) fail('文本包含不支持的控制字符。');
+  return text.replace(/\r\n?/g, '\n');
+}
+function textFileBytes(content) {
+  string(content, '文本内容', MAX_TEXT_CHARS);
+  const bytes = Buffer.from(content, 'utf8');
+  if (bytes.length > MAX_EDITABLE_FILE_BYTES || bytes.toString('utf8') !== content) fail('文本不是有效的 UTF-8，或超过 1 MB 编辑上限。');
+  decodeEditableText(bytes);
+  return bytes;
+}
 
 function fail(message) { throw new Error(message); }
 function filesystemFailure(error, message) { if (typeof error?.code === 'string') fail(message); throw error; }
@@ -74,6 +97,7 @@ function publicFile(value) {
   const result = { id: value.id, name: value.name, mime: value.mime, size: value.size, workspaceId: value.workspaceId, createdAt: value.createdAt, textStatus: value.textStatus };
   if (value.textPreview) result.textPreview = value.textPreview;
   if (value.error) result.error = value.error;
+  if (value._sha256) result.sha256 = value._sha256;
   return result;
 }
 function fileShape(value, internal = false) {
@@ -86,6 +110,8 @@ function fileShape(value, internal = false) {
     const expected = `${result.id}.${describeFile(result.name).managedExtension}`;
     if (value._storedName !== expected || value._textName !== `${result.id}.text` || typeof value._textTruncated !== 'boolean') fail('本地文件路径记录无效。');
     result._storedName = expected; result._textName = value._textName; result._textTruncated = value._textTruncated;
+    if (value._sha256 != null) { if (typeof value._sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value._sha256)) fail('本地文件校验值无效。'); result._sha256 = value._sha256; }
+    if (value._contentRevision != null) result._contentRevision = identifier(value._contentRevision, '文件内容版本');
   }
   return result;
 }
@@ -134,6 +160,7 @@ class Store {
         this.recoveryNotice = '本地数据文件损坏，已恢复上一次自动备份。损坏文件已保留。';
       }
     }
+    this._recoverFileEdits();
     let interrupted = false;
     for (const chat of this.state.chats) for (const message of chat.messages) if (message.status === 'streaming') { message.status = 'cancelled'; interrupted = true; }
     if (interrupted) this.recoveryNotice = '上次关闭时仍在生成的消息已标记为已停止，可以重试。';
@@ -159,6 +186,81 @@ class Store {
       if (!stat.isFile() || stat.isSymbolicLink()) fail('附件包含不安全的链接。');
     } else if (mustExist) fail('附件副本不存在，可能已被移动或删除。');
     return filename;
+  }
+  _writeSynced(filename, bytes) {
+    let handle;
+    try { handle = fs.openSync(filename, 'wx', 0o600); fs.writeFileSync(handle, bytes); fs.fsyncSync(handle); }
+    finally { if (handle != null) fs.closeSync(handle); }
+  }
+  _replaceManagedBytes(name, bytes) {
+    const target = this._managedPath(name), temporary = path.join(this.attachmentsDir, `.edit-${crypto.randomUUID()}.tmp`);
+    try { this._writeSynced(temporary, bytes); this._managedPath(name); fs.renameSync(temporary, target); }
+    finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
+  }
+  _assertEditDirectory(directory) {
+    if (path.dirname(directory) !== this.dataDir || !FILE_EDIT_DIRECTORY.test(path.basename(directory))) fail('文件编辑恢复目录无效。');
+    const stat = fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(directory) !== directory) fail('文件编辑恢复目录不安全。');
+  }
+  _writeEditManifest(directory, journal) {
+    this._assertEditDirectory(directory);
+    const temporary = path.join(directory, 'manifest.tmp'), target = path.join(directory, 'manifest.json');
+    try { this._writeSynced(temporary, JSON.stringify(journal)); fs.renameSync(temporary, target); }
+    finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
+  }
+  _readEditPart(directory, name, digest) {
+    this._assertEditDirectory(directory);
+    const filename = path.join(directory, name), stat = fs.lstatSync(filename);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_EDITABLE_FILE_BYTES) fail('文件编辑恢复数据无效。');
+    const bytes = fs.readFileSync(filename);
+    if (bytes.length > MAX_EDITABLE_FILE_BYTES || sha256(bytes) !== digest) fail('文件编辑恢复数据校验失败。');
+    return bytes;
+  }
+  _cleanupFileEdit(directory) {
+    this._assertEditDirectory(directory);
+    for (const name of ['manifest.json', 'manifest.tmp', 'before-source', 'before-text', 'after-source', 'after-text']) {
+      const filename = path.join(directory, name);
+      try { fs.unlinkSync(filename); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    fs.rmdirSync(directory);
+  }
+  _restoreFileEdit(directory, journal, side) {
+    const metadata = journal[side];
+    const source = this._readEditPart(directory, `${side}-source`, journal[`${side}SourceSha256`]);
+    const text = this._readEditPart(directory, `${side}-text`, journal[`${side}TextSha256`]);
+    this._replaceManagedBytes(metadata._storedName, source);
+    this._replaceManagedBytes(metadata._textName, text);
+  }
+  _recoverFileEdits() {
+    for (const entry of fs.readdirSync(this.dataDir, { withFileTypes: true })) {
+      if (!FILE_EDIT_DIRECTORY.test(entry.name)) continue;
+      const directory = path.join(this.dataDir, entry.name);
+      this._assertEditDirectory(directory);
+      const manifest = path.join(directory, 'manifest.json');
+      if (!fs.existsSync(manifest)) { this._cleanupFileEdit(directory); continue; }
+      const stat = fs.lstatSync(manifest);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) fail('文件编辑恢复记录无效，已保留恢复数据。');
+      const journal = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+      if (journal.version !== 1 || !['prepared', 'committed'].includes(journal.phase)) fail('文件编辑恢复版本无效。');
+      const before = fileShape(journal.before, true), after = fileShape(journal.after, true);
+      if (before.id !== after.id || before._storedName !== after._storedName || before._textName !== after._textName || !after._contentRevision || before._contentRevision === after._contentRevision) fail('文件编辑恢复对象不匹配。');
+      const current = this.state.files.find(file => file.id === after.id);
+      // A later edit/delete makes an old committed journal obsolete. Never
+      // resurrect deleted files or roll back a newer revision after cleanup fails.
+      if (!current || current._storedName !== after._storedName || current._contentRevision !== before._contentRevision && current._contentRevision !== after._contentRevision) { this._cleanupFileEdit(directory); continue; }
+      const side = current._contentRevision === after._contentRevision || journal.phase === 'committed' ? 'after' : 'before';
+      this._restoreFileEdit(directory, journal, side);
+      const selected = side === 'after' ? after : before;
+      for (const key of ['size', 'mime', 'textStatus', 'textPreview', '_textTruncated', '_sha256', '_contentRevision']) {
+        if (key in selected) current[key] = selected[key]; else delete current[key];
+      }
+      if (selected.error) current.error = selected.error; else delete current.error;
+      this.state = stateShape(this.state);
+      // Align the automatic metadata backup with the recovered file bytes too.
+      this._persistState(this.state); this._persistState(this.state);
+      this._cleanupFileEdit(directory);
+      this.recoveryNotice = '已恢复上次中断的文件编辑，文件与预览保持一致。';
+    }
   }
   _persistState(state) {
     const json = JSON.stringify(state);
@@ -244,7 +346,7 @@ class Store {
   }
   async _prepareFile(buffer, name, workspaceId) {
     const id = uid('file'), ext = describeFile(name).managedExtension, extracted = await extractDocument(buffer, name);
-    const item = { id, name, mime: extracted.mime, size: buffer.length, workspaceId, createdAt: stamp(), textStatus: extracted.textStatus, textPreview: extracted.text.slice(0, 1000), ...(extracted.error ? { error: extracted.error } : {}), _storedName: `${id}.${ext}`, _textName: `${id}.text`, _textTruncated: extracted.truncated };
+    const item = { id, name, mime: extracted.mime, size: buffer.length, workspaceId, createdAt: stamp(), textStatus: extracted.textStatus, textPreview: extracted.text.slice(0, 1000), ...(extracted.error ? { error: extracted.error } : {}), _storedName: `${id}.${ext}`, _textName: `${id}.text`, _textTruncated: extracted.truncated, _sha256: sha256(buffer), _contentRevision: uid('revision') };
     const written = [];
     try { for (const [name, data] of [[item._storedName, buffer], [item._textName, extracted.text]]) { const filename = this._managedPath(name); fs.writeFileSync(filename, data, { flag: 'wx', mode: 0o600 }); written.push(filename); } }
     catch (error) { for (const filename of written) fs.unlinkSync(filename); throw error; }
@@ -267,6 +369,57 @@ class Store {
     try { return this._commit(next => { this._workspaceId(workspaceId, next); next.files.push(item); return publicFile(item); }); }
     catch (error) { this._discardFile(item); throw error; }
   }
+  async createTextFile(input) {
+    record(input, '新文件'); onlyKeys(input, ['workspaceId', 'name', 'content'], '新文件');
+    const name = safeTextName(input.name), workspaceId = this._workspaceId(input.workspaceId);
+    const bytes = textFileBytes(input.content ?? '');
+    const item = await this._prepareFile(bytes, name, workspaceId);
+    try {
+      this._commit(next => { this._workspaceId(workspaceId, next); next.files.push(item); return null; });
+      return { file: this.getFile(item.id), preview: this.readFile(item.id) };
+    } catch (error) { this._discardFile(item); throw error; }
+  }
+  saveTextFile(input) {
+    record(input, '保存文件'); onlyKeys(input, ['id', 'content', 'expectedSha256'], '保存文件');
+    const item = this._file(input.id);
+    if (typeof input.expectedSha256 !== 'string' || !/^[a-fA-F0-9]{64}$/.test(input.expectedSha256)) fail('保存文件需要有效的原内容校验值，请重新载入文件。');
+    const preview = this.readFile(item.id);
+    if (preview.sha256 !== input.expectedSha256.toLowerCase()) fail('文件已被其他编辑器修改，请重新载入后再保存。');
+    if (!preview.editable) fail('此文件只能预览；只允许编辑未截取、1 MB 以内的 UTF-8 普通文本。');
+    const bytes = textFileBytes(input.content), text = decodeEditableText(bytes);
+    const beforeSource = fs.readFileSync(this._managedPath(item._storedName, true));
+    if (sha256(beforeSource) !== preview.sha256) fail('文件已发生变化，请重新载入后再保存。');
+    if (beforeSource.equals(bytes)) return { file: this.getFile(item.id), preview };
+    const beforeText = fs.readFileSync(this._managedPath(item._textName, true));
+    const after = { ...copy(item), size: bytes.length, textStatus: 'ready', textPreview: text.slice(0, 1000), _textTruncated: false, _sha256: sha256(bytes), _contentRevision: uid('revision') };
+    delete after.error;
+    const directory = path.join(this.dataDir, `.file-edit-${crypto.randomUUID()}`);
+    const journal = { version: 1, phase: 'prepared', before: copy(item), after,
+      beforeSourceSha256: sha256(beforeSource), beforeTextSha256: sha256(beforeText), afterSourceSha256: after._sha256, afterTextSha256: sha256(Buffer.from(text, 'utf8')) };
+    fs.mkdirSync(directory, { mode: 0o700 });
+    let prepared = false, committed = false;
+    try {
+      for (const [name, content] of [['before-source', beforeSource], ['before-text', beforeText], ['after-source', bytes], ['after-text', Buffer.from(text, 'utf8')]]) this._writeSynced(path.join(directory, name), content);
+      this._writeEditManifest(directory, journal); prepared = true;
+      this._restoreFileEdit(directory, journal, 'after');
+      this._commit(next => { Object.assign(this._file(item.id, next), after); delete this._file(item.id, next).error; return null; });
+      committed = true;
+    } catch (error) {
+      // An OS error can arrive after the durable state rename. Read its revision
+      // before deciding to undo file bytes; otherwise disk and memory may diverge.
+      try { const disk = this._load(this.statePath); if (disk.files.find(file => file.id === item.id)?._contentRevision === after._contentRevision) { this.state = disk; committed = true; } } catch {}
+      if (!committed) {
+        try { if (prepared) this._restoreFileEdit(directory, journal, 'before'); this._cleanupFileEdit(directory); }
+        catch { fail('文件保存被中断，恢复数据已保留；请重新打开应用后再编辑。'); }
+        filesystemFailure(error, '无法保存文件，原内容已恢复。请检查磁盘空间和文件权限。');
+      }
+    }
+    // Commit the decision before synchronizing the automatic state backup. A
+    // retained journal lets startup finish a committed edit even from that backup.
+    try { journal.phase = 'committed'; this._writeEditManifest(directory, journal); this._persistState(this.state); this._cleanupFileEdit(directory); }
+    catch { /* The committed bytes/state are valid; startup can finish cleanup. */ }
+    return { file: this.getFile(item.id), preview: this.readFile(item.id) };
+  }
   removeFile(id) {
     const item = this._file(id); this._managedPath(item._storedName); this._managedPath(item._textName);
     this._commit(next => { next.files = next.files.filter(file => file.id !== id); for (const chat of next.chats) for (const message of chat.messages) if (message.attachmentIds) message.attachmentIds = message.attachmentIds.filter(fileId => fileId !== id); return null; });
@@ -279,7 +432,17 @@ class Store {
     if (item.textStatus !== 'ready') fail(item.error || '此文件格式不支持文字预览。');
     const filename = this._managedPath(item._textName, true), stat = fs.statSync(filename);
     if (stat.size > 4 * MAX_TEXT_CHARS + 16) fail('文件预览缓存无效。');
-    const text = fs.readFileSync(filename, 'utf8'); return { name: item.name, text: text.slice(0, MAX_TEXT_CHARS), truncated: item._textTruncated || text.length > MAX_TEXT_CHARS };
+    const text = fs.readFileSync(filename, 'utf8'), truncated = item._textTruncated || text.length > MAX_TEXT_CHARS;
+    const source = this._managedPath(item._storedName, true), sourceStat = fs.statSync(source);
+    if (sourceStat.size > MAX_FILE_BYTES) fail('文件副本超出大小限制。');
+    const bytes = fs.readFileSync(source);
+    if (bytes.length > MAX_FILE_BYTES) fail('文件副本超出大小限制。');
+    const digest = sha256(bytes);
+    let editable = false;
+    if (!truncated && bytes.length <= MAX_EDITABLE_FILE_BYTES && TEXT_EXTENSIONS.has(describeFile(item.name).ext) && (!item._sha256 || item._sha256 === digest)) {
+      try { editable = decodeEditableText(bytes) === text; } catch { /* Binary/non-UTF8 text remains preview-only. */ }
+    }
+    return { name: item.name, text: text.slice(0, MAX_TEXT_CHARS), truncated, sha256: digest, editable };
   }
   // Convenience for the main process: a new/global chat does not implicitly see
   // every unscoped file; cross-workspace files require an explicit attachment.
@@ -331,4 +494,4 @@ class Store {
   flush() { this._persistState(this.state); }
 }
 
-module.exports = { Store, DEFAULTS, BACKUP_FORMAT, STATE_VERSION, MAX_BACKUP_JSON_BYTES };
+module.exports = { Store, DEFAULTS, BACKUP_FORMAT, STATE_VERSION, MAX_BACKUP_JSON_BYTES, MAX_EDITABLE_FILE_BYTES };

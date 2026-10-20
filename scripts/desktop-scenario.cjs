@@ -113,6 +113,56 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
       const detached=await page(input=>window.muse.deleteWorkspace(input),{id:workspace.id});
       check('Workspace deletion preserves and detaches remaining documents',detached.files.filter(f=>f.workspaceId===null).length===2&&detached.workspaces.length===1);
     }finally{dialog.showSaveDialog=originalSave;dialog.showOpenDialog=originalOpen;}
+    await page(()=>Array.from(document.querySelectorAll('.settings-footer button')).find(x=>x.textContent==='关闭').click());
+    await page(()=>document.querySelector('[data-testid="workspace-nav"]').click());
+    await wait(()=>!!document.querySelector('[data-testid="workspace-file-new"]'));
+    const createEditorFile=async name=>{
+      await page(()=>document.querySelector('[data-testid="workspace-file-new"]').click());
+      await wait(()=>!!document.querySelector('[data-testid="new-file-name"]'));
+      await fill('new-file-name',name);
+      await page(()=>document.querySelector('[data-testid="new-file-create"]').click());
+      await wait(()=>!!document.querySelector('[data-testid="file-edit-mode"]:not(:disabled)'));
+      return await page(async name=>(await window.muse.bootstrap()).files.find(file=>file.name===name),name);
+    };
+    const editorFile=await createEditorFile('编辑验收.md');
+    await page(()=>document.querySelector('[data-testid="file-edit-mode"]').click());
+    await fill('file-editor-input','## 编辑验收\n\nSOURCE-EDIT-42');
+    await page(()=>document.querySelector('[data-testid="file-save"]').click());
+    await wait(async id=>(await window.muse.readFile({id})).text.includes('SOURCE-EDIT-42'),editorFile.id);
+    check('New Markdown file is created and saved through the rendered editor',true);
+    const secondFile=await createEditorFile('第二份.md');
+    await page(()=>document.querySelector('[data-testid="file-edit-mode"]').click());
+    await fill('file-editor-input','未保存的第二个标签页');
+    await page(()=>document.querySelector('[role="tab"][title="编辑验收.md"]').click());
+    await page(()=>document.querySelector('[data-testid="file-preview-mode"]').click());
+    check('Multiple file tabs retain drafts and render sanitized Markdown',await page(()=>document.querySelectorAll('.file-tab').length===2&&!!Array.from(document.querySelectorAll('.file-editor h2')).find(x=>x.textContent==='编辑验收')&&!!document.querySelector('[aria-label="未保存"]')));
+    await page(()=>document.querySelector('[role="tab"][title="第二份.md"]').click());
+    check('Switching file tabs preserves unsaved editor text',await page(()=>document.querySelector('[data-testid="file-editor-input"]')?.value==='未保存的第二个标签页'));
+    await page(()=>document.querySelector('[aria-label="关闭文件 第二份.md"]').click());
+    await wait(()=>!!document.querySelector('[data-testid="file-save-and-close"]'));
+    check('Closing a dirty file requires an explicit save or discard choice',true);
+    await page(()=>document.querySelector('[data-testid="file-save-and-close"]').click());
+    await wait(()=>document.querySelectorAll('.file-tab').length===1);
+    check('Save-and-close persists the draft before closing its tab',(await page(id=>window.muse.readFile({id}),secondFile.id)).text==='未保存的第二个标签页');
+    await page(()=>document.querySelector('[data-testid="file-edit-mode"]').click());
+    await fill('file-editor-input','THIS DRAFT MUST SURVIVE A CANCELLED WINDOW CLOSE');
+    const nativeMessage=dialog.showMessageBoxSync;
+    let closePrompts=0;
+    try{dialog.showMessageBoxSync=()=>{closePrompts++;return 0;};window.close();await new Promise(resolve=>setTimeout(resolve,200));}
+    finally{dialog.showMessageBoxSync=nativeMessage;}
+    check('Native window close preserves unsaved files when Continue is selected',!window.isDestroyed()&&closePrompts===1);
+    const external=await page(async id=>{const before=await window.muse.readFile({id});return window.muse.saveTextFile({id,content:'EXTERNAL EDIT MUST NOT BE OVERWRITTEN',expectedSha256:before.sha256});},editorFile.id);
+    await page(()=>document.querySelector('[data-testid="file-save"]').click());
+    await wait(()=>!!document.querySelector('.editor-error'));
+    check('Stale editor save detects a conflict and preserves the newer file',(await page(id=>window.muse.readFile({id}),editorFile.id)).text==='EXTERNAL EDIT MUST NOT BE OVERWRITTEN');
+    check('Conflict keeps the unsaved local draft available',await page(()=>document.querySelector('[data-testid="file-editor-input"]')?.value==='THIS DRAFT MUST SURVIVE A CANCELLED WINDOW CLOSE'));
+    await window.webContents.capturePage().then(image=>fs.writeFileSync(path.join(folder,'file-editor.png'),image.toPNG()));
+    await page(()=>document.querySelector('.editor-error button').click());
+    await wait(()=>!!document.querySelector('[data-testid="file-discard"]'));
+    await page(()=>document.querySelector('[data-testid="file-discard"]').click());
+    await wait(()=>document.querySelector('.file-editor .markdown')?.textContent.trim()==='EXTERNAL EDIT MUST NOT BE OVERWRITTEN');
+    check('Explicit discard-and-reload recovers the newest managed file',true);
+    await page(()=>document.querySelector('[aria-label="关闭文件预览"]').click());
     const report={passed:true,checks,check_count:checks.length,provider:'local deterministic test server only',target_mac_app_executed:false};
     fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify(report,null,2));
     app.exit(0);

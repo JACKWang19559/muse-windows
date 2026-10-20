@@ -5,9 +5,11 @@ const crypto = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const { Store } = require('./backend/store.cjs');
 const provider = require('./backend/provider.cjs');
+const { assertLiveTestProfile } = require('./backend/live-test-profile.cjs');
 
 app.setName('Muse Windows');
-const testMode = process.argv.includes('--desktop-test');
+const liveProviderTest = process.argv.includes('--live-provider-test');
+const testMode = process.argv.includes('--desktop-test') || liveProviderTest;
 const dataArg = process.argv.find(x => x.startsWith('--data-dir='));
 if (dataArg) app.setPath('userData', path.resolve(dataArg.slice(11)));
 if (testMode) app.disableHardwareAcceleration();
@@ -171,6 +173,8 @@ const operations = {
   },
   importDroppedPaths: input => { if (!Array.isArray(input.paths) || input.paths.some(p => typeof p !== 'string')) throw new Error('拖入的文件无效。'); return addFiles(input.paths, input.workspaceId); },
   removeFile: input => { store.removeFile(id(input.id)); return refresh(); },
+  createTextFile: async input => { const result = await store.createTextFile(input || {}); refresh(); return result; },
+  saveTextFile: input => { const result = store.saveTextFile(input || {}); refresh(); return result; },
   readFile: input => store.readFile(id(input.id)),
   openFile: async input => {
     const target = store.filePath(id(input.id));
@@ -215,14 +219,19 @@ function createWindow() {
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#141414' : '#faf9f6', title: 'Muse', icon: path.join(__dirname, 'assets', 'icon.png'),
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, backgroundThrottling: !testMode, offscreen: testMode } });
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  window.webContents.on('will-prevent-unload', event => {
+    const choice = dialog.showMessageBoxSync(window, { type: 'warning', title: '有未保存的文件', message: '文件还有未保存的修改。', detail: '继续编辑并保存，或放弃这些修改后关闭。', buttons: ['继续编辑', '放弃修改并关闭'], defaultId: 0, cancelId: 0, noLink: true });
+    if (choice === 1) event.preventDefault();
+  });
   window.webContents.on('will-navigate', (event, target) => { if (target.split('#')[0] !== rendererURL) event.preventDefault(); });
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-  window.loadFile(rendererFile);
+  window.loadFile(rendererFile, process.argv.includes('--settings') ? { hash: 'settings' } : {});
   window.on('closed', () => { window = null; });
   return window;
 }
 app.whenReady().then(async () => {
   Menu.setApplicationMenu(null);
+  if (liveProviderTest) assertLiveTestProfile(__dirname, app.getPath('userData'), Boolean(dataArg));
   store = new Store(app.getPath('userData'), {
     encrypt: value => { if (!safeStorage.isEncryptionAvailable()) throw new Error('Windows 密钥保护暂不可用，请稍后重试。'); return safeStorage.encryptString(value); },
     decrypt: bytes => safeStorage.decryptString(Buffer.from(bytes))
@@ -237,7 +246,7 @@ app.whenReady().then(async () => {
   createWindow();
   if (testMode) {
     window.webContents.once('did-finish-load', async () => {
-      try { await require('./scripts/desktop-scenario.cjs')({ app, window, store, operations, snapshot }); }
+      try { await require(liveProviderTest ? './scripts/live-provider-scenario.cjs' : './scripts/desktop-scenario.cjs')({ app, window, store, operations, snapshot }); }
       catch (error) { console.error(error); app.exit(1); }
     });
   }

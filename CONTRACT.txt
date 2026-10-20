@@ -28,7 +28,9 @@ window.muse methods:
   importFiles({workspaceId?:string|null}) -> File[]  // native picker
   importDroppedFiles(files:File[], workspaceId?:string|null) -> File[]  // preload uses webUtils, never trusts raw renderer paths
   removeFile({id}) -> Snapshot  // removes the app's managed copy
-  readFile({id}) -> {name,text,truncated:boolean}
+  readFile({id}) -> {name,text,truncated:boolean,sha256,editable:boolean}
+  createTextFile({workspaceId?:string|null,name,content?:string}) -> {file:File,preview:readFileResult}
+  saveTextFile({id,content,expectedSha256}) -> {file:File,preview:readFileResult}  // compare-and-save managed UTF-8 text only; never the original source
   openFile({id}) -> void  // managed copy only
   exportChat({chatId,format:'markdown'|'json'}) -> {cancelled:boolean,path?:string}
   exportData() -> {cancelled:boolean,path?:string}

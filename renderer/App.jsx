@@ -11,6 +11,7 @@ import {
   Upload, X, AlertCircle, Database, Server, StopCircle,
 } from 'lucide-react';
 import './styles.css';
+import FileEditor from './FileEditor.jsx';
 
 const api = window.muse;
 const COLORS = ['#47766a', '#607eb3', '#a07cb5', '#c49456', '#bd7777', '#7c8992'];
@@ -117,24 +118,15 @@ function FileRow({ file, onPreview, onRemove, compact = false }) {
   </div>;
 }
 
-function FilePreview({ file, onClose, onRemove, notify }) {
-  const [state, setState] = useState({ loading: true });
-  useEffect(() => {
-    let current = true;
-    setState({ loading: true });
-    api.readFile({ id: file.id }).then(result => { if (current) setState({ ...result, loading: false }); }).catch(error => { if (current) setState({ error: error.message, loading: false }); });
-    return () => { current = false; };
-  }, [file.id]);
-  return <aside className="file-preview" aria-label={`文件预览 ${file.name}`} data-testid="file-preview">
-    <header className="preview-header"><span className="eyebrow">文件预览</span><IconButton icon={X} label="关闭文件预览" onClick={onClose} /></header>
-    <div className="preview-identity"><span className="preview-file-icon"><FileText size={28} strokeWidth={1.4} /></span><h3>{file.name}</h3><p>{formatBytes(file.size)} · {dateText(file.createdAt)}</p></div>
-    <div className="preview-actions"><button className="button secondary small" onClick={() => api.openFile({ id: file.id }).catch(error => notify(error.message, 'error'))}><ExternalLink size={14} />打开文件</button><button className="button ghost small danger-text" onClick={() => onRemove(file)}><Trash2 size={14} />移除</button></div>
-    <div className="preview-content">{state.loading ? <div className="centered loading-inline"><Spinner />读取文件中…</div> : state.error ? <div className="empty-preview"><File size={28} /><h4>暂无文字预览</h4><p>{state.error}</p><p>你仍然可以使用系统应用打开这份文件。</p></div> : <>
-      {state.truncated && <div className="inline-note"><Info size={14} />文件较长，仅预览前面部分内容。</div>}
-      {state.text ? <pre className="plain-preview">{state.text}</pre> : <div className="empty-preview"><File size={28} /><h4>这份文件没有可预览的文字</h4><p>使用“打开文件”在系统应用中查看。</p></div>}
-    </>}</div>
-    <footer className="preview-footer"><ShieldCheck size={13} />文件保存在本机工作台中</footer>
-  </aside>;
+function NewFileDialog({ workspaceId, onClose, onCreated, notify }) {
+  const [name, setName] = useState('笔记.md');
+  const [saving, setSaving] = useState(false);
+  return <Modal title="新建文件" subtitle="在工作区写下内容，并用于后续对话。" onClose={() => !saving && onClose()} className="entity-modal"><form onSubmit={async event => {
+    event.preventDefault(); setSaving(true);
+    try { const result = await api.createTextFile({ workspaceId, name, content: '' }); onCreated(result.file); }
+    catch (error) { notify(error.message, 'error'); }
+    finally { setSaving(false); }
+  }}><div className="form-body"><label className="field-label" htmlFor="new-file-name">文件名</label><input id="new-file-name" className="text-input" data-testid="new-file-name" value={name} maxLength={180} onChange={event => setName(event.target.value)} /><p className="field-hint">例如：笔记.md、计划.txt、配置.json。</p></div><footer className="modal-footer"><button type="button" className="button secondary" onClick={onClose} disabled={saving}>取消</button><button type="submit" className="button primary" data-testid="new-file-create" disabled={!name.trim() || saving}>{saving && <Spinner size={14} />}创建文件</button></footer></form></Modal>;
 }
 
 function EntityDialog({ entity, onClose, onSave }) {
@@ -232,12 +224,16 @@ function App() {
   const [bootError, setBootError] = useState('');
   const [route, setRoute] = useState({ type: 'welcome', workspaceId: null });
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(() => window.location.hash === '#settings');
   const [searchOpen, setSearchOpen] = useState(false);
   const [entity, setEntity] = useState(null);
   const [confirm, setConfirm] = useState(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
-  const [filePreviewId, setFilePreviewId] = useState(null);
+  const [filePreviewId, selectFilePreview] = useState(null);
+  const [filePreviewIds, setFilePreviewIds] = useState([]);
+  const [newFile, setNewFile] = useState(null);
+  const setFilePreviewId = id => { if (id) setFilePreviewIds(previous => previous.includes(id) ? previous : [...previous, id]); selectFilePreview(id); };
+  const closeFilePreview = id => { const remaining = filePreviewIds.filter(value => value !== id); setFilePreviewIds(remaining); if (filePreviewId === id) selectFilePreview(remaining.at(-1) || null); };
   const [menu, setMenu] = useState(null);
   const [drafts, setDrafts] = useState({});
   const [attachments, setAttachments] = useState({});
@@ -328,7 +324,6 @@ function App() {
   const configured = !!data.settings.baseUrl && !!data.settings.model;
   const busy = sending || !!chat && (pendingChats.has(chat.id) || chat.messages.some(message => message.status === 'streaming'));
   const sortedChats = useMemo(() => sortChats(data.chats), [data.chats]);
-  const selectedPreview = data.files.find(file => file.id === filePreviewId);
   const openRoute = useCallback(next => { setRoute(next); setMenu(null); if (window.innerWidth < 900) setSidebarOpen(false); followBottom.current = true; setShowScrollBottom(false); }, []);
   const newChat = useCallback((scope = null) => { openRoute({ type: 'welcome', workspaceId: typeof scope === 'string' ? scope : null }); setTimeout(() => window.dispatchEvent(new Event('muse-focus-composer')), 60); }, [openRoute]);
 
@@ -389,7 +384,7 @@ function App() {
     setEntity(null);
   };
   const updateChat = async input => { try { const saved = await api.updateChat(input); setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, saved) })); } catch (error) { notify(error.message, 'error'); } setMenu(null); };
-  const askRemoveFile = file => setConfirm({ title: '移除这份文件？', body: `“${file.name}”将从工作台中移除。你电脑中的原始文件不会改变。`, action: '移除文件', run: async () => { replaceSnapshot(await api.removeFile({ id: file.id })); setAttachments(previous => Object.fromEntries(Object.entries(previous).map(([key, ids]) => [key, ids.filter(id => id !== file.id)]))); if (filePreviewId === file.id) setFilePreviewId(null); } });
+  const askRemoveFile = file => setConfirm({ title: '移除这份文件？', body: `“${file.name}”及其未保存修改将从工作台中移除。你电脑中的原始文件不会改变。`, action: '移除文件', run: async () => { replaceSnapshot(await api.removeFile({ id: file.id })); setAttachments(previous => Object.fromEntries(Object.entries(previous).map(([key, ids]) => [key, ids.filter(id => id !== file.id)]))); closeFilePreview(file.id); } });
   const askDeleteChat = item => { setMenu(null); setConfirm({ title: '删除这段对话？', body: `“${item.title}”中的消息将从工作台删除。`, action: '删除对话', run: async () => { replaceSnapshot(await api.deleteChat({ id: item.id })); if (chat?.id === item.id) newChat(item.workspaceId); } }); };
   const askDeleteWorkspace = item => { setMenu(null); setConfirm({ title: '删除这个工作区？', body: `“${item.name}”将被删除，其中的对话和文件会保留在个人工作台。`, action: '删除工作区', run: async () => { replaceSnapshot(await api.deleteWorkspace({ id: item.id })); newChat(); } }); };
   const exportChat = async format => { setMenu(null); try { const result = await api.exportChat({ chatId: chat.id, format }); if (!result.cancelled) notify('对话已导出'); } catch (error) { notify(error.message, 'error'); } };
@@ -421,7 +416,7 @@ function App() {
         </header>
 
         {route.type === 'workspace' && workspace ? <div className="workspace-scroll"><div className="workspace-page"><div className="workspace-hero"><span className="workspace-hero-icon" style={{ '--space-color': workspace.color || COLORS[0] }}><FolderOpen size={31} strokeWidth={1.4} /></span><div className="workspace-title"><span className="eyebrow">一个专注的空间</span><h2>{workspace.name}</h2><p>{workspace.description || '收集资料、整理思路，让相关的事都在这里。'}</p></div><div className="workspace-hero-actions"><IconButton icon={Pencil} label="编辑工作区" data-testid="workspace-edit" onClick={() => setEntity({ kind: 'workspace', ...workspace })} /><IconButton icon={Trash2} label="删除工作区" onClick={() => askDeleteWorkspace(workspace)} /></div></div>
-          <div className="workspace-section"><div className="workspace-section-title"><h3>资料 <span>{data.files.filter(file => file.workspaceId === workspace.id).length}</span></h3><button className="button secondary small" onClick={() => addFiles(null, workspace.id, false)} disabled={importing} data-testid="workspace-file-import">{importing ? <Spinner size={14} /> : <Plus size={14} />}添加资料</button></div>{data.files.some(file => file.workspaceId === workspace.id) ? <div className="workspace-files">{data.files.filter(file => file.workspaceId === workspace.id).map(file => <FileRow key={file.id} file={file} onPreview={setFilePreviewId} onRemove={askRemoveFile} />)}</div> : <button className="workspace-file-empty" onClick={() => addFiles(null, workspace.id, false)}><span className="empty-file-illustration"><FileText size={31} strokeWidth={1.2} /><Plus size={12} /></span><strong>给这个空间，添一点资料</strong><span>拖入文件，或点击选择。工作区内的文字资料会用于相关对话。</span><small>文本 · Markdown · 代码文件</small></button>}</div>
+          <div className="workspace-section"><div className="workspace-section-title"><h3>资料 <span>{data.files.filter(file => file.workspaceId === workspace.id).length}</span></h3><div className="workspace-file-actions"><button className="button ghost small" onClick={() => setNewFile({ workspaceId: workspace.id })} data-testid="workspace-file-new"><FileText size={14} />新建文件</button><button className="button secondary small" onClick={() => addFiles(null, workspace.id, false)} disabled={importing} data-testid="workspace-file-import">{importing ? <Spinner size={14} /> : <Plus size={14} />}添加资料</button></div></div>{data.files.some(file => file.workspaceId === workspace.id) ? <div className="workspace-files">{data.files.filter(file => file.workspaceId === workspace.id).map(file => <FileRow key={file.id} file={file} onPreview={setFilePreviewId} onRemove={askRemoveFile} />)}</div> : <button className="workspace-file-empty" onClick={() => addFiles(null, workspace.id, false)}><span className="empty-file-illustration"><FileText size={31} strokeWidth={1.2} /><Plus size={12} /></span><strong>给这个空间，添一点资料</strong><span>拖入文件，或点击选择。工作区内的文字资料会用于相关对话。</span><small>文本 · Markdown · 代码文件</small></button>}</div>
           <div className="workspace-section"><div className="workspace-section-title"><h3>对话 <span>{data.chats.filter(item => item.workspaceId === workspace.id).length}</span></h3><button className="text-button" onClick={() => newChat(workspace.id)}><Plus size={14} />新对话</button></div>{data.chats.some(item => item.workspaceId === workspace.id) ? <div className="workspace-chats">{sortChats(data.chats.filter(item => item.workspaceId === workspace.id)).map(item => <button className="workspace-chat-card" key={item.id} onClick={() => openRoute({ type: 'chat', id: item.id })}><MessageCircle size={19} /><strong>{item.title}</strong><p>{excerpt(item.messages.find(message => message.role === 'user')?.content || '等待第一条消息', 85)}</p><span>{dateText(item.updatedAt)}<ArrowRight size={14} /></span></button>)}</div> : <div className="workspace-chat-empty"><MessageCircle size={19} /><span>还没有对话。在下方写一个问题，和资料聊聊。</span></div>}</div>
           <div className="workspace-composer-area"><Composer {...composerProps} placeholder={`在「${workspace.name}」中开始一段对话…`} /><p className="composer-caption">工作区中的文字资料会随相关消息发送至你配置的模型。</p></div>
         </div></div> : chat ? <>
@@ -444,12 +439,13 @@ function App() {
           {!configured && <button className="welcome-connect-note" onClick={() => setSettingsOpen(true)}><span><KeyRound size={17} /></span><div><strong>带上你喜欢的模型</strong><small>连接自己的 API，开始真实对话。</small></div><ArrowRight size={16} /></button>}
         </section><footer className="welcome-footer"><ShieldCheck size={13} /><span>本地保存，安静思考。使用你自己的模型服务。</span></footer></div>}
       </main>
-      {selectedPreview && <FilePreview file={selectedPreview} onClose={() => setFilePreviewId(null)} onRemove={askRemoveFile} notify={notify} />}
+      {filePreviewIds.length > 0 && <FileEditor ids={filePreviewIds} activeId={filePreviewId} files={data.files} onSelect={setFilePreviewId} onCloseTab={closeFilePreview} onClose={() => { setFilePreviewIds([]); selectFilePreview(null); }} onRemove={askRemoveFile} notify={notify} Modal={Modal} renderMarkdown={content => <Markdown content={content} notify={notify} />} />}
     </div>
     {dragging && <div className="drop-overlay"><div><span><Upload size={31} /></span><h2>把资料放到这里</h2><p>{route.type === 'workspace' ? `添加到「${workspace?.name || '工作区'}」` : '作为附件，和模型一起看看。'}</p></div></div>}
     {settingsOpen && <SettingsDialog settings={data.settings} app={data.app} onClose={() => { setSettingsOpen(false); setThemePreview(null); }} onSaved={settings => setSnapshot(previous => ({ ...previous, settings }))} onImport={replaceSnapshot} notify={notify} onThemePreview={setThemePreview} />}
     {searchOpen && <SearchDialog snapshot={data} onClose={() => setSearchOpen(false)} onSelect={item => { if (item.type === 'file') setFilePreviewId(item.id); else openRoute({ type: item.type, id: item.id }); }} />}
     {entity && <EntityDialog key={`${entity.kind}:${entity.id || 'new'}`} entity={entity} onClose={() => setEntity(null)} onSave={saveEntity} />}
+    {newFile && <NewFileDialog workspaceId={newFile.workspaceId} onClose={() => setNewFile(null)} notify={notify} onCreated={file => { setSnapshot(previous => ({ ...previous, files: upsert(previous.files, file) })); setFilePreviewId(file.id); setNewFile(null); notify('文件已创建'); }} />}
     {confirm && <Modal title={confirm.title} onClose={() => !confirmBusy && setConfirm(null)} className="confirm-modal"><p className="confirm-body">{confirm.body}</p><footer className="modal-footer"><button className="button secondary" onClick={() => setConfirm(null)} disabled={confirmBusy}>取消</button><button className="button danger" disabled={confirmBusy} data-testid="confirm-delete" onClick={async () => { setConfirmBusy(true); try { await confirm.run(); setConfirm(null); } catch (error) { notify(error.message, 'error'); } finally { setConfirmBusy(false); } }}>{confirmBusy && <Spinner size={15} />}{confirm.action}</button></footer></Modal>}
     {toast && <div className={`toast toast-${toast.kind}`} role="status">{toast.kind === 'error' ? <AlertCircle size={17} /> : toast.kind === 'info' ? <Info size={17} /> : <Check size={17} />}<span>{toast.message}</span><IconButton icon={X} label="关闭提示" onClick={() => setToast(null)} /></div>}
   </div>;

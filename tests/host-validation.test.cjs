@@ -17,7 +17,7 @@ const appRoot = path.resolve(__dirname, '..');
 const mainFile = path.join(appRoot, 'main.cjs');
 const mainRequire = createRequire(mainFile);
 const rendererURL = pathToFileURL(path.join(appRoot, 'build', 'index.html')).href;
-const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat sendMessage stopGeneration retryMessage importFiles importDroppedFiles removeFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe'.split(' ');
+const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat sendMessage stopGeneration retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe'.split(' ');
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
@@ -121,6 +121,24 @@ test('main rejects foreign webContents, child frames and remote documents before
   assert.throws(() => host.assertSender({ sender: host.webContents, senderFrame: { url: rendererURL } }));
   host.webContents.mainFrame.url = 'https://provider-a.example/';
   assert.throws(() => host.assertSender({ sender: host.webContents, senderFrame: host.webContents.mainFrame }));
+});
+
+test('managed file creation and edits refresh public state and subsequent model context', async t => {
+  const host = fixture(t);
+  const workspace = host.store.createWorkspace({ name: 'Editable reference' });
+  const result = await host.operations.createTextFile({ workspaceId: workspace.id, name: 'editable.md', content: 'BEFORE-EDIT' });
+  assert.ok(host.events.at(-1).snapshot.files.some(file => file.id === result.file.id));
+  const chat = host.store.createChat({ workspaceId: workspace.id });
+  const saved = host.operations.saveTextFile({ id: result.file.id, content: 'AFTER-EDIT', expectedSha256: result.preview.sha256 });
+  const current = host.events.at(-1).snapshot;
+  assert.equal(current.files.find(file => file.id === result.file.id).textPreview, 'AFTER-EDIT');
+  const context = host.contextMessages(chat, null, host.store.settings(), current).map(message => message.content).join('\n');
+  assert.ok(context.includes('AFTER-EDIT'));
+  assert.ok(!context.includes('BEFORE-EDIT'));
+  assert.ok(!JSON.stringify(current).includes('_contentRevision'));
+  assert.equal(saved.preview.text, 'AFTER-EDIT');
+  assert.throws(() => host.operations.saveTextFile({ id: result.file.id, content: 'STALE-EDIT', expectedSha256: result.preview.sha256 }), /修改/);
+  assert.equal(host.operations.readFile({ id: result.file.id }).text, 'AFTER-EDIT');
 });
 
 test('external links reject file, script and embedded credentials', async t => {
