@@ -17,7 +17,7 @@ const appRoot = path.resolve(__dirname, '..');
 const mainFile = path.join(appRoot, 'main.cjs');
 const mainRequire = createRequire(mainFile);
 const rendererURL = pathToFileURL(path.join(appRoot, 'build', 'index.html')).href;
-const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage cancelSendAdmission stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact previewSchedule createSchedule updateSchedule pauseSchedule deleteSchedule runScheduleNow stopSchedule saveBackgroundSettings getMemoryDocument saveMemoryDocument deleteMemoryDocument createMemory getMemory updateMemory deleteMemory rebuildMemoryIndex searchMemories getSkill importSkillPackage replaceSkillPackage updateSkill deleteSkill setSkillConsent getAgentProfile createAgentProfile updateAgentProfile captureProfileKnowledge refreshProfileKnowledge removeProfileKnowledge reviewAgentProfile deleteAgentProfile previewSelectedContext startDictation dictationCaptureReady finishDictation cancelDictation getDictationState prepareAudio updateAudioState stopAudio getAudioState'.split(' ');
+const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage cancelSendAdmission stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact previewSchedule createSchedule updateSchedule pauseSchedule deleteSchedule runScheduleNow stopSchedule saveBackgroundSettings getMemoryDocument saveMemoryDocument deleteMemoryDocument createMemory getMemory updateMemory deleteMemory rebuildMemoryIndex searchMemories getSkill importSkillPackage replaceSkillPackage updateSkill deleteSkill setSkillConsent getAgentProfile createAgentProfile updateAgentProfile captureProfileKnowledge refreshProfileKnowledge removeProfileKnowledge reviewAgentProfile deleteAgentProfile previewSelectedContext startDictation dictationCaptureReady finishDictation cancelDictation getDictationState prepareAudio updateAudioState stopAudio getAudioState'.split(' ');
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
@@ -108,7 +108,7 @@ function fixture(t, overrides = {}) {
   const operations = { ...sandbox.hostUnderTest.operations };
   // Electron structured-clones JSON cancellation results across the IPC realm.
   for (const name of ['cancelQueuedMessage','cancelSendAdmission','stopGeneration']) operations[name] = (...args) => structuredClone(sandbox.hostUnderTest.operations[name](...args));
-  return { ...sandbox.hostUnderTest, operations, store, dir, window, webContents, provider, speechRequests, synthesisRequests, permissions, scheduled, events, errors, external, appEvents,windowEvents,webEvents };
+  return { ...sandbox.hostUnderTest, operations, store, dir, window, webContents, provider, speechRequests, synthesisRequests, permissions, scheduled, events, errors, external, appEvents,windowEvents,webEvents, dialog:electron.dialog };
 }
 
 async function waitFor(predicate, label) {
@@ -1418,6 +1418,24 @@ test('main rejects foreign webContents, child frames and remote documents before
   assert.throws(() => host.assertSender({ sender: host.webContents, senderFrame: { url: rendererURL } }));
   host.webContents.mainFrame.url = 'https://provider-a.example/';
   assert.throws(() => host.assertSender({ sender: host.webContents, senderFrame: host.webContents.mainFrame }));
+});
+
+test('file download uses the real host picker path and leaves an invalid JSON draft unsaved', async t => {
+  const host=fixture(t), created=await host.store.createTextFile({name:'host-download.json',content:'{"saved":true}'});
+  const target=path.join(host.dir,'exported-draft.json'), draft='{ invalid JSON\r\n'; let prompted=0;
+  host.dialog.showSaveDialog=async (owner,options)=>{prompted++;assert.equal(owner,host.window);assert.equal(options.defaultPath,'host-download.json');return{canceled:false,filePath:target};};
+  const result=await host.operations.exportFile({id:created.file.id,content:draft});
+  assert.equal(result.cancelled,false);assert.equal(result.draft,true);assert.equal(prompted,1);
+  assert.equal(fs.readFileSync(target,'utf8'),draft);assert.equal(host.store.readFile(created.file.id).text,'{"saved":true}');
+  assert.equal(host.operations.bootstrap().chats.length,0);
+});
+
+test('file download cancel and rejected renderer paths never change host files', async t => {
+  const host=fixture(t), created=await host.store.createTextFile({name:'host-cancel.txt',content:'saved'});let prompted=0;
+  host.dialog.showSaveDialog=async()=>{prompted++;return{canceled:true};};
+  const result=await host.operations.exportFile({id:created.file.id,content:'draft'});assert.equal(result.cancelled,true);assert.equal(prompted,1);
+  await assert.rejects(host.operations.exportFile({id:created.file.id,path:path.join(host.dir,'forged.txt')}),/不支持/);
+  assert.equal(prompted,1);assert.equal(host.store.readFile(created.file.id).text,'saved');assert(!fs.existsSync(path.join(host.dir,'forged.txt')));
 });
 
 test('preload never exposes the host API inside a child frame',()=>{

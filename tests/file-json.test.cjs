@@ -46,16 +46,16 @@ test('actual JSON preview represents primitive roots and invalid content without
 const source=fs.readFileSync(path.resolve(__dirname,'../renderer/FileEditor.jsx'),'utf8');
 const dirtyStart=source.indexOf('const dirty ='),start=source.indexOf('export default function FileEditor('),end=source.indexOf('  const tab = tabs[activeId]',start);
 assert(dirtyStart>=0&&start>dirtyStart&&end>start);
-const actionCode=esbuild.transformSync(source.slice(dirtyStart,start)+source.slice(start,end).replace('export default ','')+'globalThis.probe={load,save,guard,patch,tabs,pending,saving};return null;}',{loader:'jsx',format:'cjs'}).code;
+const actionCode=esbuild.transformSync(source.slice(dirtyStart,start)+source.slice(start,end).replace('export default ','')+'globalThis.probe={load,save,download,guard,patch,tabs,pending,saving,downloading};return null;}',{loader:'jsx',format:'cjs'}).code;
 function editor(name='fixture.json',baseline='{"before":true}'){
-  let cursor=0;const hooks=[],updates=[],calls=[],notices=[];let failSave=false;
+  let cursor=0;const hooks=[],updates=[],calls=[],notices=[],downloads=[];let failSave=false,failDownload=false,downloadResult={cancelled:false,draft:true};
   const preview=text=>({name,text,editable:true,truncated:false,sha256:'a'.repeat(64)});
-  const api={readFile:async()=>preview(baseline),saveTextFile:async input=>{calls.push(JSON.parse(JSON.stringify(input)));if(failSave)throw Error('Synthetic save conflict');return{preview:preview(input.content)};}};
+  const api={readFile:async()=>preview(baseline),saveTextFile:async input=>{calls.push(JSON.parse(JSON.stringify(input)));if(failSave)throw Error('Synthetic save conflict');return{preview:preview(input.content)};},exportFile:async input=>{downloads.push(JSON.parse(JSON.stringify(input)));if(failDownload)throw Error('Synthetic download error');return await downloadResult;}};
   const useState=initial=>{const i=cursor++;if(!(i in hooks))hooks[i]=typeof initial==='function'?initial():initial;return[hooks[i],v=>updates.push(()=>{hooks[i]=typeof v==='function'?v(hooks[i]):v;})];};
   const useRef=initial=>{const i=cursor++;return hooks[i]||(hooks[i]={current:initial});};
   const context=vm.createContext({api,isJsonFile,jsonSaveError,useState,useRef,useEffect(){},props:{ids:['file_fixture'],activeId:'file_fixture',files:[{id:'file_fixture',name}],notify:(...args)=>notices.push(args)}});vm.runInContext(actionCode,context);
   const render=()=>{while(updates.length)updates.shift()();cursor=0;vm.runInContext('FileEditor(props)',context);return context.probe;};render();
-  return{calls,notices,render,get probe(){return context.probe;},async load(){await context.probe.load('file_fixture');return render();},edit(text){context.probe.patch('file_fixture',{text,mode:'edit'});return render();},fail(value){failSave=value;}};
+  return{calls,notices,downloads,render,get probe(){return context.probe;},async load(){await context.probe.load('file_fixture');return render();},edit(text){context.probe.patch('file_fixture',{text,mode:'edit'});return render();},fail(value){failSave=value;},failDownload(value){failDownload=value;},replyDownload(value){downloadResult=value;}};
 }
 test('invalid JSON Save preserves draft and baseline, reports the error and performs no host write',async()=>{
   const h=editor();await h.load();const invalid='{\n "a":1,\n}';h.edit(invalid);assert.equal(await h.probe.save('file_fixture'),false);h.render();assert.equal(h.calls.length,0);assert.equal(h.probe.tabs.file_fixture.text,invalid);assert.equal(h.probe.tabs.file_fixture.baseline,'{"before":true}');assert.match(h.probe.tabs.file_fixture.saveError,/JSON/);assert.equal(h.probe.saving,false);assert.equal(h.notices.at(-1)[1],'error');
@@ -74,4 +74,28 @@ test('save conflict preserves a valid JSON draft and allows retry against the sa
 });
 test('failed JSON Save leaves the dirty-file close guard pending',async()=>{
   const h=editor();await h.load();h.edit('broken');let closed=false;h.probe.guard(['file_fixture'],()=>{closed=true;});h.render();assert(h.probe.pending);assert.equal(await h.probe.save('file_fixture'),false);h.render();assert(h.probe.pending);assert.equal(closed,false);assert.equal(h.probe.tabs.file_fixture.text,'broken');
+});
+
+test('actual editor downloads invalid JSON without Save and keeps the dirty-close guard pending',async()=>{
+  const h=editor();await h.load();const invalid='{ broken\r\n';h.edit(invalid);h.probe.guard(['file_fixture'],()=>assert.fail('dirty draft must remain open'));h.render();
+  await h.probe.download('file_fixture');h.render();
+  assert.deepEqual(h.downloads,[{id:'file_fixture',content:invalid}]);assert.equal(h.calls.length,0);
+  assert.equal(h.probe.tabs.file_fixture.text,invalid);assert.equal(h.probe.tabs.file_fixture.baseline,'{"before":true}');assert(h.probe.pending);assert.equal(h.probe.downloading,false);
+});
+
+test('download cancellation and errors retain editor source and baseline',async()=>{
+  const h=editor('rows.jsonl','1');await h.load();h.edit('1\n2');h.replyDownload({cancelled:true});await h.probe.download('file_fixture');h.render();assert.equal(h.notices.length,0);
+  h.failDownload(true);await h.probe.download('file_fixture');h.render();assert.equal(h.notices.at(-1)[1],'error');assert.equal(h.probe.tabs.file_fixture.text,'1\n2');assert.equal(h.probe.tabs.file_fixture.baseline,'1');assert.equal(h.calls.length,0);
+});
+
+test('pending download captures the clicked draft once and does not replace newer edits on completion',async()=>{
+  const h=editor();await h.load();h.edit('first draft');let resolve;const pending=new Promise(r=>{resolve=r;});h.replyDownload(pending);
+  const first=h.probe.download('file_fixture');h.render();assert.equal(h.probe.downloading,true);await h.probe.download('file_fixture');h.edit('newer draft');
+  assert.deepEqual(h.downloads,[{id:'file_fixture',content:'first draft'}]);resolve({cancelled:false,draft:true});await first;h.render();assert.equal(h.probe.tabs.file_fixture.text,'newer draft');assert.equal(h.probe.tabs.file_fixture.baseline,'{"before":true}');assert.equal(h.probe.downloading,false);
+});
+
+test('clean and binary-preview-error download requests the managed original without preview text',async()=>{
+  const h=editor('note.txt','saved');await h.load();await h.probe.download('file_fixture');h.render();
+  h.probe.patch('file_fixture',{editable:false,error:'No text preview'});h.render();await h.probe.download('file_fixture');
+  assert.deepEqual(h.downloads,[{id:'file_fixture'},{id:'file_fixture'}]);assert.equal(h.calls.length,0);
 });

@@ -44,6 +44,10 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await new Promise(r=>setTimeout(r,300));
     await window.webContents.capturePage().then(image=>fs.writeFileSync(path.join(folder,'settings.png'),image.toPNG()));
     await page(()=>Array.from(document.querySelectorAll('.settings-footer button')).find(x=>x.textContent==='关闭').click());
+    if(process.env.MUSE_E2E_SCENARIO==='file-export'){
+      await require('./file-export-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+      fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'file-export only',provider:'local deterministic test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
+    }
     if(process.env.MUSE_E2E_SCENARIO==='json-file'){
       await require('./json-file-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
       fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'json-file only',provider:'local deterministic test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
@@ -237,6 +241,7 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     const staleDenied=await page(async id=>{try{await window.muse.respondApproval({id,decision:'approve'});return false;}catch{return true;}},stoppedApproval.id);
     check('Stale approval cannot be replayed through the real isolated IPC',staleDenied);
     await require('./json-file-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+    await require('./file-export-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./chat-lifecycle-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./queue-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./cancel-admission-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});

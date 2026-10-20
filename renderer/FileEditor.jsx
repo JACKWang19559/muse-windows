@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ExternalLink, FileText, Info, LoaderCircle, Pencil, RefreshCw, Save, ShieldCheck, Trash2, X } from 'lucide-react';
+import { Download, ExternalLink, FileText, Info, LoaderCircle, Pencil, RefreshCw, Save, ShieldCheck, Trash2, X } from 'lucide-react';
 import JsonPreview from './JsonPreview.jsx';
 import { isJsonFile, jsonSaveError } from './file-json.cjs';
 
@@ -9,6 +9,8 @@ const dirty = tab => tab && !tab.loading && !tab.error && tab.text !== tab.basel
 export default function FileEditor({ ids, activeId, files, onSelect, onCloseTab, onClose, onRemove, notify, Modal, renderMarkdown }) {
   const [tabs, setTabs] = useState({});
   const [saving, setSaving] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const downloadInFlight = useRef(false);
   const [pending, setPending] = useState(null);
   const latest = useRef({ ids, tabs, activeId });
   latest.current = { ids, tabs, activeId };
@@ -48,6 +50,18 @@ export default function FileEditor({ ids, activeId, files, onSelect, onCloseTab,
     } catch (error) { patch(id, { saveError: error.message, saveDetail: '' }); notify(error.message, 'error'); return false; }
     finally { setSaving(false); }
   };
+  const download = async id => {
+    const current = latest.current.tabs[id];
+    if (!current || current.loading || downloadInFlight.current) return;
+    const input = { id, ...(current.editable && dirty(current) ? { content: current.text } : {}) };
+    downloadInFlight.current = true;
+    setDownloading(true);
+    try {
+      const result = await api.exportFile(input);
+      if (!result.cancelled) notify(result.draft ? '草稿副本已下载，工作台文件尚未保存' : '文件副本已下载');
+    } catch (error) { notify(error.message, 'error'); }
+    finally { downloadInFlight.current = false; if (alive.current) setDownloading(false); }
+  };
   const guard = (scope, run) => {
     if (saving) return;
     const changed = scope.filter(id => dirty(latest.current.tabs[id]));
@@ -79,7 +93,7 @@ export default function FileEditor({ ids, activeId, files, onSelect, onCloseTab,
       {tab.truncated && <div className="inline-note"><Info size={14} />文件较长，仅预览前面部分内容。</div>}
       {tab.text ? isJson && !tab.truncated ? <JsonPreview key={activeId} text={tab.text} editable={tab.editable} onEdit={() => patch(activeId, { mode: 'edit' })} /> : isMarkdown ? renderMarkdown(tab.text) : <pre className="plain-preview">{tab.text}</pre> : <div className="empty-preview"><FileText size={28} /><h4>{tab.editable ? '这是一份空文件' : '这份文件没有可预览的文字'}</h4><p>{tab.editable ? '点击“编辑”开始写作。' : '使用系统应用打开这份文件。'}</p></div>}
     </>}</div>
-    <div className="editor-file-actions"><button className="text-button" onClick={() => api.openFile({ id: activeId }).catch(error => notify(error.message, 'error'))}><ExternalLink size={13} />打开文件</button><button className="icon-button" title="重新读取文件" aria-label="重新读取文件" onClick={() => guard([activeId], () => load(activeId))} disabled={saving}><RefreshCw size={14} /></button><button className="text-button danger-text" onClick={() => onRemove(file)} disabled={saving}><Trash2 size={13} />移除</button></div>
+    <div className="editor-file-actions"><button className="text-button" disabled={saving || downloading || tab.loading} data-testid="file-download" onClick={() => download(activeId)}>{downloading ? <LoaderCircle size={13} className="spin" /> : <Download size={13} />}下载副本</button><button className="text-button" onClick={() => api.openFile({ id: activeId }).catch(error => notify(error.message, 'error'))}><ExternalLink size={13} />打开文件</button><button className="icon-button" title="重新读取文件" aria-label="重新读取文件" onClick={() => guard([activeId], () => load(activeId))} disabled={saving}><RefreshCw size={14} /></button><button className="text-button danger-text" onClick={() => onRemove(file)} disabled={saving}><Trash2 size={13} />移除</button></div>
     <footer className="preview-footer"><ShieldCheck size={13} />{dirty(tab) ? '有未保存的修改 · Ctrl + S 保存' : tab.editable ? '修改仅保存到工作台中的文件副本' : '此文件为只读预览'}</footer>
     {pending && <Modal title="文件有未保存的修改" subtitle="保存后再离开，或放弃这些修改。" onClose={() => !saving && setPending(null)} className="confirm-modal"><p className="confirm-body">{pending.ids.map(id => tabs[id]?.name || files.find(file => file.id === id)?.name).join('、')}</p><footer className="modal-footer"><button className="button secondary" disabled={saving} onClick={() => setPending(null)}>继续编辑</button><button className="button ghost danger-text" disabled={saving} data-testid="file-discard" onClick={() => { const run = pending.run; setPending(null); run(); }}>放弃修改</button><button className="button primary" disabled={saving} data-testid="file-save-and-close" onClick={async () => { for (const id of pending.ids) if (!await save(id)) return; const run = pending.run; setPending(null); run(); }}>保存并继续</button></footer></Modal>}
   </aside>;

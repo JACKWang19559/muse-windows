@@ -29,6 +29,7 @@ const { transcribeAudio, normalizeSpeechBaseUrl } = require('./backend/asr-provi
 const { synthesizeSpeech } = require('./backend/tts-provider.cjs');
 const { AudioSession } = require('./backend/audio-session.cjs');
 const { readManagedAudio } = require('./backend/audio-file.cjs');
+const { exportManagedFile } = require('./backend/file-export.cjs');
 
 app.setName('Muse Windows');
 if(process.platform==='win32')app.setAppUserModelId?.('com.jackwang19559.musewindows');
@@ -742,6 +743,7 @@ const operations = {
   createTextFile: async input => { const result = await store.createTextFile(input || {}); refresh(); return result; },
   saveTextFile: input => { const result = store.saveTextFile(input || {}); refresh(); return result; },
   readFile: input => store.readFile(id(input.id)),
+  exportFile: input => exportManagedFile({ store, input, chooseDestination: name => dialog.showSaveDialog(window, { title: '下载文件副本', defaultPath: name }) }),
   openFile: async input => {
     const target = store.filePath(id(input.id));
     if (!target) throw new Error('文件不存在。');
