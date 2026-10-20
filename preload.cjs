@@ -13,4 +13,5 @@ api.subscribe = callback => {
   ipcRenderer.on('muse:event', listener);
   return () => ipcRenderer.removeListener('muse:event', listener);
 };
+for(const name of ['previewSchedule','createSchedule','updateSchedule','pauseSchedule','deleteSchedule','runScheduleNow','stopSchedule','saveBackgroundSettings'])api[name]=call(name);
 if (typeof process === 'undefined' || process.isMainFrame !== false) contextBridge.exposeInMainWorld('muse', Object.freeze(api));

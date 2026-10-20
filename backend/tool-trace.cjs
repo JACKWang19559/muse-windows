@@ -73,10 +73,12 @@ function traceHistory(value) {
 function cancelRounds(rounds) { return rounds.map(round => ({ ...round, calls: round.calls.map(call => FINAL_STATES.has(call.status) ? call : { ...call, status: 'cancelled', result: CANCELLED_RESULT }) })); }
 function cancelToolTrace(value) { return cancelRounds(normalizeToolTrace(value)); }
 function hasUnfinishedToolCalls(value) { return normalizeToolTrace(value).some(round => round.calls.some(call => !FINAL_STATES.has(call.status))); }
-function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map(), artifactIds = new Map(), buildIds = new Map() } = {}) {
-  if ([fileIds, workspaceIds, artifactIds, buildIds].some(mapping => types.isProxy(mapping) || !(mapping instanceof Map))) fail();
+function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map(), artifactIds = new Map(), buildIds = new Map(), scheduleIds = new Map(), runIds = new Map(), chatIds = new Map(), messageIdsByChat = new Map() } = {}) {
+  if ([fileIds, workspaceIds, artifactIds, buildIds, scheduleIds, runIds, chatIds, messageIdsByChat].some(mapping => types.isProxy(mapping) || !(mapping instanceof Map))) fail();
+  for (const mapping of messageIdsByChat.values()) if (types.isProxy(mapping) || !(mapping instanceof Map)) fail();
   const known = new Set(['workspace_list_files', 'workspace_read_file', 'workspace_create_text_file', 'workspace_save_text_file']);
   const appTools = new Set(['muse_list_apps', 'muse_read_app', 'muse_create_app', 'muse_write_app', 'muse_build_app']);
+  const scheduleTools = new Set(['muse_list_schedules', 'muse_read_schedule', 'muse_create_schedule', 'muse_update_schedule', 'muse_pause_schedule', 'muse_delete_schedule', 'muse_run_schedule']);
   const object = candidate => candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate);
   const rewrite = (source, transform) => {
     let parsed;
@@ -87,14 +89,21 @@ function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map(), 
       const replacement = mapping.get(target[key]);
       if (typeof replacement === 'string' && replacement !== target[key]) { target[key] = replacement; changed = true; }
     };
-    transform(parsed, field);
+    const list = (target, key, mapping) => {
+      if (!object(target) || !Array.isArray(target[key])) return;
+      for (let index = 0; index < target[key].length; index++) {
+        const previous = target[key][index], replacement = typeof previous === 'string' ? mapping.get(previous) : undefined;
+        if (typeof replacement === 'string' && replacement !== previous) { target[key][index] = replacement; changed = true; }
+      }
+    };
+    transform(parsed, field, list);
     // Historical malformed/deep JSON remains opaque, rather than breaking an
     // otherwise readable history entry or inventing a replacement result.
     if (!changed) return source;
     try { return JSON.stringify(parsed); } catch { return source; }
   };
   const rounds = normalizeToolTrace(value).map(round => ({ ...round, calls: round.calls.map(call => {
-    if (!known.has(call.name) && !appTools.has(call.name)) return call;
+    if (!known.has(call.name) && !appTools.has(call.name) && !scheduleTools.has(call.name)) return call;
     const result = { ...call };
     if (call.name === 'workspace_read_file' || call.name === 'workspace_save_text_file') {
       result.arguments = rewrite(call.arguments, (args, field) => field(args, 'id', fileIds));
@@ -102,7 +111,11 @@ function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map(), 
     if (['muse_read_app', 'muse_write_app', 'muse_build_app'].includes(call.name)) {
       result.arguments = rewrite(call.arguments, (args, field) => field(args, 'id', artifactIds));
     }
-    if (call.result != null) result.result = rewrite(call.result, (envelope, field) => {
+    if (scheduleTools.has(call.name)) result.arguments = rewrite(call.arguments, (args, field, list) => {
+      if (['muse_read_schedule', 'muse_update_schedule', 'muse_pause_schedule', 'muse_delete_schedule', 'muse_run_schedule'].includes(call.name)) field(args, 'id', scheduleIds);
+      if (['muse_create_schedule', 'muse_update_schedule'].includes(call.name)) list(args, 'attachmentIds', fileIds);
+    });
+    if (call.result != null) result.result = rewrite(call.result, (envelope, field, list) => {
       if (!object(envelope) || envelope.ok !== true || !object(envelope.result)) return;
       const payload = envelope.result;
       if (call.name === 'workspace_list_files' && Array.isArray(payload.files)) {
@@ -123,6 +136,21 @@ function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map(), 
         app(payload.app);
         if (Array.isArray(payload.apps)) for (const item of payload.apps) app(item);
         field(payload, 'buildId', buildIds);
+      } else if (scheduleTools.has(call.name)) {
+        // Only schema-defined identity slots are relationships. Prompt text,
+        // cadence, provider binding and arbitrary nested data remain opaque.
+        const schedule = target => {
+          if (!object(target)) return;
+          field(target, 'id', scheduleIds); field(target, 'workspaceId', workspaceIds);
+          list(target, 'attachmentIds', fileIds); field(target, 'lastRunId', runIds);
+        };
+        if (call.name === 'muse_list_schedules' && Array.isArray(payload.schedules)) for (const item of payload.schedules) schedule(item);
+        if (['muse_read_schedule', 'muse_create_schedule', 'muse_update_schedule', 'muse_pause_schedule'].includes(call.name)) schedule(payload.schedule);
+        if (['muse_create_schedule', 'muse_update_schedule', 'muse_pause_schedule', 'muse_run_schedule'].includes(call.name)) field(payload, 'id', scheduleIds); // Minimal committed receipt.
+        if (call.name === 'muse_delete_schedule') field(payload, 'deletedId', scheduleIds);
+        if (call.name === 'muse_run_schedule') {
+          field(payload, 'scheduleId', scheduleIds); field(payload, 'runId', runIds); field(payload, 'chatId', chatIds);
+        }
       }
     });
     return result;

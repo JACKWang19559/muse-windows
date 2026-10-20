@@ -24,7 +24,7 @@ const server = http.createServer(async (request, response) => {
   const parsed = JSON.parse(body); requests.push(parsed);
   response.writeHead(200, { 'content-type':'text/event-stream' });
   const user = parsed.messages.filter(x => x.role === 'user').at(-1)?.content || '';
-  if (parsed.tools?.length && /AGENT_(CREATE|SAVE|DENY|STOP|APP)_DEMO/.test(user)) {
+  if (parsed.tools?.length && /AGENT_(CREATE|SAVE|DENY|STOP|APP|SCHEDULE)_DEMO|SCHEDULE_WRITE_DEMO/.test(user)) {
     const emitTool = (name, args) => {
       const id = 'call-desktop-' + requests.length, data = JSON.stringify(args), cut = Math.floor(data.length / 2);
       response.write('data: ' + JSON.stringify({ choices:[{delta:{tool_calls:[{index:0,id,type:'function',function:{name,arguments:data.slice(0,cut)}}]}}] }) + '\n\n');
@@ -44,7 +44,9 @@ const server = http.createServer(async (request, response) => {
       const text = receipt.ok ? '文件操作已完成，结果已回传。' : '用户没有批准，本次没有写入。';
       response.end('data: '+JSON.stringify({choices:[{delta:{content:text},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n'); return;
     }
-    if (user.includes('AGENT_APP_DEMO')) emitTool('muse_create_app',{name:'模型创建的应用',runtime:'html'});
+    if (user.includes('AGENT_SCHEDULE_DEMO')) emitTool('muse_create_schedule',{name:'模型创建的计划',prompt:'SCHEDULE_MODEL_CREATED_RESULT',cadence:{kind:'daily',timeZone:'Asia/Shanghai',time:'09:00'},enabled:false,notification:'none'});
+    else if(user.includes('SCHEDULE_WRITE_DEMO'))emitTool('workspace_create_text_file',{name:'scheduled-write-rejected.md',content:'must not commit'});
+    else if (user.includes('AGENT_APP_DEMO')) emitTool('muse_create_app',{name:'模型创建的应用',runtime:'html'});
     else if (user.includes('AGENT_SAVE_DEMO')) emitTool('workspace_list_files',{});
     else emitTool('workspace_create_text_file',{name:user.includes('AGENT_DENY_DEMO')?'denied-agent.md':user.includes('AGENT_STOP_DEMO')?'stopped-agent.md':'agent-created.md',content:'# AGENT-CREATED-42'});
     return;
@@ -63,6 +65,7 @@ server.listen(0, '127.0.0.1', async () => {
   const binary = process.env.MUSE_PACKAGED_EXE || require('electron');
   const args = process.env.MUSE_PACKAGED_EXE ? [] : [root];
   args.push('--desktop-test', '--data-dir=' + path.join(folder, 'data'));
+  args.push('--background-lifecycle-test');
   const child = spawn(binary, args, { cwd:root, env, windowsHide:true, stdio:['ignore','pipe','pipe'] });
   let output = '';
   child.stdout.on('data', x => { output += x; }); child.stderr.on('data', x => { output += x; });
@@ -73,10 +76,11 @@ server.listen(0, '127.0.0.1', async () => {
     fs.writeFileSync(path.join(folder, 'electron.log'), output);
     fs.writeFileSync(path.join(folder, 'provider-requests.json'), JSON.stringify(requests, null, 2));
     const crypto = require('node:crypto');
+    let desktopChecks;try{desktopChecks=JSON.parse(fs.readFileSync(path.join(folder,'desktop-checks.json'),'utf8'));}catch{}
     const application = process.env.MUSE_PACKAGED_EXE ? path.join(path.dirname(binary),'resources','app') : root;
-    const evidence = { exit_code:code, folder, application, executable:binary, executable_sha256:crypto.createHash('sha256').update(fs.readFileSync(binary)).digest('hex'), version:JSON.parse(fs.readFileSync(path.join(application,'package.json'),'utf8')).version, main_sha256:crypto.createHash('sha256').update(fs.readFileSync(path.join(application,'main.cjs'))).digest('hex'), provider_requests:requests.length, workspace_document_reached_provider:requests.some(x=>JSON.stringify(x.messages).includes('WIND-CEDAR-42')) };
+    const evidence = { exit_code:code, desktop_checks_completed:desktopChecks?.passed===true, desktop_check_count:desktopChecks?.check_count||0, folder, application, executable:binary, executable_sha256:crypto.createHash('sha256').update(fs.readFileSync(binary)).digest('hex'), version:JSON.parse(fs.readFileSync(path.join(application,'package.json'),'utf8')).version, main_sha256:crypto.createHash('sha256').update(fs.readFileSync(path.join(application,'main.cjs'))).digest('hex'), provider_requests:requests.length, workspace_document_reached_provider:requests.some(x=>JSON.stringify(x.messages).includes('WIND-CEDAR-42')) };
     fs.writeFileSync(path.join(folder, 'test-run.json'), JSON.stringify(evidence, null, 2));
     console.log(JSON.stringify(evidence, null, 2));
-    if (code !== 0) { console.error(output.slice(-6000)); process.exitCode=1; }
+    if (code !== 0||!evidence.desktop_checks_completed) { console.error(output.slice(-6000)||'Desktop process exited before completing its checks.'); process.exitCode=1; }
   });
 });

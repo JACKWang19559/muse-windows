@@ -208,6 +208,8 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await require('./queue-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./artifact-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./artifact-editing-scenario.cjs')({window,store,operations,folder,page,wait,check,fill});
+    await require('./scheduler-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+    await require('./quit-cancel-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     const report={passed:true,checks,check_count:checks.length,provider:'local deterministic test server only',target_mac_app_executed:false};
     fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify(report,null,2));
     app.exit(0);

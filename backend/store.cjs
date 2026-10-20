@@ -7,6 +7,8 @@ const { TextDecoder } = require('node:util');
 const { MAX_FILE_BYTES, MAX_TEXT_CHARS, TEXT_EXTENSIONS, describeFile, extractDocument } = require('./documents.cjs');
 const { normalizeToolTrace, cancelToolTrace, hasUnfinishedToolCalls, remapToolTrace } = require('./tool-trace.cjs');
 const { MAX_ARTIFACTS, strictRecord: artifactInput, validArray: artifactArray, artifactPath, revision: artifactRevision, dataKey: artifactDataKey, jsonValue: artifactJson, fileBytes: artifactFileBytes, sourceDigest, validateArtifactFiles, validateArtifactBuild, validateArtifact, publicArtifact, starterFiles } = require('./artifact-model.cjs');
+const scheduleModel = require('./scheduler-model.cjs');
+const { normalizeCadence, nextOccurrence } = require('./schedule-time.cjs');
 
 const STATE_VERSION = 1;
 const BACKUP_FORMAT = 'muse-windows-backup';
@@ -17,7 +19,7 @@ const MAX_EDITABLE_FILE_BYTES = 1024 * 1024;
 const MAX_REPLY_EXCERPT_CHARS = 2000;
 const FILE_EDIT_DIRECTORY = /^\.file-edit-[0-9a-f-]{36}$/;
 const ID = /^[A-Za-z0-9_-]{1,100}$/;
-const DEFAULTS = { baseUrl: 'https://api.openai.com/v1', model: '', systemPrompt: '你是一位认真、清晰、乐于协作的 AI 助手。请优先使用中文回答，并明确区分事实与推测。', temperature: 0.7, theme: 'system', language: 'zh', transcriptionModel: '' };
+const DEFAULTS = { baseUrl: 'https://api.openai.com/v1', model: '', systemPrompt: '你是一位认真、清晰、乐于协作的 AI 助手。请优先使用中文回答，并明确区分事实与推测。', temperature: 0.7, theme: 'system', language: 'zh', transcriptionModel: '', backgroundTasks: false };
 const SETTINGS_KEYS = Object.keys(DEFAULTS);
 const stamp = () => new Date().toISOString();
 const uid = kind => `${kind}_${crypto.randomUUID()}`;
@@ -62,7 +64,8 @@ function validateSettings(value, current = DEFAULTS, patch = false) {
   record(value, '设置');
   const result = { ...current };
   for (const key of SETTINGS_KEYS) if (key in value) {
-    if (key === 'temperature') { if (typeof value[key] !== 'number' || !Number.isFinite(value[key]) || value[key] < 0 || value[key] > 2) fail('温度必须在 0 到 2 之间。'); result[key] = value[key]; }
+    if (key === 'backgroundTasks') { if (typeof value[key] !== 'boolean') fail('后台运行选项必须是布尔值。'); result[key] = value[key]; }
+    else if (key === 'temperature') { if (typeof value[key] !== 'number' || !Number.isFinite(value[key]) || value[key] < 0 || value[key] > 2) fail('温度必须在 0 到 2 之间。'); result[key] = value[key]; }
     else if (key === 'theme') { if (!['light', 'dark', 'system'].includes(value[key])) fail('主题设置无效。'); result[key] = value[key]; }
     else if (key === 'language') { if (value[key] !== 'zh') fail('语言设置无效。'); result[key] = 'zh'; }
     else result[key] = string(value[key], '设置字段', key === 'systemPrompt' ? 50000 : key === 'baseUrl' ? 2048 : 500).trim();
@@ -137,8 +140,27 @@ function unique(values, label) { if (new Set(values).size !== values.length) fai
 function validateRelations(state) {
   unique(state.workspaces.map(item => item.id), '工作区'); unique(state.chats.map(item => item.id), '对话'); unique(state.files.map(item => item.id), '文件');
   unique((state.artifacts || []).map(item => item.id), 'Space');
+  unique((state.schedules || []).map(item => item.id), '计划'); unique((state.scheduleRuns || []).map(item => item.id), '计划执行记录');
   const workspaces = new Set(state.workspaces.map(item => item.id)), files = new Set(state.files.map(item => item.id));
   for (const item of [...state.chats, ...state.files, ...(state.artifacts || [])]) if (item.workspaceId !== null && !workspaces.has(item.workspaceId)) fail('数据引用了不存在的工作区。');
+  const schedules = new Map((state.schedules || []).map(item => [item.id, item])), runs = new Map((state.scheduleRuns || []).map(item => [item.id, item])), chats = new Map(state.chats.map(item => [item.id, item]));
+  for (const schedule of schedules.values()) {
+    if (schedule.workspaceId !== null && !workspaces.has(schedule.workspaceId) || schedule.attachmentIds.some(id => !files.has(id))) fail('计划引用了不存在的授权范围。');
+    if (schedule.lastRunId && runs.get(schedule.lastRunId)?.scheduleId !== schedule.id) fail('计划最近执行记录引用无效。');
+  }
+  const liveSchedules = new Set(), ownedMessages = new Set(), runCounts = new Map();
+  for (const run of runs.values()) {
+    if (run.scheduleId !== null) {
+      const schedule = schedules.get(run.scheduleId); if (!schedule || run.scheduleRevision > schedule.revision) fail('执行记录引用了不存在的计划或未来版本。');
+      runCounts.set(run.scheduleId, (runCounts.get(run.scheduleId) || 0) + 1); if (runCounts.get(run.scheduleId) > scheduleModel.MAX_RUNS_PER_SCHEDULE) fail('单个计划执行历史超出限制。');
+      if (run.status === 'running') { if (liveSchedules.has(run.scheduleId)) fail('同一计划不能拥有重复的活动执行记录。'); liveSchedules.add(run.scheduleId); }
+    }
+    if (run.scopeSnapshot.workspaceId !== null && !workspaces.has(run.scopeSnapshot.workspaceId) || run.scopeSnapshot.attachmentIds.some(id => !files.has(id))) fail('执行记录引用了不存在的资料范围。');
+    if (run.chatId !== null) {
+      const chat = chats.get(run.chatId), message = chat?.messages.find(item => item.id === run.messageId), key = `${run.chatId}:${run.messageId}`;
+      if (!message || message.role !== 'assistant' || ownedMessages.has(key)) fail('计划执行记录的对话或消息引用无效。'); ownedMessages.add(key);
+    }
+  }
   for (const chat of state.chats) {
     unique(chat.messages.map(item => item.id), '消息');
     const preceding = new Map();
@@ -159,7 +181,8 @@ function stateShape(value) {
   const encrypted = value.encryptedApiKey;
   if (encrypted != null && (typeof encrypted !== 'string' || encrypted.length > 65536 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encrypted))) fail('本地密钥记录损坏。');
   const artifacts = value.artifacts === undefined ? [] : artifactArray(value.artifacts, MAX_ARTIFACTS, 'Space 列表').map(validateArtifact);
-  const state = { schemaVersion: STATE_VERSION, settings: validateSettings(value.settings), encryptedApiKey: encrypted || null, workspaces: value.workspaces.map(workspaceShape), chats: value.chats.map(chatShape), files: value.files.map(item => fileShape(item, true)), artifacts };
+  const schedules = value.schedules === undefined ? [] : scheduleModel.array(value.schedules, scheduleModel.MAX_SCHEDULES, '计划列表').map(scheduleModel.scheduleShape), scheduleRuns = value.scheduleRuns === undefined ? [] : scheduleModel.array(value.scheduleRuns, scheduleModel.MAX_SCHEDULE_RUNS, '执行记录').map(scheduleModel.runShape);
+  const state = { schemaVersion: STATE_VERSION, settings: validateSettings(value.settings), encryptedApiKey: encrypted || null, workspaces: value.workspaces.map(workspaceShape), chats: value.chats.map(chatShape), files: value.files.map(item => fileShape(item, true)), artifacts, schedules, scheduleRuns };
   validateRelations(state);
   return state;
 }
@@ -178,7 +201,7 @@ class Store {
         try { this.state = this._load(this.backupPath); }
         catch { fail('本地数据缺失且自动备份无法读取。文件已保留，请从手动备份恢复。'); }
         this.recoveryNotice = '本地数据文件缺失，已恢复上一次自动备份。';
-      } else this.state = { schemaVersion: 1, settings: { ...DEFAULTS }, encryptedApiKey: null, workspaces: [], chats: [], files: [], artifacts: [] };
+      } else this.state = { schemaVersion: 1, settings: { ...DEFAULTS }, encryptedApiKey: null, workspaces: [], chats: [], files: [], artifacts: [], schedules: [], scheduleRuns: [] };
     }
     else {
       try { this.state = this._load(this.statePath); }
@@ -190,10 +213,16 @@ class Store {
       }
     }
     this._recoverFileEdits();
-    let interrupted = false;
+    let interrupted = false, scheduledInterrupted = false;
+    if (this.recoveryNotice) { for (const schedule of this.state.schedules) if (schedule.enabled) { schedule.enabled = false; if (schedule.revision < Number.MAX_SAFE_INTEGER) schedule.revision++; } this.state.settings.backgroundTasks = false; }
+    for (const run of this.state.scheduleRuns) if (run.status === 'running') {
+      run.status = 'interrupted'; run.finishedAt = stamp(); run.error = '上次计划执行被中断，不会自动重发。'; interrupted = true; scheduledInterrupted = true;
+      const message = this.state.chats.find(chat => chat.id === run.chatId)?.messages.find(message => message.id === run.messageId);
+      if (message) { message.status = 'cancelled'; message.error = run.error; if (message.toolTrace) message.toolTrace = cancelToolTrace(message.toolTrace); }
+    }
     for (const chat of this.state.chats) for (const message of chat.messages) if (message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace)) { message.status = 'cancelled'; if (message.toolTrace) message.toolTrace = cancelToolTrace(message.toolTrace); interrupted = true; }
-    if (interrupted) this.recoveryNotice = '上次关闭时仍在生成的消息已标记为已停止，可以重试。';
-    this._persistState(this.state);
+    if (interrupted) this.recoveryNotice = scheduledInterrupted ? '上次计划执行已标记为中断，不会自动重发；未完成的聊天生成已停止。' : '上次关闭时仍在生成的消息已标记为已停止，可以重试。';
+    this._persistState(this.state, { replaceBackup: Boolean(interrupted || this.recoveryNotice) });
   }
   _load(filename) {
     const stat = fs.lstatSync(filename);
@@ -320,7 +349,9 @@ class Store {
   _chat(id, state = this.state) { identifier(id); const chat = state.chats.find(item => item.id === id); if (!chat) fail('对话不存在。'); return chat; }
   _file(id, state = this.state) { identifier(id); const file = state.files.find(item => item.id === id); if (!file) fail('附件不存在。'); return file; }
   _artifact(id, state = this.state) { identifier(id); const artifact = state.artifacts.find(item => item.id === id); if (!artifact) fail('Space 不存在。'); return artifact; }
-  snapshot() { return { settings: this.settings(), workspaces: copy(this.state.workspaces), chats: copy(this.state.chats), files: this.state.files.map(publicFile), artifacts: this.state.artifacts.map(publicArtifact), app: { version: '0.1.0', platform: process.platform } }; }
+  _schedule(id, state = this.state) { identifier(id); const schedule = state.schedules.find(item => item.id === id); if (!schedule) fail('计划不存在。'); return schedule; }
+  _scheduleRun(id, state = this.state) { identifier(id); const run = state.scheduleRuns.find(item => item.id === id); if (!run) fail('计划执行记录不存在。'); return run; }
+  snapshot() { return { settings: this.settings(), workspaces: copy(this.state.workspaces), chats: copy(this.state.chats), files: this.state.files.map(publicFile), artifacts: this.state.artifacts.map(publicArtifact), schedules: copy(this.state.schedules), scheduleRuns: copy(this.state.scheduleRuns), app: { version: '0.1.0', platform: process.platform } }; }
   settings() { return { ...copy(this.state.settings), hasApiKey: Boolean(this.state.encryptedApiKey) }; }
   secret() {
     if (!this.state.encryptedApiKey) return '';
@@ -355,7 +386,12 @@ class Store {
     return this._commit(next => { const item = this._workspace(input.id, next), value = workspaceShape({ ...item, ...input, updatedAt: stamp() }); Object.assign(item, value); return item; });
   }
   deleteWorkspace(id) {
-    this._workspace(id); this._commit(next => { next.workspaces = next.workspaces.filter(item => item.id !== id); for (const item of [...next.chats, ...next.files, ...next.artifacts]) if (item.workspaceId === id) { item.workspaceId = null; if ('updatedAt' in item) item.updatedAt = stamp(); } return null; }); return this.snapshot();
+    this._workspace(id); this._commit(next => {
+      next.workspaces = next.workspaces.filter(item => item.id !== id); for (const item of [...next.chats, ...next.files, ...next.artifacts]) if (item.workspaceId === id) { item.workspaceId = null; if ('updatedAt' in item) item.updatedAt = stamp(); }
+      for (const schedule of next.schedules) if (schedule.workspaceId === id) { schedule.workspaceId = null; schedule.enabled = false; if (schedule.revision < Number.MAX_SAFE_INTEGER) schedule.revision++; schedule.updatedAt = stamp(); }
+      for (const run of next.scheduleRuns) if (run.scopeSnapshot.workspaceId === id) run.scopeSnapshot.workspaceId = null;
+      return null;
+    }, { replaceBackup: true }); return this.snapshot();
   }
   createChat(input = {}) {
     record(input, '对话'); onlyKeys(input, ['workspaceId', 'title'], '对话');
@@ -367,7 +403,7 @@ class Store {
     if ('workspaceId' in input) this._workspaceId(input.workspaceId);
     return this._commit(next => { const item = this._chat(input.id, next), value = chatShape({ ...item, ...input, updatedAt: stamp() }); Object.assign(item, value); return item; });
   }
-  deleteChat(id) { this._chat(id); this._commit(next => { next.chats = next.chats.filter(item => item.id !== id); return null; }); return this.snapshot(); }
+  deleteChat(id) { this._chat(id); this._commit(next => { next.chats = next.chats.filter(item => item.id !== id); for (const run of next.scheduleRuns) if (run.chatId === id) { run.chatId = null; run.messageId = null; } return null; }); return this.snapshot(); }
   getChat(id) { return copy(this._chat(id)); }
   appendMessage(chatId, input) {
     record(input, '消息'); onlyKeys(input, ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace', 'replyToMessageId'], '消息');
@@ -499,7 +535,12 @@ class Store {
   }
   removeFile(id) {
     const item = this._file(id); this._managedPath(item._storedName); this._managedPath(item._textName);
-    this._commit(next => { next.files = next.files.filter(file => file.id !== id); for (const chat of next.chats) for (const message of chat.messages) if (message.attachmentIds) message.attachmentIds = message.attachmentIds.filter(fileId => fileId !== id); return null; });
+    this._commit(next => {
+      next.files = next.files.filter(file => file.id !== id); for (const chat of next.chats) for (const message of chat.messages) if (message.attachmentIds) message.attachmentIds = message.attachmentIds.filter(fileId => fileId !== id);
+      for (const schedule of next.schedules) if (schedule.attachmentIds.includes(id)) { schedule.attachmentIds = schedule.attachmentIds.filter(fileId => fileId !== id); schedule.enabled = false; if (schedule.revision < Number.MAX_SAFE_INTEGER) schedule.revision++; schedule.updatedAt = stamp(); }
+      for (const run of next.scheduleRuns) run.scopeSnapshot.attachmentIds = run.scopeSnapshot.attachmentIds.filter(fileId => fileId !== id);
+      return null;
+    }, { replaceBackup: true });
     this._discardFile(item); return this.snapshot();
   }
   getFile(id) { return copy(publicFile(this._file(id))); }
@@ -526,6 +567,83 @@ class Store {
   contextDocuments(chatId, attachmentIds = []) {
     const chat = this._chat(chatId), explicit = new Set(attachmentIds.map(id => this._file(id).id));
     return this.state.files.filter(file => (chat.workspaceId !== null && file.workspaceId === chat.workspaceId) || explicit.has(file.id)).filter(file => file.textStatus === 'ready').map(file => ({ ...publicFile(file), ...this.readFile(file.id) }));
+  }
+  getSchedule(id) { return copy(this._schedule(id)); }
+  getScheduleRun(id) { return copy(this._scheduleRun(id)); }
+  createSchedule(input, at = stamp()) {
+    scheduleModel.input(input, ['name','prompt','workspaceId','attachmentIds','enabled','cadence','providerBinding','authorization','notification']); const now = scheduleModel.iso(at);
+    let cadence = normalizeCadence(input.cadence); if (cadence.kind === 'interval' && !Object.hasOwn(input.cadence, 'anchorAt')) cadence = normalizeCadence({ ...cadence, anchorAt: now });
+    const schedule = scheduleModel.scheduleShape({ id: uid('schedule'), name: typeof input.name === 'string' ? input.name.trim() : input.name, prompt: input.prompt, workspaceId: this._workspaceId(input.workspaceId), attachmentIds: scheduleModel.attachments(input.attachmentIds === undefined ? [] : input.attachmentIds), enabled: input.enabled === undefined ? true : input.enabled, cadence, revision: 1, createdAt: now, updatedAt: now, nextRunAt: scheduleModel.initialNextRun(cadence, now), providerBinding: input.providerBinding, authorization: input.authorization, notification: input.notification === undefined ? 'all' : input.notification });
+    return this._commit(next => { if (next.schedules.length >= scheduleModel.MAX_SCHEDULES) fail('计划数量超过限制。'); this._workspaceId(schedule.workspaceId, next); for (const id of schedule.attachmentIds) this._file(id, next); next.schedules.push(schedule); return schedule; }, { replaceBackup: true });
+  }
+  updateSchedule(input, at = stamp()) {
+    scheduleModel.input(input, ['id','expectedRevision','name','prompt','workspaceId','attachmentIds','enabled','cadence','providerBinding','authorization','notification']); const now = scheduleModel.iso(at), expectedRevision = scheduleModel.revision(input.expectedRevision);
+    const { id, expectedRevision: ignored, ...patch } = input;
+    return this._commit(next => {
+      const schedule = this._schedule(id, next); if (schedule.revision !== expectedRevision) fail('计划已被其他操作修改，请重新载入并确认。'); if (schedule.revision === Number.MAX_SAFE_INTEGER) fail('计划版本超出限制。');
+      const candidate = { ...schedule, ...patch, revision: schedule.revision + 1, updatedAt: now };
+      if ('name' in patch && typeof patch.name === 'string') candidate.name = patch.name.trim();
+      if ('cadence' in patch) { candidate.cadence = normalizeCadence(patch.cadence); if (candidate.cadence.kind === 'interval' && !Object.hasOwn(patch.cadence, 'anchorAt')) candidate.cadence = normalizeCadence({ ...candidate.cadence, anchorAt: now }); }
+      if (JSON.stringify(candidate.cadence) !== JSON.stringify(schedule.cadence) || patch.enabled === true && !schedule.enabled) candidate.nextRunAt = scheduleModel.initialNextRun(candidate.cadence, now);
+      const value = scheduleModel.scheduleShape(candidate); this._workspaceId(value.workspaceId, next); for (const attachment of value.attachmentIds) this._file(attachment, next);
+      Object.assign(schedule, value); return schedule;
+    }, { replaceBackup: true });
+  }
+  deleteSchedule(id) {
+    this._schedule(id); this._commit(next => { next.schedules = next.schedules.filter(schedule => schedule.id !== id); for (const run of next.scheduleRuns) if (run.scheduleId === id) run.scheduleId = null; return null; }, { replaceBackup: true }); return this.snapshot();
+  }
+  claimScheduleRun(input) {
+    scheduleModel.input(input, ['id','expectedRevision','trigger','now']); const now = scheduleModel.iso(input.now), expectedRevision = scheduleModel.revision(input.expectedRevision);
+    if (!['scheduled','manual'].includes(input.trigger)) fail('计划触发方式无效。');
+    return this._commit(next => {
+      const schedule = this._schedule(input.id, next);
+      if (schedule.revision !== expectedRevision) fail('计划已变化，请重新确认。');
+      if (next.scheduleRuns.some(run => run.scheduleId === schedule.id && run.status === 'running')) fail('这项计划正在执行，请先停止。');
+      if (input.trigger === 'scheduled' && (!schedule.enabled || !schedule.nextRunAt || Date.parse(schedule.nextRunAt) > Date.parse(now))) fail('计划尚未到期或已暂停。');
+      this._workspaceId(schedule.workspaceId, next); for (const attachment of schedule.attachmentIds) this._file(attachment, next);
+      scheduleModel.authorization(schedule.authorization); scheduleModel.providerBinding(schedule.providerBinding);
+      const captured = copy(schedule), chatId = uid('chat'), messageId = uid('msg'), runId = uid('run');
+      const user = messageShape({ id: uid('msg'), role: 'user', content: schedule.prompt, createdAt: now, status: 'complete', attachmentIds: copy(schedule.attachmentIds) });
+      const assistant = messageShape({ id: messageId, role: 'assistant', content: '', createdAt: now, status: 'streaming', agentMode: schedule.authorization.allowReadTools, ...(schedule.authorization.allowReadTools ? { toolTrace: [] } : {}) });
+      const chat = chatShape({ id: chatId, title: schedule.name, workspaceId: schedule.workspaceId, createdAt: now, updatedAt: now, pinned: false, messages: [user, assistant] });
+      if (next.chats.length >= 5000) fail('对话数量超过限制，请整理历史记录后再运行。');
+      const run = scheduleModel.runShape({ id: runId, scheduleId: schedule.id, scheduleRevision: schedule.revision, scheduleName: schedule.name, chatId, messageId, scheduledFor: input.trigger === 'scheduled' ? schedule.nextRunAt : now, trigger: input.trigger, status: 'running', dispatchStarted: false, createdAt: now, startedAt: now, scopeSnapshot: { workspaceId: schedule.workspaceId, attachmentIds: copy(schedule.attachmentIds) }, providerBinding: copy(schedule.providerBinding), authorization: copy(schedule.authorization) });
+      next.chats.push(chat); next.scheduleRuns.push(run); schedule.lastRunId = runId;
+      if (input.trigger === 'scheduled') { schedule.nextRunAt = nextOccurrence(schedule.cadence, now); if (schedule.nextRunAt === null) schedule.enabled = false; }
+      schedule.updatedAt = now; scheduleModel.pruneRuns(next); return { schedule: captured, run };
+    }, { replaceBackup: true });
+  }
+  markScheduleDispatched(input) {
+    scheduleModel.input(input, ['runId','now']); scheduleModel.iso(input.now);
+    return this._commit(next => {
+      const run = this._scheduleRun(input.runId, next); if (run.status !== 'running' || run.dispatchStarted) fail('计划请求已结束或已经开始，不允许重发。');
+      const schedule = run.scheduleId === null ? null : this._schedule(run.scheduleId, next), chat = next.chats.find(chat => chat.id === run.chatId), message = chat?.messages.find(message => message.id === run.messageId);
+      if (!schedule || schedule.revision !== run.scheduleRevision || JSON.stringify({ workspaceId: schedule.workspaceId, attachmentIds: schedule.attachmentIds }) !== JSON.stringify(run.scopeSnapshot) || JSON.stringify(schedule.providerBinding) !== JSON.stringify(run.providerBinding) || JSON.stringify(schedule.authorization) !== JSON.stringify(run.authorization) || !message || message.status !== 'streaming' || chat.workspaceId !== run.scopeSnapshot.workspaceId) fail('计划授权、资料范围或执行对话已变化，本次没有发送。');
+      this._workspaceId(schedule.workspaceId, next); for (const attachment of schedule.attachmentIds) this._file(attachment, next);
+      run.dispatchStarted = true; return run;
+    }, { replaceBackup: true });
+  }
+  finishScheduleRun(input) {
+    scheduleModel.input(input, ['runId','status','now','content','toolTrace','error','pause']); const now = scheduleModel.iso(input.now);
+    if (!['succeeded','failed','cancelled'].includes(input.status) || input.pause != null && typeof input.pause !== 'boolean') fail('计划完成状态无效。');
+    const error = input.error == null ? '' : scheduleModel.text(input.error, 1400, '计划执行错误', true);
+    if (input.content != null) string(input.content, '计划回复', 2000000);
+    const trace = input.toolTrace == null ? null : normalizeToolTrace(input.toolTrace);
+    return this._commit(next => {
+      const run = this._scheduleRun(input.runId, next);
+      if (run.status !== 'running') { if (run.status === input.status) return run; fail('计划执行已经结束，不能改写终态记录。'); }
+      run.status = input.status; run.finishedAt = now; run.error = error;
+      const chat = next.chats.find(chat => chat.id === run.chatId), message = chat?.messages.find(message => message.id === run.messageId);
+      if (message) {
+        if (input.content != null) message.content = input.content;
+        if (trace !== null) { if (!message.agentMode && trace.length) fail('普通计划回复不能保存工具记录。'); if (message.agentMode) message.toolTrace = input.status === 'succeeded' ? trace : cancelToolTrace(trace); }
+        else if (message.toolTrace && input.status !== 'succeeded') message.toolTrace = cancelToolTrace(message.toolTrace);
+        if (input.status === 'succeeded' && message.toolTrace && hasUnfinishedToolCalls(message.toolTrace)) fail('工具记录尚未结束，不能把计划标记为成功。');
+        message.status = input.status === 'succeeded' ? 'complete' : input.status === 'failed' ? 'error' : 'cancelled'; message.error = error; chat.updatedAt = now;
+      }
+      if (input.pause && run.scheduleId !== null) { const schedule = this._schedule(run.scheduleId, next); if (schedule.revision === run.scheduleRevision) { schedule.enabled = false; if (schedule.revision < Number.MAX_SAFE_INTEGER) schedule.revision++; schedule.updatedAt = now; } }
+      scheduleModel.pruneRuns(next); return run;
+    }, { replaceBackup: true });
   }
   getArtifact(id) { return publicArtifact(this._artifact(id)); }
   createArtifact(input) {
@@ -603,18 +721,26 @@ class Store {
   exportData() {
     let total = 0;
     const files = this.state.files.map(file => { const bytes = fs.readFileSync(this.filePath(file.id)); total += bytes.length; if (total > MAX_BACKUP_BYTES) fail('附件总量过大，请分批备份。'); return { ...publicFile(file), dataBase64: bytes.toString('base64'), sha256: crypto.createHash('sha256').update(bytes).digest('hex') }; });
-    const data = { format: BACKUP_FORMAT, schemaVersion: 1, exportedAt: stamp(), settings: copy(this.state.settings), workspaces: copy(this.state.workspaces), chats: copy(this.state.chats), files, artifacts: this.state.artifacts.map(artifact => ({ ...copy(artifact), builds: copy(artifact.builds.slice(-1)) })) };
+    const exportedAt = stamp(), chats = copy(this.state.chats), schedules = this.state.schedules.map(schedule => ({ ...copy(schedule), enabled: false }));
+    const scheduleRuns = this.state.scheduleRuns.map(item => {
+      const run = copy(item); if (run.status !== 'running') return run;
+      run.status = 'interrupted'; run.finishedAt = exportedAt; run.error = '备份中的计划执行已停止，导入后不会自动重发。';
+      const message = chats.find(chat => chat.id === run.chatId)?.messages.find(message => message.id === run.messageId);
+      if (message) { message.status = 'cancelled'; message.error = run.error; if (message.toolTrace) message.toolTrace = cancelToolTrace(message.toolTrace); }
+      return run;
+    });
+    const data = { format: BACKUP_FORMAT, schemaVersion: 1, exportedAt, settings: { ...copy(this.state.settings), backgroundTasks: false }, workspaces: copy(this.state.workspaces), chats, files, artifacts: this.state.artifacts.map(artifact => ({ ...copy(artifact), builds: copy(artifact.builds.slice(-1)) })), schedules, scheduleRuns };
     if (Buffer.byteLength(JSON.stringify(data)) > MAX_BACKUP_JSON_BYTES) fail('备份超过 150 MB，请先减少附件数量后重试。');
     return data;
   }
   async importData(data) {
-    record(data, '备份'); onlyKeys(data, ['format', 'schemaVersion', 'exportedAt', 'settings', 'workspaces', 'chats', 'files', 'artifacts'], '备份');
+    record(data, '备份'); onlyKeys(data, ['format', 'schemaVersion', 'exportedAt', 'settings', 'workspaces', 'chats', 'files', 'artifacts', 'schedules', 'scheduleRuns'], '备份');
     let serialized;
     try { serialized = JSON.stringify(data); } catch { fail('备份结构无效，无法读取。'); }
     if (Buffer.byteLength(serialized) > MAX_BACKUP_JSON_BYTES) fail('备份超过 150 MB，无法导入。');
     if (data.format !== BACKUP_FORMAT || data.schemaVersion !== 1) fail('不是受支持的 Muse Windows 备份。');
     date(data.exportedAt);
-    const settings = validateSettings(data.settings);
+    const settings = validateSettings(data.settings); settings.backgroundTasks = this.state.settings.backgroundTasks;
     if (!Array.isArray(data.workspaces) || data.workspaces.length > 1000 || !Array.isArray(data.chats) || data.chats.length > 5000 || !Array.isArray(data.files) || data.files.length > 10000) fail('备份内容超出限制或格式无效。');
     for (const item of data.workspaces) onlyKeys(record(item, '工作区'), ['id', 'name', 'description', 'color', 'createdAt', 'updatedAt'], '备份工作区');
     for (const item of data.chats) {
@@ -630,10 +756,12 @@ class Store {
       const bytes = Buffer.from(file.dataBase64, 'base64'); total += bytes.length;
       if (total > MAX_BACKUP_BYTES || bytes.length !== item.size || typeof file.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(file.sha256) || crypto.createHash('sha256').update(bytes).digest('hex') !== file.sha256) fail('备份附件大小或校验值不匹配。');
       buffers.set(item.id, bytes); return item;
-    }), artifacts: data.artifacts === undefined ? [] : artifactArray(data.artifacts, MAX_ARTIFACTS, '备份 Space').map(validateArtifact) };
+    }), artifacts: data.artifacts === undefined ? [] : artifactArray(data.artifacts, MAX_ARTIFACTS, '备份 Space').map(validateArtifact), schedules: data.schedules === undefined ? [] : scheduleModel.array(data.schedules, scheduleModel.MAX_SCHEDULES, '备份计划').map(scheduleModel.scheduleShape), scheduleRuns: data.scheduleRuns === undefined ? [] : scheduleModel.array(data.scheduleRuns, scheduleModel.MAX_SCHEDULE_RUNS, '备份执行记录').map(scheduleModel.runShape) };
     validateRelations(source);
     const workspaceIds = new Map(source.workspaces.map(item => [item.id, uid('ws')])), fileIds = new Map(), prepared = [];
     const artifactIds = new Map(source.artifacts.map(item => [item.id, uid('artifact')])), buildIds = new Map();
+    const chatIds = new Map(source.chats.map(item => [item.id, uid('chat')])), messageIdsByChat = new Map(source.chats.map(chat => [chat.id, new Map(chat.messages.map(message => [message.id, uid('msg')]))]));
+    const scheduleIds = new Map(source.schedules.map(item => [item.id, uid('schedule')])), runIds = new Map(source.scheduleRuns.map(item => [item.id, uid('run')]));
     // Only the retained latest build exists after import. Older historical IDs
     // stay historical instead of being remapped to phantom build identities.
     for (const item of source.artifacts) for (const build of item.builds.slice(-1)) if (!buildIds.has(build.id)) buildIds.set(build.id, uid('build'));
@@ -641,11 +769,13 @@ class Store {
       for (const item of source.files) { const file = await this._prepareFile(buffers.get(item.id), item.name, item.workspaceId === null ? null : workspaceIds.get(item.workspaceId)); file.createdAt = item.createdAt; prepared.push(file); fileIds.set(item.id, file.id); }
       const workspaces = source.workspaces.map(item => ({ ...item, id: workspaceIds.get(item.id) }));
       const artifacts = source.artifacts.map(item => ({ ...item, id: artifactIds.get(item.id), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), builds: item.builds.slice(-1).map(build => ({ ...build, id: buildIds.get(build.id) })) }));
+      const schedules = source.schedules.map(item => ({ ...item, id: scheduleIds.get(item.id), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), attachmentIds: item.attachmentIds.map(id => fileIds.get(id)), enabled: false, ...(item.lastRunId ? { lastRunId: runIds.get(item.lastRunId) } : {}) }));
+      const scheduleRuns = source.scheduleRuns.map(item => ({ ...item, id: runIds.get(item.id), scheduleId: item.scheduleId === null ? null : scheduleIds.get(item.scheduleId), chatId: item.chatId === null ? null : chatIds.get(item.chatId), messageId: item.chatId === null ? null : messageIdsByChat.get(item.chatId).get(item.messageId), scopeSnapshot: { workspaceId: item.scopeSnapshot.workspaceId === null ? null : workspaceIds.get(item.scopeSnapshot.workspaceId), attachmentIds: item.scopeSnapshot.attachmentIds.map(id => fileIds.get(id)) }, ...(item.status === 'running' ? { status: 'interrupted', finishedAt: stamp(), error: '导入的计划执行已停止，不会自动重发。' } : {}) }));
       const chats = source.chats.map(item => {
-        const messageIds = new Map(item.messages.map(message => [message.id, uid('msg')]));
-        return { ...item, id: uid('chat'), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), messages: item.messages.map(message => ({ ...message, id: messageIds.get(message.id), status: message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace) ? 'cancelled' : message.status, ...(message.replyTo ? { replyTo: { ...message.replyTo, messageId: messageIds.get(message.replyTo.messageId) } } : {}), ...(message.toolTrace ? { toolTrace: remapToolTrace(cancelToolTrace(message.toolTrace), { fileIds, workspaceIds, artifactIds, buildIds }) } : {}), ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) };
+        const messageIds = messageIdsByChat.get(item.id);
+        return { ...item, id: chatIds.get(item.id), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), messages: item.messages.map(message => ({ ...message, id: messageIds.get(message.id), status: message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace) ? 'cancelled' : message.status, ...(message.replyTo ? { replyTo: { ...message.replyTo, messageId: messageIds.get(message.replyTo.messageId) } } : {}), ...(message.toolTrace ? { toolTrace: remapToolTrace(cancelToolTrace(message.toolTrace), { fileIds, workspaceIds, artifactIds, buildIds, scheduleIds, runIds, chatIds, messageIdsByChat }) } : {}), ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) };
       });
-      this._commit(next => { if (next.workspaces.length + workspaces.length > 1000 || next.chats.length + chats.length > 5000 || next.files.length + prepared.length > 10000 || next.artifacts.length + artifacts.length > MAX_ARTIFACTS) fail('合并后的数据数量超出限制。'); next.settings = settings; next.workspaces.push(...workspaces); next.chats.push(...chats); next.files.push(...prepared); next.artifacts.push(...artifacts); return null; });
+      this._commit(next => { if (next.workspaces.length + workspaces.length > 1000 || next.chats.length + chats.length > 5000 || next.files.length + prepared.length > 10000 || next.artifacts.length + artifacts.length > MAX_ARTIFACTS || next.schedules.length + schedules.length > scheduleModel.MAX_SCHEDULES) fail('合并后的数据数量超出限制。'); next.settings = settings; next.workspaces.push(...workspaces); next.chats.push(...chats); next.files.push(...prepared); next.artifacts.push(...artifacts); next.schedules.push(...schedules); next.scheduleRuns.push(...scheduleRuns); scheduleModel.pruneRuns(next); return null; });
       return this.snapshot();
     } catch (error) { for (const item of prepared) this._discardFile(item); throw error; }
   }

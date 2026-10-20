@@ -17,7 +17,7 @@ const appRoot = path.resolve(__dirname, '..');
 const mainFile = path.join(appRoot, 'main.cjs');
 const mainRequire = createRequire(mainFile);
 const rendererURL = pathToFileURL(path.join(appRoot, 'build', 'index.html')).href;
-const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact'.split(' ');
+const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact previewSchedule createSchedule updateSchedule pauseSchedule deleteSchedule runScheduleNow stopSchedule saveBackgroundSettings'.split(' ');
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
@@ -43,27 +43,28 @@ function fixture(t, overrides = {}) {
     decrypt: bytes => Buffer.from(bytes).toString().slice('test-encrypted:'.length)
   });
   store.saveSettings({ baseUrl: 'https://provider-a.example/v1', model: 'model-a', apiKey: 'review-key-original-12345', systemPrompt: 'PROMPT_AT_SEND' });
-  const scheduled = [], events = [], errors = [], external = [], handlers = new Map();
+  const scheduled = [], events = [], errors = [], external = [], handlers = new Map(), appEvents=new Map(), windowEvents=new Map(),webEvents=new Map();
   const provider = {
+    configuredUrl: mainRequire('./backend/provider.cjs').configuredUrl,
     streamCompletion: async options => { options.onDelta('answer'); return { content: 'answer' }; },
     listModels: async () => ['model-a'], testConnection: async () => ({ ok: true, message: 'local stub' }),
     ...overrides
   };
-  const webContents = { mainFrame: { url: rendererURL }, send: (_channel, event) => events.push(structuredClone(event)) };
-  const window = { webContents, isDestroyed: () => false, minimize() {}, maximize() {}, unmaximize() {}, isMaximized: () => false, close() {} };
-  const app = { setName() {}, getVersion: () => 'test', getPath: () => dir, on() {}, requestSingleInstanceLock: () => true, quit() {}, whenReady: () => ({ then: () => ({ catch() {} }) }) };
+  const webContents = { mainFrame: { url: rendererURL }, send: (_channel, event) => events.push(structuredClone(event)),on:(name,fn)=>webEvents.set(name,fn),setWindowOpenHandler(){},session:{on(){},setPermissionCheckHandler(){},setPermissionRequestHandler(){}} };
+  const window = { webContents, isDestroyed: () => false, minimize() {}, maximize() {}, unmaximize() {}, isMaximized: () => false, close() {},on:(name,fn)=>windowEvents.set(name,fn),loadFile(){},show(){},focus(){},hide(){},isMinimized:()=>false };
+  const app = { setName() {}, getVersion: () => 'test', getPath: () => dir, on:(name,fn)=>appEvents.set(name,fn), requestSingleInstanceLock: () => true, quit() {}, whenReady: () => ({ then: () => ({ catch() {} }) }) };
   const electron = {
-    app, BrowserWindow: function () {}, ipcMain: { handle: (channel, callback) => handlers.set(channel, callback) },
-    dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }), showSaveDialog: async () => ({ canceled: true }) },
+    app, BrowserWindow: function () {return window;}, ipcMain: { handle: (channel, callback) => handlers.set(channel, callback) },
+    dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }), showSaveDialog: async () => ({ canceled: true }),showMessageBoxSync:()=>0 },
     safeStorage: {}, shell: { openExternal: async url => external.push(url), openPath: async () => '', showItemInFolder() {} },
-    clipboard: { writeText() {} }, nativeTheme: {}, Menu: { setApplicationMenu() {} }, protocol: {registerSchemesAsPrivileged(){},handle(){}}
+    clipboard: { writeText() {} }, nativeTheme: {}, Menu: { setApplicationMenu() {},buildFromTemplate:entries=>entries }, protocol: {registerSchemesAsPrivileged(){},handle(){}},Tray:class{setToolTip(){}setContextMenu(){}on(){}isDestroyed(){return false;}destroy(){}}
   };
   const sandbox = {
     require: name => name === 'electron' ? electron : name === './backend/provider.cjs' ? provider : name === './backend/agent-loop.cjs' ? {
       // This VM is a separate JS realm. Recreate the host-owned wire payload
       // in the module's realm, as the actual Electron main process constructs it.
       runAgentConversation: options => mainRequire(name).runAgentConversation({ ...options, messages: JSON.parse(JSON.stringify(options.messages)) })
-    } : name === './backend/message-outbox.cjs' ? {
+    } : name === './backend/schedule-tools.cjs'?{...mainRequire(name),createScheduleRuntime:options=>mainRequire(name).createScheduleRuntime({...options,attachmentIds:JSON.parse(JSON.stringify(options.attachmentIds)),getProviderBinding:()=>JSON.parse(JSON.stringify(options.getProviderBinding()))})}: name === './backend/schedule-time.cjs' ? Object.fromEntries(Object.entries(mainRequire(name)).map(([key,value])=>[key,['normalizeCadence','nextOccurrence','resolveLocalTime','localDateTime'].includes(key)?(...args)=>value(...args.map(arg=>arg&&typeof arg==='object'?JSON.parse(JSON.stringify(arg)):arg)):value])) : name === './backend/message-outbox.cjs' ? {
       ...mainRequire(name), MessageOutbox: class extends mainRequire(name).MessageOutbox {
         // Production creates this host-owned envelope in the module's realm.
         reserve(input) { return super.reserve({ ...input, ...(input.metadata ? { metadata: JSON.parse(JSON.stringify(input.metadata)) } : {}) }); }
@@ -73,13 +74,13 @@ function fixture(t, overrides = {}) {
     Buffer, URL, AbortController, AbortSignal, setTimeout, clearTimeout,
     setImmediate: callback => { scheduled.push(callback); }
   };
-  const expose = '\n;globalThis.hostUnderTest={operations,active,assertSender,contextMessages,cleanError,setState:(s,w)=>{store=s;window=w;}};';
+  const expose = '\n;globalThis.hostUnderTest={operations,active,assertSender,contextMessages,cleanError,createWindow,setState:(s,w)=>{store=s;window=w;}};';
   vm.runInNewContext(fs.readFileSync(mainFile, 'utf8') + expose, sandbox, { filename: mainFile });
   // Production main and Store share a realm; the VM fixture serializes its
   // host-owned data at this test boundary without relaxing JSON validators.
   const mainStore = new Proxy(store, { get(target, key) { const value = Reflect.get(target, key); return typeof value === 'function' ? (...args) => value.apply(target, args.map(arg => arg && typeof arg === 'object' ? JSON.parse(JSON.stringify(arg)) : arg)) : value; } });
   sandbox.hostUnderTest.setState(mainStore, window);
-  return { ...sandbox.hostUnderTest, store, dir, window, webContents, provider, scheduled, events, errors, external };
+  return { ...sandbox.hostUnderTest, store, dir, window, webContents, provider, scheduled, events, errors, external, appEvents,windowEvents,webEvents };
 }
 
 async function waitFor(predicate, label) {
@@ -617,6 +618,69 @@ test('old job key is redacted from errors even after provider settings are repla
   const state = JSON.stringify({ events: host.events, chat: host.store.getChat(chat.id), errors: host.errors });
   assert.doesNotMatch(state, /review-key-original-12345|review-key-changed-67890/);
   assert.equal(host.store.getChat(chat.id).messages.at(-1).status, 'error');
+});
+
+function scheduleInput(host,patch={}){
+  const preview=host.operations.previewSchedule({cadence:{kind:'daily',timeZone:'Asia/Shanghai',time:'09:00'}});
+  return{name:'host schedule',prompt:'SCHEDULE_HOST_FIXTURE',workspaceId:null,attachmentIds:[],enabled:false,cadence:preview.cadence,allowReadTools:false,notification:'none',expectedProviderBinding:preview.providerBinding,...patch};
+}
+test('host binds reviewed schedules to the current provider and refuses stale review or hidden authority fields',t=>{
+  const host=fixture(t),input=scheduleInput(host);
+  assert.throws(()=>host.operations.createSchedule({...input,authorization:{allowReadTools:true}}),/未声明/);
+  host.store.saveSettings({model:'changed'});assert.throws(()=>host.operations.createSchedule(input),/模型连接已变化/);
+  assert.equal(host.store.snapshot().schedules.length,0);
+  const task=host.operations.createSchedule(scheduleInput(host));assert.equal(task.authorization.allowReadTools,false);
+  assert.equal(task.providerBinding.model,'changed');assert.ok(!JSON.stringify(task).includes('review-key-original'));
+});
+test('a plain scheduled completion is saved as a distinct scoped chat without an invalid empty tool trace',async t=>{
+  let captured;const host=fixture(t,{streamCompletion:async input=>{captured=input;input.onDelta('scheduled answer');return{content:'scheduled answer'};}});
+  const workspace=host.store.createWorkspace({name:'schedule workspace'});
+  const task=host.operations.createSchedule(scheduleInput(host,{workspaceId:workspace.id}));
+  const result=host.operations.runScheduleNow({id:task.id,expectedRevision:task.revision});
+  await waitFor(()=>host.store.getScheduleRun(result.runId).status==='succeeded','scheduled result');
+  const run=host.store.getScheduleRun(result.runId),chat=host.store.getChat(result.chatId);
+  assert.equal(run.dispatchStarted,true);assert.equal(chat.workspaceId,workspace.id);assert.equal(chat.messages.length,2);assert.equal(chat.messages.at(-1).content,'scheduled answer');assert.equal(chat.messages.at(-1).toolTrace,undefined);assert.equal(captured.tools,undefined);assert.equal(host.active.size,0);
+});
+test('background completion cannot forge a write call even when the provider ignores its read-only declarations',async t=>{
+  const host=fixture(t,{streamCompletion:async input=>input.messages.at(-1)?.role==='tool'?{content:'policy denied'}:{content:'',toolCalls:[toolCall('forged-write','workspace_create_text_file',{name:'must-not-exist.md',content:'blocked'})],finishReason:'tool_calls'}});
+  const task=host.operations.createSchedule(scheduleInput(host,{allowReadTools:true})),result=host.operations.runScheduleNow({id:task.id,expectedRevision:task.revision});
+  await waitFor(()=>host.store.getScheduleRun(result.runId).status==='succeeded','denied tool returned');
+  assert.equal(host.store.snapshot().files.length,0);assert.equal(host.operations.bootstrap().approvals.length,0);
+  const call=host.store.getChat(result.chatId).messages.at(-1).toolTrace[0].calls[0];assert.equal(JSON.parse(call.result).error.code,'scheduled_read_only');assert.equal(call.status,'error');
+});
+test('provider changes pause a future run before dispatch and never send it to the new service',async t=>{
+  let calls=0;const host=fixture(t,{streamCompletion:async()=>{calls++;return{content:'must not send'};}});
+  const task=host.operations.createSchedule(scheduleInput(host));host.store.saveSettings({baseUrl:'https://new-provider.example/v1'});
+  const result=host.operations.runScheduleNow({id:task.id,expectedRevision:task.revision});await waitFor(()=>host.store.getScheduleRun(result.runId).status==='failed','changed provider rejected');
+  const run=host.store.getScheduleRun(result.runId);assert.equal(calls,0);assert.equal(run.dispatchStarted,false);assert.equal(host.store.getSchedule(task.id).enabled,false);assert.match(run.error,/模型地址或名称已变化/);
+});
+test('stopping an uncooperative scheduled stream detaches the job, saves partial output and ignores its late result',async t=>{
+  let resolve,started=false;const host=fixture(t,{streamCompletion:async input=>{started=true;input.onDelta('safe partial response '.repeat(30));return new Promise(done=>{resolve=done;});}});
+  const task=host.operations.createSchedule(scheduleInput(host)),result=host.operations.runScheduleNow({id:task.id,expectedRevision:task.revision});await waitFor(()=>started,'scheduled stream starts');
+  host.operations.stopSchedule({id:task.id});await waitFor(()=>host.store.getScheduleRun(result.runId).status==='cancelled','scheduled stream stops');
+  const before=host.store.getChat(result.chatId).messages.at(-1);assert.equal(host.active.size,0);assert.ok(before.content.length>0);assert.equal(before.status,'cancelled');
+  resolve({content:'LATE MUST NOT REPLACE'});await new Promise(done=>setTimeout(done,15));assert.equal(host.store.getChat(result.chatId).messages.at(-1).content,before.content);
+});
+
+test('scheduled finalization persists its answer before admitting a queued user follow-up and retry preserves the old run result',async t=>{
+  let release,followHistory;const host=fixture(t,{streamCompletion:async input=>{const last=input.messages.filter(message=>message.role==='user').at(-1)?.content;if(last==='SCHEDULE_HOST_FIXTURE')return new Promise(done=>{release=()=>done({content:'SCHEDULED_ANSWER_REQUIRED_IN_CONTEXT'});});followHistory=input.messages;return{content:'follow-up answer'};}});
+  const task=host.operations.createSchedule(scheduleInput(host)),result=host.operations.runScheduleNow({id:task.id,expectedRevision:task.revision});await waitFor(()=>!!release,'schedule provider starts');
+  await host.operations.sendMessage({chatId:result.chatId,content:'follow-up question'});release();
+  await waitFor(()=>host.scheduled.length>0,'follow-up admitted');await runQueued(host);
+  assert.ok(followHistory.some(message=>message.role==='assistant'&&message.content==='SCHEDULED_ANSWER_REQUIRED_IN_CONTEXT'));
+  const run=host.store.getScheduleRun(result.runId);assert.equal(host.store.getChat(result.chatId).messages.find(message=>message.id===run.messageId).content,'SCHEDULED_ANSWER_REQUIRED_IN_CONTEXT');
+  release=null;const second=host.operations.runScheduleNow({id:task.id,expectedRevision:task.revision});await waitFor(()=>!!release,'second run starts');release();await waitFor(()=>host.store.getScheduleRun(second.runId).status==='succeeded','second run finishes');
+  const oldId=host.store.getScheduleRun(second.runId).messageId;await host.operations.retryMessage({chatId:second.chatId});
+  assert.notEqual(host.active.get(second.chatId).messageId,oldId);assert.equal(host.store.getChat(second.chatId).messages.find(message=>message.id===oldId).content,'SCHEDULED_ANSWER_REQUIRED_IN_CONTEXT');
+  host.operations.stopGeneration({chatId:second.chatId});await runQueued(host);
+});
+test('cancelled unsaved-window quit retains the tray and permits new chat admission',async t=>{
+  const host=fixture(t);host.operations.saveBackgroundSettings({backgroundTasks:true,launchAtLogin:false});host.createWindow();
+  host.appEvents.get('before-quit')();assert.equal(host.operations.bootstrap().app.backgroundTrayActive,true);
+  host.webEvents.get('will-prevent-unload')({preventDefault(){assert.fail('Continue editing must keep unload prevented');}});
+  let prevented=false;host.windowEvents.get('close')({preventDefault(){prevented=true;}});assert.equal(prevented,true,'background Close is restored after cancelled quit');
+  const chat=host.store.createChat();await host.operations.sendMessage({chatId:chat.id,content:'after cancelled quit'});await runQueued(host);assert.equal(host.store.getChat(chat.id).messages.at(-1).status,'complete');
+  host.operations.saveBackgroundSettings({backgroundTasks:false,launchAtLogin:false});
 });
 
 test('provider redacts credentials before truncating an overlong remote error', async () => {

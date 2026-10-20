@@ -8,7 +8,7 @@ import {
   FolderPlus, Info, KeyRound, LoaderCircle, MessageCircle, Minus, Monitor, Moon,
   MoreHorizontal, PanelLeft, Paperclip, Pencil, Pin, Plus, RefreshCw, Search,
   Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Square, Sun, Trash2,
-  Upload, X, AlertCircle, Database, Server, StopCircle, Reply,
+  Upload, X, AlertCircle, Database, Server, StopCircle, Reply, AlarmClock,
 } from 'lucide-react';
 import './styles.css';
 import FileEditor from './FileEditor.jsx';
@@ -16,10 +16,11 @@ import { AgentActivity, ApprovalQueue } from './AgentActivity.jsx';
 import SearchDialog from './SearchDialog.jsx';
 import PendingSends from './PendingSends.jsx';
 import ArtifactPanel from './ArtifactPanel.jsx';
+import SchedulePanel from './SchedulePanel.jsx';
 
 const api = window.muse;
 const COLORS = ['#47766a', '#607eb3', '#a07cb5', '#c49456', '#bd7777', '#7c8992'];
-const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], artifacts: [], approvals: [], pendingSends: [], app: {} };
+const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], artifacts: [], schedules: [], scheduleRuns: [], approvals: [], pendingSends: [], app: {} };
 
 function Brand({ size = 28, className = '' }) {
   return <svg width={size} height={size} viewBox="0 0 40 40" fill="none" className={`brand-mark ${className}`} aria-hidden="true">
@@ -157,7 +158,7 @@ function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport
         if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (value.trim() || attachedFiles.length) onSend(); }
       }} />
     <div className="composer-toolbar"><div className="composer-tools"><IconButton icon={Paperclip} label="添加文件" data-testid="file-import" onClick={onImport} disabled={importing} />{importing && <Spinner size={15} />}
-      <button className={`agent-mode-toggle ${useTools ? 'enabled' : ''}`} aria-pressed={!!useTools} title="让模型读取当前工作区文件；创建或修改文件前会请求确认" data-testid="agent-mode-toggle" disabled={admitting} onClick={() => onToolsChange(!useTools)}><ShieldCheck size={13} />文件助手</button>
+      <button className={`agent-mode-toggle ${useTools ? 'enabled' : ''}`} aria-pressed={!!useTools} title="让模型使用当前工作区的文件、应用和计划工具；更改前会请求确认" data-testid="agent-mode-toggle" disabled={admitting} onClick={() => onToolsChange(!useTools)}><ShieldCheck size={13} />工作区助手</button>
       <span className="composer-model"><span className={`connection-dot ${configured ? 'connected' : ''}`} />{configured ? model || '选择模型' : '尚未连接模型'}</span></div>
       <div className="composer-submit"><span className="composer-keyhint">Shift + Enter 换行</span>{busy && <button type="button" className="send-button stop-button" onClick={onStop} title="停止生成及等待发送" aria-label="停止生成" data-testid="stop-generation"><Square size={13} fill="currentColor" /></button>}
         {(!busy || value.trim() || attachedFiles.length > 0) && <button type="button" className="send-button" onClick={onSend} disabled={!value.trim() && !attachedFiles.length || importing || admitting} title={busy ? '加入待发送' : '发送消息'} aria-label={busy ? '加入待发送' : '发送消息'} data-testid="send-message"><ArrowUp size={19} strokeWidth={2} /></button>}</div>
@@ -263,6 +264,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(() => window.location.hash === '#settings');
   const [searchOpen, setSearchOpen] = useState(false);
   const [artifactsOpen, setArtifactsOpen] = useState(false);
+  const [schedulesOpen, setSchedulesOpen] = useState(false);
   const [entity, setEntity] = useState(null);
   const [confirm, setConfirm] = useState(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
@@ -317,6 +319,9 @@ function App() {
     const apply = event => {
       if (!alive || !event) return;
       if (event.type === 'snapshot') { replaceSnapshot(event.snapshot); return; }
+      if (event.type === 'open-chat'&&event.chatId) {setRoute({type:'chat',id:event.chatId});return;}
+      if (event.type === 'runtime-error') {notify(event.message,'error');return;}
+      if (event.type === 'schedule-notification') {notify(event.title,'info');return;}
       if (event.type === 'chat-delta') {
         setSnapshot(previous => {
           if (!previous) { deferredDeltas.current.set(`${event.chatId}:${event.messageId}`, event); return previous; }
@@ -496,7 +501,7 @@ function App() {
           {sortedChats.some(item => item.pinned) && <div className="sidebar-group"><div className="sidebar-group-heading"><span>置顶</span></div>{sortedChats.filter(item => item.pinned).map(renderChatItem)}</div>}
           <div className="sidebar-group conversation-group"><div className="sidebar-group-heading"><span>最近对话</span>{sortedChats.length > 0 && <small>{sortedChats.length}</small>}</div>{sortedChats.some(item => !item.pinned) ? sortedChats.filter(item => !item.pinned).map(renderChatItem) : <div className="sidebar-chat-empty"><MessageCircle size={23} strokeWidth={1.2} /><span>好想法，从一句话开始</span><small>你的对话会出现在这里</small></div>}</div>
         </div>
-        <footer className="sidebar-footer"><button className="settings-entry" onClick={() => setSettingsOpen(true)} data-testid="settings-open"><span className="settings-entry-icon"><Settings2 size={17} /></span><span>设置</span>{configured ? <span className="sidebar-connected" title="已配置模型服务" /> : <span className="setup-badge">连接模型</span>}</button><div className="sidebar-footnote"><span className="local-dot" />本地工作台<span>Windows</span></div></footer>
+        <footer className="sidebar-footer"><button className="settings-entry" data-testid="schedules-open" onClick={()=>setSchedulesOpen(true)}><span className="settings-entry-icon"><AlarmClock size={17}/></span><span>计划任务</span><small>{data.schedules.filter(task=>task.enabled).length||""}</small></button><button className="settings-entry" onClick={() => setSettingsOpen(true)} data-testid="settings-open"><span className="settings-entry-icon"><Settings2 size={17} /></span><span>设置</span>{configured ? <span className="sidebar-connected" title="已配置模型服务" /> : <span className="setup-badge">连接模型</span>}</button><div className="sidebar-footnote"><span className="local-dot" />本地工作台<span>Windows</span></div></footer>
       </aside>
 
       <main className="main-content"><header className="content-header"><div className="content-heading">{!sidebarOpen && <IconButton icon={PanelLeft} label="展开侧栏" onClick={() => setSidebarOpen(true)} />}{chat ? <><MessageCircle size={16} className="muted" /><h1>{chat.title || '新对话'}</h1>{workspace && <button className="workspace-breadcrumb" onClick={() => openRoute({ type: 'workspace', id: workspace.id })}><Folder size={12} style={{ color: workspace.color }} />{workspace.name}</button>}</> : route.type === 'workspace' && workspace ? <><Folder size={17} style={{ color: workspace.color }} /><h1>{workspace.name}</h1><span className="header-label">工作区</span></> : <span className="header-welcome-label">{workspace ? <><Folder size={15} style={{ color: workspace.color }} />{workspace.name}</> : '给想法一个开始'}</span>}</div>
@@ -536,6 +541,7 @@ function App() {
     </div>
     <ApprovalQueue approvals={data.approvals} chats={data.chats} files={data.files} onRespond={input => api.respondApproval(input)} onOpenChat={id => openRoute({ type: 'chat', id })} notify={notify} />
     {artifactsOpen && <ArtifactPanel artifacts={data.artifacts} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={()=>setArtifactsOpen(false)} notify={notify}/>}
+    {schedulesOpen&&<SchedulePanel schedules={data.schedules} runs={data.scheduleRuns} workspaceId={workspaceId} workspaces={data.workspaces} files={data.files} settings={data.settings} app={data.app} notify={notify} onClose={()=>setSchedulesOpen(false)} onOpenChat={id=>{setSchedulesOpen(false);openRoute({type:'chat',id});}}/>}
     {dragging && <div className="drop-overlay"><div><span><Upload size={31} /></span><h2>把资料放到这里</h2><p>{route.type === 'workspace' ? `添加到「${workspace?.name || '工作区'}」` : '作为附件，和模型一起看看。'}</p></div></div>}
     {settingsOpen && <SettingsDialog settings={data.settings} app={data.app} onClose={() => { setSettingsOpen(false); setThemePreview(null); }} onSaved={settings => setSnapshot(previous => ({ ...previous, settings }))} onImport={replaceSnapshot} notify={notify} onThemePreview={setThemePreview} />}
     {searchOpen && <SearchDialog snapshot={data} currentChatId={chat?.id} Modal={Modal} onClose={() => setSearchOpen(false)} onSelect={item => { if (item.type === 'file') setFilePreviewId(item.id); else openRoute({ type: item.type === 'message' ? 'chat' : item.type, id: item.id, ...(item.messageId ? { messageId: item.messageId, query: item.query } : {}) }); }} />}
