@@ -1,0 +1,15 @@
+node_modules/
+build/
+release/
+test-results/
+tests/.tmp/
+.test-tmp/
+coverage/
+.env
+.env.*
+!.env.example
+.npmrc
+.DS_Store
+Thumbs.db
+*.dmp
+*.log

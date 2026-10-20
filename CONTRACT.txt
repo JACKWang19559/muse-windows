@@ -1,0 +1,77 @@
+Muse Windows implementation contract — shared by backend, native shell and renderer.
+
+Renderer accesses only window.muse. Keys and filesystem paths stay in the main process.
+All public methods below return Promises except subscribe (which returns an unsubscribe function).
+
+Data shape:
+  Settings = {baseUrl, model, systemPrompt, temperature, hasApiKey, theme:'system'|'light'|'dark', language:'zh', transcriptionModel?}
+  Workspace = {id,name,description,color,createdAt,updatedAt}
+  Chat = {id,title,workspaceId:null|string,createdAt,updatedAt,pinned:boolean,messages:Message[]}
+  Message = {id,role:'user'|'assistant',content,createdAt,status?:'complete'|'streaming'|'error'|'cancelled',attachmentIds?:string[],error?:string}
+  File = {id,name,mime,size,workspaceId:null|string,createdAt,textStatus:'ready'|'unsupported'|'error',textPreview?,error?}
+  Snapshot = {settings,workspaces,chats,files,app:{version,platform,dataDirectory?}}
+
+window.muse methods:
+  bootstrap() -> Snapshot
+  saveSettings({baseUrl,model,apiKey?:string,clearApiKey?:boolean,systemPrompt,temperature,theme,transcriptionModel?}) -> Settings
+  testConnection() -> {ok:boolean,message:string,models?:string[]}
+  listModels() -> string[]
+  createWorkspace({name,description?,color?}) -> Workspace
+  updateWorkspace({id,name?,description?,color?}) -> Workspace
+  deleteWorkspace({id}) -> Snapshot  // detach its chats/files; never delete original user files
+  createChat({workspaceId?:string|null,title?:string}) -> Chat
+  updateChat({id,title?,pinned?,workspaceId?}) -> Chat
+  deleteChat({id}) -> Snapshot
+  sendMessage({chatId,content,attachmentIds?:string[]}) -> {requestId:string}
+  stopGeneration({chatId}) -> void
+  retryMessage({chatId}) -> {requestId:string}
+  importFiles({workspaceId?:string|null}) -> File[]  // native picker
+  importDroppedFiles(files:File[], workspaceId?:string|null) -> File[]  // preload uses webUtils, never trusts raw renderer paths
+  removeFile({id}) -> Snapshot  // removes the app's managed copy
+  readFile({id}) -> {name,text,truncated:boolean}
+  openFile({id}) -> void  // managed copy only
+  exportChat({chatId,format:'markdown'|'json'}) -> {cancelled:boolean,path?:string}
+  exportData() -> {cancelled:boolean,path?:string}
+  importData() -> Snapshot|null
+  copyText(text) -> void
+  openExternal(url) -> void // http(s) only
+  windowControl('minimize'|'maximize'|'close') -> void
+  subscribe(callback) -> unsubscribe
+
+Events:
+  {type:'snapshot',snapshot:Snapshot}
+  {type:'chat-delta',chatId,messageId,delta,content}
+  {type:'chat-complete',chatId,messageId,chat:Chat}
+  {type:'chat-error',chatId,messageId,error,chat:Chat}
+  {type:'chat-cancelled',chatId,messageId,chat:Chat}
+
+Backend module boundaries (main process):
+  backend/store.cjs exports Store. new Store(dataDir,{encrypt,decrypt})
+    .snapshot(), .settings(), .secret(), .saveSettings(input)
+    .createWorkspace(input), .updateWorkspace(input), .deleteWorkspace(id)
+    .createChat(input), .updateChat(input), .deleteChat(id), .getChat(id)
+    .appendMessage(chatId,message), .updateMessage(chatId,messageId,patch)
+    .addFile({sourcePath,workspaceId?}), .removeFile(id), .getFile(id), .filePath(id), .readFile(id)
+    .exportData(), .importData(data), .flush()
+    store methods may be awaited by caller; sync implementations are allowed.
+    data mutations return corresponding public object; .snapshot() strips all secrets and private paths.
+  backend/provider.cjs exports streamCompletion({settings,apiKey,messages,signal,onDelta}), listModels({settings,apiKey,signal}), testConnection({settings,apiKey,signal})
+    streamCompletion returns {content,usage?}; onDelta receives text chunks; messages use provider-compatible role/content.
+    Base URL may be a root, a /v1 prefix, or a full /chat/completions endpoint.
+    Only sends requests to the user's configured provider. Never use Meta endpoints or tokens from the analyzed package.
+
+Important invariants:
+  One active request per chat, streaming messages persisted on completion/cancel/error.
+  Workspace scope includes that workspace's text documents plus explicitly attached files.
+  Rendering Markdown uses sanitization and external links are delegated to the main process.
+  No shell command execution; attachments/imported project content are treated as inert data.
+  Renderer contextIsolation true, nodeIntegration false, sandbox true. IPC caller must be local app main frame.
+  API keys are encrypted by Electron safeStorage (DPAPI on Windows), never included in snapshot/events/exports.
+  JSON backups validate schema, regenerate/import IDs safely, and never trust imported file paths.
+
+UI scope:
+  Chinese polished desktop workspace. Sidebar new chat, search, chats grouped/pinned, Spaces/workspaces, settings.
+  Welcome/new chat composer, streaming chat with Markdown/copy/retry/stop, native file attachments.
+  Workspace page has editable name/description, files, scoped chats. File preview panel.
+  Settings covers base URL/key/model, connection test, model discovery, prompt/temp/theme, backup import/export.
+  Empty state must not fake an AI answer. Ask user to configure provider, then send real requests.
