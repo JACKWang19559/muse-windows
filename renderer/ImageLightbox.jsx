@@ -2,6 +2,8 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, Download, FileText, LoaderCircle, Trash2, X } from 'lucide-react';
 import { isImageFile } from '../backend/image-format.cjs';
 import ImagePreview from './ImagePreview.jsx';
+import VideoPreview from './VideoPreview.jsx';
+import { isVideoFile, isPreviewMediaFile } from '../backend/video-format.cjs';
 import './image-preview.css';
 
 const focusable = 'button:not(:disabled),a[href],input:not(:disabled),textarea:not(:disabled),select:not(:disabled),[tabindex="0"]';
@@ -10,15 +12,16 @@ const ignoresNavigation = (target, panel) => target instanceof HTMLElement && (
   target.isContentEditable || target.closest('input,textarea,select,video,audio,[contenteditable="true"],[contenteditable=""],[contenteditable="plaintext-only"]')
 );
 const fileError = error => (typeof error?.message === 'string' ? error.message : '')
-  .replace(/^Error invoking remote method 'muse:invoke': (?:Error: )?/, '').trim() || '无法下载图片，请重试。';
+  .replace(/^Error invoking remote method 'muse:invoke': (?:Error: )?/, '').trim() || '无法下载文件，请重试。';
 
 export default function ImageLightbox({ selection, files, onClose, onOpenFile, onRemove, notify }) {
   const ids = [], seen = new Set(), byId = new Map(files.map(file => [file.id, file]));
+  const accepts = selection.kind === 'image' ? isImageFile : selection.kind === 'video' ? isVideoFile : isPreviewMediaFile;
   for (const id of selection.ids) {
     const file = byId.get(id);
-    if (!seen.has(id) && file && isImageFile(file.name)) { seen.add(id); ids.push(id); }
+    if (!seen.has(id) && file && accepts(file.name)) { seen.add(id); ids.push(id); }
   }
-  const signature = JSON.stringify([selection.ids, selection.initialId, selection.wrap === true]);
+  const signature = JSON.stringify([selection.ids, selection.initialId, selection.wrap === true, selection.kind || 'visual']);
   const initialIndex = Math.max(0, ids.indexOf(selection.initialId));
   const [position, setPosition] = useState(() => ({ signature, id: ids[initialIndex], index: initialIndex }));
   const activePosition = position.signature === signature ? position : { signature, id: ids[initialIndex], index: initialIndex };
@@ -26,7 +29,7 @@ export default function ImageLightbox({ selection, files, onClose, onOpenFile, o
   const index = existingIndex < 0 ? Math.min(activePosition.index, Math.max(0, ids.length - 1)) : existingIndex;
   const current = byId.get(ids[index]);
   const panel = useRef(null), closeButton = useRef(null), latest = useRef(null), alive = useRef(true);
-  const downloadInFlight = useRef(false), gesture = useRef(null), suppressClick = useRef(false), closedEmpty = useRef(null);
+  const downloadInFlight = useRef(false), gesture = useRef(null), pointerOrigin = useRef(null), suppressClick = useRef(false), closedEmpty = useRef(null);
   const [downloading, setDownloading] = useState(false);
   latest.current = { ids, index, current, signature, wrap: selection.wrap === true, onClose, onOpenFile, onRemove, notify };
 
@@ -87,7 +90,7 @@ export default function ImageLightbox({ selection, files, onClose, onOpenFile, o
     document.addEventListener('keydown', key, true);
     document.addEventListener('focusin', focus);
     return () => {
-      alive.current = false; gesture.current = null;
+      alive.current = false; gesture.current = null; pointerOrigin.current = null;
       cancelAnimationFrame(frame);
       document.removeEventListener('keydown', key, true);
       document.removeEventListener('focusin', focus);
@@ -101,7 +104,7 @@ export default function ImageLightbox({ selection, files, onClose, onOpenFile, o
     downloadInFlight.current = true; setDownloading(true);
     try {
       const result = await window.muse.exportFile({ id: captured.id });
-      if (!result.cancelled) latest.current.notify?.('图片原始副本已下载');
+      if (!result.cancelled) latest.current.notify?.('文件原始副本已下载');
     } catch (error) { latest.current.notify?.(fileError(error), 'error'); }
     finally { downloadInFlight.current = false; if (alive.current) setDownloading(false); }
   };
@@ -109,6 +112,21 @@ export default function ImageLightbox({ selection, files, onClose, onOpenFile, o
     if (suppressClick.current) { suppressClick.current = false; event.stopPropagation(); return; }
     if (event.target instanceof Element && event.target.closest('img,button,a,input,textarea,select,video,audio')) return;
     latest.current.onClose();
+  };
+  // A source change can disable the old range and release the browser's
+  // pointer capture. Its eventual click must not close the replacement view.
+  const capturePointerDown = event => {
+    if (event.isPrimary === false || event.button !== 0) return;
+    const view = latest.current;
+    pointerOrigin.current = { pointerId: event.pointerId, signature: view.signature, id: view.current?.id,
+      protected: event.target instanceof Element && !!event.target.closest('img,button,a,input,textarea,select,video,audio') };
+  };
+  const capturePointerEnd = event => {
+    const start = pointerOrigin.current;
+    if (!start || start.pointerId !== event.pointerId) return;
+    pointerOrigin.current = null;
+    const view = latest.current;
+    if (start.protected || start.signature !== view.signature || start.id !== view.current?.id) suppressClick.current = true;
   };
   const pointerDown = event => {
     suppressClick.current = false;
@@ -129,17 +147,17 @@ export default function ImageLightbox({ selection, files, onClose, onOpenFile, o
   if (!current) return null;
   const previousEnabled = ids.length > 1 && (selection.wrap || index > 0);
   const nextEnabled = ids.length > 1 && (selection.wrap || index < ids.length - 1);
-  return <section ref={panel} className="image-lightbox" role="dialog" aria-modal="true" aria-label={'图片预览 ' + current.name} tabIndex={-1} data-testid="image-lightbox" data-file-id={current.id} onClick={event => { if (event.target === event.currentTarget) clickBackground(event); }}>
+  return <section ref={panel} className="image-lightbox" role="dialog" aria-modal="true" aria-label={(isVideoFile(current.name) ? '视频预览 ' : '图片预览 ') + current.name} tabIndex={-1} data-testid="image-lightbox" data-file-id={current.id} data-media-kind={isVideoFile(current.name) ? 'video' : 'image'} onClick={event => { if (event.target === event.currentTarget) clickBackground(event); }}>
     <header className="image-lightbox-header" onClick={event => event.stopPropagation()}>
-      <button ref={closeButton} type="button" className="icon-button" aria-label="关闭图片预览" title="关闭图片预览" data-testid="image-lightbox-close" onClick={() => onClose()}><X size={20} /></button>
+      <button ref={closeButton} type="button" className="icon-button" aria-label="关闭预览" title="关闭预览" data-testid="image-lightbox-close" onClick={() => onClose()}><X size={20} /></button>
       <span className="image-lightbox-title" title={current.name} data-testid="image-lightbox-title">{current.name}</span>
       <span className="image-lightbox-counter" aria-live="polite" data-testid="image-lightbox-counter">{index + 1} / {ids.length}</span>
     </header>
-    <div className="image-lightbox-stage" onClick={clickBackground} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={() => { gesture.current = null; }}>
-      <ImagePreview key={current.id} file={current} />
+    <div className="image-lightbox-stage" onClick={clickBackground} onPointerDownCapture={capturePointerDown} onPointerUpCapture={capturePointerEnd} onPointerCancelCapture={capturePointerEnd} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={() => { gesture.current = null; }}>
+      {isVideoFile(current.name) ? <VideoPreview file={current} variant="lightbox" /> : <ImagePreview key={current.id} file={current} />}
       {ids.length > 1 && <>
-        <button type="button" className="image-lightbox-nav previous" aria-label="上一张图片" title="上一张图片" data-testid="image-lightbox-previous" disabled={!previousEnabled} onClick={event => { event.stopPropagation(); navigate(-1); }}><ChevronLeft size={24} /></button>
-        <button type="button" className="image-lightbox-nav next" aria-label="下一张图片" title="下一张图片" data-testid="image-lightbox-next" disabled={!nextEnabled} onClick={event => { event.stopPropagation(); navigate(1); }}><ChevronRight size={24} /></button>
+        <button type="button" className="image-lightbox-nav previous" aria-label="上一个文件" title="上一个文件" data-testid="image-lightbox-previous" disabled={!previousEnabled} onClick={event => { event.stopPropagation(); navigate(-1); }}><ChevronLeft size={24} /></button>
+        <button type="button" className="image-lightbox-nav next" aria-label="下一个文件" title="下一个文件" data-testid="image-lightbox-next" disabled={!nextEnabled} onClick={event => { event.stopPropagation(); navigate(1); }}><ChevronRight size={24} /></button>
       </>}
     </div>
     <footer className="image-lightbox-footer" onClick={event => event.stopPropagation()}>

@@ -111,6 +111,7 @@ server.listen(0, '127.0.0.1', async () => {
     const result={};const visit=relative=>{const file=path.join(application,relative);if(fs.statSync(file).isDirectory()){for(const name of fs.readdirSync(file).sort())visit(relative+'/'+name);}else result[relative]=hash(file);};
     for(const name of ['main.cjs','preload.cjs','package.json','backend','build'])visit(name);
     for(const name of fs.readdirSync(path.join(application,'scripts')).filter(name=>/scenario\.cjs$/.test(name)).sort())visit('scripts/'+name);
+    visit('scripts/video-fixtures.cjs');
     return result;
   };
   const runtimeAtLaunch=manifest(),executableAtLaunch=hash(binary);
@@ -121,7 +122,7 @@ server.listen(0, '127.0.0.1', async () => {
   const child = spawn(binary, args, { cwd:root, env, windowsHide:true, stdio:['ignore','pipe','pipe'] });
   let output = '';
   child.stdout.on('data', x => { output += x; }); child.stderr.on('data', x => { output += x; });
-  const timeout = setTimeout(() => { output += '\nDesktop test timeout'; child.kill(); }, 120000);
+  const timeout = setTimeout(() => { output += '\nDesktop test timeout'; child.kill(); }, 180000);
   child.on('error', error => { clearTimeout(timeout); server.close(); console.error(error.message); process.exitCode=1; });
   child.on('exit', code => {
     clearTimeout(timeout); server.close();

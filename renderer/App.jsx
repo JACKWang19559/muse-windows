@@ -14,6 +14,7 @@ import './styles.css';
 import FileEditor from './FileEditor.jsx';
 import ImageLightbox from './ImageLightbox.jsx';
 import { isImageFile } from '../backend/image-format.cjs';
+import { isVideoFile, isPreviewMediaFile } from '../backend/video-format.cjs';
 import RenameFileDialog from './RenameFileDialog.jsx';
 import { AgentActivity, ApprovalQueue } from './AgentActivity.jsx';
 import SearchDialog from './SearchDialog.jsx';
@@ -22,9 +23,10 @@ import ArtifactPanel from './ArtifactPanel.jsx';
 import SchedulePanel from './SchedulePanel.jsx';
 import KnowledgePanel from './KnowledgePanel.jsx';
 import { useDictation } from './DictationControl.jsx';
-import { useAudioPlayback, AudioControls, isAudioFile } from './AudioPlayback.jsx';
+import { useAudioPlayback, AudioControls, isAudioFile as legacyIsAudioFile } from './AudioPlayback.jsx';
 
 const api = window.muse;
+const isAudioFile = file => legacyIsAudioFile(file) && !isVideoFile(file?.name);
 const COLORS = ['#47766a', '#607eb3', '#a07cb5', '#c49456', '#bd7777', '#7c8992'];
 const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], artifacts: [], schedules: [], scheduleRuns: [], memoryDocuments:[],memories:[],skills:[],agentProfiles:[],memoryIndexes:[],approvals: [], pendingSends: [], app: {} };
 
@@ -318,10 +320,16 @@ function App() {
   const [renameFile, setRenameFile] = useState(null);
   const [imageViewer, setImageViewer] = useState(null);
   const openFileTab = id => { if (id) setFilePreviewIds(previous => previous.includes(id) ? previous : [...previous, id]); selectFilePreview(id); };
-  const setFilePreviewId = (id, ids = [id], wrap = false) => {
+  const setFilePreviewId = (id, ids = [id], wrap = false, kind = 'visual') => {
     const file = data.files.find(value => value.id === id);
-    if (file && isImageFile(file.name)) setImageViewer({ initialId: id, ids: Array.isArray(ids) ? [...ids] : [id], wrap });
+    if (file && isPreviewMediaFile(file.name)) setImageViewer({ initialId: id, ids: Array.isArray(ids) ? [...ids] : [id], wrap, kind });
     else openFileTab(id);
+  };
+  const openMessageFile = (file, message) => {
+    if (isAudioFile(file)) playAudioAttachment(file, message);
+    else if (isVideoFile(file.name)) setFilePreviewId(file.id, [file.id], false, 'video');
+    else if (isImageFile(file.name)) setFilePreviewId(file.id, message.attachmentIds || [file.id], true, 'image');
+    else openFileTab(file.id);
   };
   const closeFilePreview = id => { const remaining = filePreviewIds.filter(value => value !== id); setFilePreviewIds(remaining); if (filePreviewId === id) selectFilePreview(remaining.at(-1) || null); };
   const [menu, setMenu] = useState(null);
@@ -714,10 +722,10 @@ function App() {
             {chat.messages.length ? chat.messages.map((message, index) => <article className={`message message-${message.role} ${route.messageId === message.id ? 'message-search-target' : ''}`} key={message.id} tabIndex={-1} data-role={message.role} data-message-id={message.id} data-status={message.status || 'complete'}>
               {message.role === 'assistant' && <span className="assistant-avatar"><Brand size={23} /></span>}<div className="message-body">{message.role === 'user' ? message.isDeleted ? <p className="message-deleted" data-testid="deleted-message"><Trash2 size={13} />你删除了一条消息</p> : <>
                 {message.replyTo && <button className="message-quote" data-testid="message-quote" onClick={() => openRoute({ type: 'chat', id: chat.id, messageId: message.replyTo.messageId })}><Reply size={14} /><span><strong>{message.replyTo.role === 'user' ? '你' : 'Muse'}</strong>{chat.messages.find(item => item.id === message.replyTo.messageId)?.isDeleted ? '已删除的消息' : excerpt(message.replyTo.excerpt || '附件消息', 180)}</span></button>}
-                {message.activePanel && message.activePanel.artifactId!==message.artifactContext?.artifactId && <div className="message-artifact-context" data-testid="message-active-panel"><Monitor size={13}/>{message.activePanel.artifactName} · 应用</div>}{message.artifactContext && <div className="message-artifact-context" data-testid="message-artifact-context"><Monitor size={13}/>{message.artifactContext.artifactName} · 页面选区</div>}<div className="user-message-content"><HighlightText text={message.content} query={route.messageId === message.id ? route.query : null} /></div>{message.attachmentIds?.length > 0 && <div className="message-attachments">{message.attachmentIds.map(id => { const file = data.files.find(file => file.id === id); return file ? <button key={id} data-testid={isAudioFile(file)?'audio-attachment':isImageFile(file.name)?'image-attachment':undefined} onClick={() => isAudioFile(file)?playAudioAttachment(file,message):setFilePreviewId(id,message.attachmentIds,true)}><FileText size={14} /><span>{file.name}{isAudioFile(file)?' · 播放音频':''}</span></button> : null; })}</div>}
+                {message.activePanel && message.activePanel.artifactId!==message.artifactContext?.artifactId && <div className="message-artifact-context" data-testid="message-active-panel"><Monitor size={13}/>{message.activePanel.artifactName} · 应用</div>}{message.artifactContext && <div className="message-artifact-context" data-testid="message-artifact-context"><Monitor size={13}/>{message.artifactContext.artifactName} · 页面选区</div>}<div className="user-message-content"><HighlightText text={message.content} query={route.messageId === message.id ? route.query : null} /></div>{message.attachmentIds?.length > 0 && <div className="message-attachments">{message.attachmentIds.map(id => { const file = data.files.find(file => file.id === id); return file ? <button key={id} data-testid={isVideoFile(file.name)?'video-attachment':isAudioFile(file)?'audio-attachment':isImageFile(file.name)?'image-attachment':undefined} onClick={() => openMessageFile(file,message)}><FileText size={14} /><span>{file.name}{isVideoFile(file.name)?' · 播放视频':isAudioFile(file)?' · 播放音频':''}</span></button> : null; })}</div>}
                 <div className="message-actions user-message-actions"><CopyButton content={message.content} notify={notify} /><IconButton icon={Reply} label="引用回复" data-testid="quote-message" onClick={() => quoteMessage(message)} disabled={busy} /><IconButton icon={Trash2} label="删除消息" data-testid="delete-turn" onClick={() => askDeleteTurn(message)} disabled={busy} />{index === chat.messages.length - 1 && <IconButton icon={RefreshCw} label="继续回复" data-testid="retry-message" onClick={retry} disabled={busy} />}<span>{dateText(message.createdAt)}</span></div>
               </> : <>
-                {!!message.attachmentIds?.length&&<div className="message-attachments">{message.attachmentIds.map(id=>{const file=data.files.find(item=>item.id===id);return file&&(isAudioFile(file)||isImageFile(file.name))?<button key={id} data-testid={isAudioFile(file)?"audio-attachment":"image-attachment"} disabled={message.status==='streaming'} onClick={()=>isAudioFile(file)?playAudioAttachment(file,message):setFilePreviewId(id,message.attachmentIds,true)}><FileText size={14}/>{file.name}{isAudioFile(file)?' · 播放音频':''}</button>:null;})}</div>}
+                {!!message.attachmentIds?.length&&<div className="message-attachments">{message.attachmentIds.map(id=>{const file=data.files.find(item=>item.id===id);return file&&(isAudioFile(file)||isPreviewMediaFile(file.name))?<button key={id} data-testid={isVideoFile(file.name)?"video-attachment":isAudioFile(file)?"audio-attachment":"image-attachment"} disabled={message.status==='streaming'} onClick={()=>openMessageFile(file,message)}><FileText size={14}/>{file.name}{isVideoFile(file.name)?' · 播放视频':isAudioFile(file)?' · 播放音频':''}</button>:null;})}</div>}
                 <AgentActivity trace={message.toolTrace} files={data.files} onOpenFile={setFilePreviewId} />
                 {!message.content && message.status === 'streaming' ? <div className="thinking"><span /><span /><span /><small>{data.approvals.some(approval => approval.chatId === chat.id) ? '等待你确认文件操作' : '正在思考'}</small></div> : <Markdown content={message.content} notify={notify} highlight={route.messageId === message.id ? route.query : null} />}
                 {message.status === 'streaming' && message.content && <span className="stream-caret" aria-label="正在生成" />}
@@ -735,7 +743,7 @@ function App() {
           {!configured && <button className="welcome-connect-note" onClick={() => setSettingsOpen(true)}><span><KeyRound size={17} /></span><div><strong>带上你喜欢的模型</strong><small>连接自己的 API，开始真实对话。</small></div><ArrowRight size={16} /></button>}
         </section><footer className="welcome-footer"><ShieldCheck size={13} /><span>本地保存，安静思考。使用你自己的模型服务。</span></footer></div>}
       </main>
-      {filePreviewIds.length > 0 && <FileEditor ids={filePreviewIds} activeId={filePreviewId} files={data.files} onSelect={openFileTab} onOpenImage={setFilePreviewId} onCloseTab={closeFilePreview} onClose={() => { setFilePreviewIds([]); selectFilePreview(null); }} onRemove={askRemoveFile} onRename={setRenameFile} notify={notify} Modal={Modal} renderMarkdown={content => <Markdown content={content} notify={notify} />} />}
+      {filePreviewIds.length > 0 && <FileEditor ids={filePreviewIds} activeId={filePreviewId} files={data.files} previewSuspended={Boolean(imageViewer)} onSelect={openFileTab} onOpenImage={setFilePreviewId} onCloseTab={closeFilePreview} onClose={() => { setFilePreviewIds([]); selectFilePreview(null); }} onRemove={askRemoveFile} onRename={setRenameFile} notify={notify} Modal={Modal} renderMarkdown={content => <Markdown content={content} notify={notify} />} />}
     </div>
     <ApprovalQueue approvals={data.approvals} chats={data.chats} files={data.files} onRespond={input => api.respondApproval(input)} onOpenChat={id => openRoute({ type: 'chat', id })} notify={notify} />
     <AudioControls player={chatAudio}/>

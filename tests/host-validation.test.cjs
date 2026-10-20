@@ -21,6 +21,7 @@ const API_METHODS = 'bootstrap saveSettings testConnection listModels createWork
 
 API_METHODS.push('renameFile');
 API_METHODS.push('readImageFile');
+API_METHODS.push('readVideoFile');
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
@@ -1460,6 +1461,28 @@ test('main image read enforces digest integrity and missing-copy errors without 
  const host=fixture(t),source=path.join(host.dir,'source.webp'),bytes=Buffer.from('synthetic image bytes');fs.writeFileSync(source,bytes);const file=await host.store.addFile({sourcePath:source}),input={id:file.id,expectedName:file.name,expectedSha256:file.sha256};
  assert.throws(()=>host.operations.readImageFile({...input,expectedSha256:'0'.repeat(64)}),/已变化/);const managed=host.store.filePath(file.id);bytes[0]^=1;fs.writeFileSync(managed,bytes);
  assert.throws(()=>host.operations.readImageFile(input),/已变化/);fs.unlinkSync(managed);assert.throws(()=>host.operations.readImageFile(input),error=>!error.message.includes(host.dir)&&!error.message.includes(managed));
+});
+
+test('main video read returns only the selected owned binary and does not publish it through bootstrap',async t=>{
+ const host=fixture(t),source=path.join(host.dir,'original.MP4'),bytes=Buffer.concat([Buffer.from([0,0,0,24]),Buffer.from('ftypisom'),Buffer.from([0,255,128,13,10])]);fs.writeFileSync(source,bytes);
+ const file=await host.store.addFile({sourcePath:source}),result=host.operations.readVideoFile({id:file.id,expectedName:file.name,expectedSha256:file.sha256});
+ assert.deepEqual(Object.keys(result).sort(),['id','name','mimeType','size','sha256','video'].sort());assert.equal(result.id,file.id);assert.equal(result.name,file.name);assert.equal(result.mimeType,'video/mp4');assert.equal(result.size,bytes.length);assert.equal(result.sha256,file.sha256);assert.deepEqual(Buffer.from(result.video),bytes);
+ new Uint8Array(result.video).fill(0);assert.deepEqual(Buffer.from(host.operations.readVideoFile({id:file.id,expectedName:file.name}).video),bytes);assert.deepEqual(fs.readFileSync(source),bytes);assert(!JSON.stringify(result).includes(host.dir));
+ const snapshot=host.operations.bootstrap();assert.equal(snapshot.files[0].video,undefined);assert.equal(snapshot.chats.length,0);assert.equal(host.scheduled.length,0);
+});
+
+test('main video read refuses renderer paths, missing IDs, stale names and image resource substitution',async t=>{
+ const host=fixture(t),source=path.join(host.dir,'clip.webm');fs.writeFileSync(source,Buffer.from([26,69,223,163,0,255,1]));const file=await host.store.addFile({sourcePath:source});
+ for(const input of [{id:source,expectedName:file.name},{id:file.id,expectedName:file.name,path:source},{id:'missing_video',expectedName:'missing.mp4'}])assert.throws(()=>host.operations.readVideoFile(input));
+ assert.throws(()=>host.operations.readImageFile({id:file.id,expectedName:file.name}),/格式不支持/);const renamed=await host.operations.renameFile({id:file.id,expectedName:file.name,name:'changed.MOV'});
+ assert.throws(()=>host.operations.readVideoFile({id:file.id,expectedName:file.name}),/文件名已变化/);assert.equal(host.operations.readVideoFile({id:file.id,expectedName:renamed.name,expectedSha256:renamed.sha256}).mimeType,'video/quicktime');
+ const imageSource=path.join(host.dir,'still.svg');fs.writeFileSync(imageSource,'<svg/>');const image=await host.store.addFile({sourcePath:imageSource});assert.throws(()=>host.operations.readVideoFile({id:image.id,expectedName:image.name}),/格式不支持/);assert.equal(host.scheduled.length,0);
+});
+
+test('main video read checks binary hashes and hides missing managed-copy paths',async t=>{
+ const host=fixture(t),source=path.join(host.dir,'clip.mkv'),bytes=Buffer.from('owned synthetic container bytes\0\xff');fs.writeFileSync(source,bytes);const file=await host.store.addFile({sourcePath:source}),input={id:file.id,expectedName:file.name,expectedSha256:file.sha256};
+ assert.throws(()=>host.operations.readVideoFile({...input,expectedSha256:'0'.repeat(64)}),/已变化/);const managed=host.store.filePath(file.id);bytes[0]^=1;fs.writeFileSync(managed,bytes);assert.throws(()=>host.operations.readVideoFile(input),/已变化/);
+ fs.unlinkSync(managed);assert.throws(()=>host.operations.readVideoFile(input),e=>!e.message.includes(host.dir)&&!e.message.includes(managed));assert.equal(host.operations.bootstrap().files[0].video,undefined);assert.equal(host.scheduled.length,0);
 });
 
 test('preload never exposes the host API inside a child frame',()=>{

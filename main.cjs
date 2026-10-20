@@ -743,6 +743,7 @@ const operations = {
   createTextFile: async input => { const result = await store.createTextFile(input || {}); refresh(); return result; },
   renameFile: async input => { const result = await store.renameFile(input || {}); refresh(); return result; },
   readImageFile: input => require('./backend/image-file.cjs').readManagedImage(store, input),
+  readVideoFile: input => require('./backend/video-file.cjs').readManagedVideo(store, input),
   saveTextFile: input => { const result = store.saveTextFile(input || {}); if (/\.(csv|tsv)$/i.test(result.file.name)) result.preview = store.readFile(result.file.id, { preserveCsvSource: true }); refresh(); return result; },
   readFile: input => store.readFile(id(input.id), { preserveCsvSource: true }),
   exportFile: input => exportManagedFile({ store, input, chooseDestination: name => dialog.showSaveDialog(window, { title: '下载文件副本', defaultPath: name }) }),

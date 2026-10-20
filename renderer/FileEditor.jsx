@@ -5,6 +5,8 @@ import CsvPreview from './CsvPreview.jsx';
 import { isJsonFile, jsonSaveError } from './file-json.cjs';
 import { isCsvFile } from './file-csv.cjs';
 import ImagePreview from './ImagePreview.jsx';
+import VideoPreview from './VideoPreview.jsx';
+import { isVideoFile, isPreviewMediaFile } from '../backend/video-format.cjs';
 import { isImageFile } from '../backend/image-format.cjs';
 
 const api = window.muse;
@@ -14,7 +16,7 @@ const fileErrorMessage = error => {
   return message.replace(/^Error invoking remote method 'muse:invoke': (?:Error: )?/, '').trim() || '文件操作失败，请重试。';
 };
 
-export default function FileEditor({ ids, activeId, files, onSelect, onCloseTab, onClose, onRemove, onRename, onOpenImage, notify, Modal, renderMarkdown }) {
+export default function FileEditor({ ids, activeId, files, previewSuspended = false, onSelect, onCloseTab, onClose, onRemove, onRename, onOpenImage, notify, Modal, renderMarkdown }) {
   const [tabs, setTabs] = useState({});
   const [saving, setSaving] = useState(false);
   const [downloading, setDownloading] = useState(false);
@@ -31,8 +33,8 @@ export default function FileEditor({ ids, activeId, files, onSelect, onCloseTab,
     requests.current.set(id, token);
     const name = files.find(file => file.id === id)?.name;
     patch(id, { name, loading: true, editable: false, error: '', saveError: '', saveDetail: '', renamedTo: '' });
-    if (isImageFile(name)) {
-      patch(id, { name, kind: 'image', text: '', baseline: '', editable: false, truncated: false, loading: false, mode: 'preview' });
+    if (isPreviewMediaFile(name)) {
+      patch(id, { name, kind: isVideoFile(name) ? 'video' : 'image', text: '', baseline: '', editable: false, truncated: false, loading: false, mode: 'preview' });
       return;
     }
     try {
@@ -108,6 +110,7 @@ export default function FileEditor({ ids, activeId, files, onSelect, onCloseTab,
   const isJson = isJsonFile(previewName);
   const isCsv = isCsvFile(previewName);
   const isImage = isImageFile(previewName) && !dirty(tab);
+  const isVideo = isVideoFile(previewName) && !dirty(tab);
   return <aside className="file-preview file-editor" aria-label={`文件预览 ${file.name}`} data-testid="file-preview">
     <header className="preview-header"><span className="eyebrow">文件工作台</span><button className="icon-button" aria-label="关闭文件预览" onClick={() => guard(ids, onClose)} disabled={saving}><X size={17} /></button></header>
     <div className="file-tabs" role="tablist" aria-label="已打开文件">{ids.map(id => {
@@ -117,11 +120,11 @@ export default function FileEditor({ ids, activeId, files, onSelect, onCloseTab,
     <div className="editor-toolbar"><div className="editor-modes"><button className={tab.mode !== 'edit' ? 'active' : ''} onClick={() => patch(activeId, { mode: 'preview' })} data-testid="file-preview-mode">{isJson ? '结构' : isCsv ? '表格' : '预览'}</button><button className={tab.mode === 'edit' ? 'active' : ''} disabled={!tab.editable || tab.loading} onClick={() => patch(activeId, { mode: 'edit' })} data-testid="file-edit-mode"><Pencil size={12} />{isJson || isCsv ? '源码' : '编辑'}</button></div><button className="button primary small" onClick={() => save(activeId)} disabled={!tab.editable || !dirty(tab) || saving} data-testid="file-save">{saving ? <LoaderCircle size={13} className="spin" /> : <Save size={13} />}保存</button></div>
     {tab.saveError && <div className="editor-error" role="alert">{tab.saveError}{tab.saveDetail && <p className="json-save-detail">{tab.saveDetail}</p>}<button onClick={() => guard([activeId], () => load(activeId))}>重新读取文件</button></div>}
     {tab.renamedTo && <div className="editor-error" role="alert" data-testid="file-renamed-warning">文件已重命名为“{tab.renamedTo}”，当前草稿已保留。<button onClick={() => api.copyText(tab.text).then(() => notify('草稿已复制')).catch(error => notify(fileErrorMessage(error), 'error'))}>复制草稿</button><button onClick={() => guard([activeId], () => load(activeId))}>重新读取文件</button></div>}
-    <div className={`preview-content ${tab.mode === 'edit' ? 'editing' : ''}`}>{tab.loading ? <div className="centered loading-inline"><LoaderCircle size={16} className="spin" />读取文件中…</div> : tab.error ? <div className="empty-preview"><FileText size={28} /><h4>暂无文字预览</h4><p>{tab.error}</p></div> : isImage ? <ImagePreview key={activeId} file={file} /> : tab.mode === 'edit' ? <textarea className="file-editor-input" aria-label={`编辑 ${file.name}`} data-testid="file-editor-input" spellCheck={false} value={tab.text} disabled={saving} onChange={event => patch(activeId, { text: event.target.value, saveError: '', saveDetail: '' })} /> : <>
+    <div className={`preview-content ${tab.mode === 'edit' ? 'editing' : ''}`}>{tab.loading ? <div className="centered loading-inline"><LoaderCircle size={16} className="spin" />读取文件中…</div> : tab.error ? <div className="empty-preview"><FileText size={28} /><h4>暂无文字预览</h4><p>{tab.error}</p></div> : isVideo ? previewSuspended ? <div className="empty-preview"><p>视频正在全屏浏览</p></div> : <VideoPreview file={file} variant="inline" /> : isImage ? <ImagePreview key={activeId} file={file} /> : tab.mode === 'edit' ? <textarea className="file-editor-input" aria-label={`编辑 ${file.name}`} data-testid="file-editor-input" spellCheck={false} value={tab.text} disabled={saving} onChange={event => patch(activeId, { text: event.target.value, saveError: '', saveDetail: '' })} /> : <>
       {tab.truncated && <div className="inline-note"><Info size={14} />文件较长，仅预览前面部分内容。</div>}
       {tab.text ? isJson && !tab.truncated ? <JsonPreview key={activeId} text={tab.text} editable={tab.editable} onEdit={() => patch(activeId, { mode: 'edit' })} /> : isCsv && !tab.truncated ? <CsvPreview text={tab.text} name={previewName} /> : isMarkdown ? renderMarkdown(tab.text) : <pre className="plain-preview">{tab.text}</pre> : <div className="empty-preview"><FileText size={28} /><h4>{tab.editable ? '这是一份空文件' : '这份文件没有可预览的文字'}</h4><p>{tab.editable ? '点击“编辑”开始写作。' : '使用系统应用打开这份文件。'}</p></div>}
     </>}</div>
-    <div className="editor-file-actions">{isImage && onOpenImage && <button className="text-button" disabled={tab.loading} data-testid="image-open-fullscreen" onClick={() => onOpenImage(activeId)}><Maximize2 size={13} />全屏浏览</button>}<button className="text-button" disabled={saving || downloading || tab.loading} data-testid="file-download" onClick={() => download(activeId)}>{downloading ? <LoaderCircle size={13} className="spin" /> : <Download size={13} />}下载副本</button>{onRename && <button className="text-button" disabled={saving || downloading || tab.loading} data-testid="file-rename" onClick={() => guard([activeId], decision => { if (decision === 'discard') patch(activeId, { text: latest.current.tabs[activeId].baseline, saveError: '', saveDetail: '' }); onRename(file); })}><Pencil size={13} />重命名</button>}<button className="text-button" onClick={() => api.openFile({ id: activeId }).catch(error => notify(fileErrorMessage(error), 'error'))}><ExternalLink size={13} />打开文件</button><button className="icon-button" title="重新读取文件" aria-label="重新读取文件" onClick={() => guard([activeId], () => load(activeId))} disabled={saving}><RefreshCw size={14} /></button><button className="text-button danger-text" onClick={() => onRemove(file)} disabled={saving}><Trash2 size={13} />移除</button></div>
+    <div className="editor-file-actions">{(isImage || isVideo) && onOpenImage && <button className="text-button" disabled={tab.loading} data-testid="image-open-fullscreen" onClick={() => onOpenImage(activeId)}><Maximize2 size={13} />全屏浏览</button>}<button className="text-button" disabled={saving || downloading || tab.loading} data-testid="file-download" onClick={() => download(activeId)}>{downloading ? <LoaderCircle size={13} className="spin" /> : <Download size={13} />}下载副本</button>{onRename && <button className="text-button" disabled={saving || downloading || tab.loading} data-testid="file-rename" onClick={() => guard([activeId], decision => { if (decision === 'discard') patch(activeId, { text: latest.current.tabs[activeId].baseline, saveError: '', saveDetail: '' }); onRename(file); })}><Pencil size={13} />重命名</button>}<button className="text-button" onClick={() => api.openFile({ id: activeId }).catch(error => notify(fileErrorMessage(error), 'error'))}><ExternalLink size={13} />打开文件</button><button className="icon-button" title="重新读取文件" aria-label="重新读取文件" onClick={() => guard([activeId], () => load(activeId))} disabled={saving}><RefreshCw size={14} /></button><button className="text-button danger-text" onClick={() => onRemove(file)} disabled={saving}><Trash2 size={13} />移除</button></div>
     <footer className="preview-footer"><ShieldCheck size={13} />{dirty(tab) ? '有未保存的修改 · Ctrl + S 保存' : tab.editable ? '修改仅保存到工作台中的文件副本' : '此文件为只读预览'}</footer>
     {pending && <Modal title="文件有未保存的修改" subtitle="保存后再离开，或放弃这些修改。" onClose={() => !saving && setPending(null)} className="confirm-modal"><p className="confirm-body">{pending.ids.map(id => tabs[id]?.name || files.find(file => file.id === id)?.name).join('、')}</p><footer className="modal-footer"><button className="button secondary" disabled={saving} onClick={() => setPending(null)}>继续编辑</button><button className="button ghost danger-text" disabled={saving} data-testid="file-discard" onClick={() => { const run = pending.run; setPending(null); run('discard'); }}>放弃修改</button><button className="button primary" disabled={saving} data-testid="file-save-and-close" onClick={async () => { for (const id of pending.ids) if (!await save(id)) return; const run = pending.run; setPending(null); run('saved'); }}>保存并继续</button></footer></Modal>}
   </aside>;
