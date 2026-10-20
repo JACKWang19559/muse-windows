@@ -44,6 +44,10 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await new Promise(r=>setTimeout(r,300));
     await window.webContents.capturePage().then(image=>fs.writeFileSync(path.join(folder,'settings.png'),image.toPNG()));
     await page(()=>Array.from(document.querySelectorAll('.settings-footer button')).find(x=>x.textContent==='关闭').click());
+    if(process.env.MUSE_E2E_SCENARIO==='pdf-preview'){
+      await require('./pdf-preview-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+      fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'pdf-preview only',provider:'local deterministic test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
+    }
     if(process.env.MUSE_E2E_SCENARIO==='video-preview'){
       await require('./video-preview-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
       fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'video-preview only',provider:'local deterministic test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
@@ -262,6 +266,7 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await require('./file-rename-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./image-preview-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./video-preview-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+    await require('./pdf-preview-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./chat-lifecycle-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./queue-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./cancel-admission-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});

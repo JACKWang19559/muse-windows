@@ -112,6 +112,7 @@ server.listen(0, '127.0.0.1', async () => {
     for(const name of ['main.cjs','preload.cjs','package.json','backend','build'])visit(name);
     for(const name of fs.readdirSync(path.join(application,'scripts')).filter(name=>/scenario\.cjs$/.test(name)).sort())visit('scripts/'+name);
     visit('scripts/video-fixtures.cjs');
+    visit('scripts/pdf-fixtures.cjs');
     return result;
   };
   const runtimeAtLaunch=manifest(),executableAtLaunch=hash(binary);

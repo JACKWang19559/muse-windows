@@ -8,3 +8,5 @@
 *.yml text eol=lf
 *.png binary
 *.ico binary
+# Generated fixture modules participate in byte-level acceptance receipts.
+/scripts/pdf-fixtures.cjs -text whitespace=trailing-space,space-before-tab,cr-at-eol

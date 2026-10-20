@@ -22,6 +22,33 @@ const API_METHODS = 'bootstrap saveSettings testConnection listModels createWork
 API_METHODS.push('renameFile');
 API_METHODS.push('readImageFile');
 API_METHODS.push('readVideoFile');
+API_METHODS.push('readPdfFile');
+API_METHODS.push('readPdfAsset');
+
+test('main PDF reader returns exact managed bytes without launching a decoder or model request',async t=>{
+ const host=fixture(t),source=path.join(host.dir,'owned.PDF'),bytes=Buffer.concat([Buffer.from('%PDF-1.7\r\n'),Buffer.from([0,255,128,0]),Buffer.from('\r\n%%EOF')]);fs.writeFileSync(source,bytes);
+ const file=await host.store.addFile({sourcePath:source}),input={id:file.id,expectedName:file.name,expectedSha256:file.sha256},result=host.operations.readPdfFile(input);
+ assert.equal(result.id,file.id);assert.equal(result.name,file.name);assert.equal(result.mimeType,'application/pdf');assert.equal(result.size,bytes.length);assert.deepEqual(Buffer.from(result.pdf),bytes);
+ new Uint8Array(result.pdf).fill(0);assert.deepEqual(Buffer.from(host.operations.readPdfFile(input).pdf),bytes);assert.deepEqual(fs.readFileSync(source),bytes);assert(!JSON.stringify(result).includes(host.dir));
+ assert.equal(host.operations.bootstrap().files.find(x=>x.id===file.id).pdf,undefined);assert.equal(host.scheduled.length,0);assert.equal(host.external.length,0);
+});
+
+test('main PDF preview rejects paths format confusion stale name and changed bytes through its real operation',async t=>{
+ const host=fixture(t),source=path.join(host.dir,'owned.pdf'),bytes=Buffer.from('%PDF-1.4\r\nHOST_OWNED_BYTES\r\n%%EOF');fs.writeFileSync(source,bytes);const file=await host.store.addFile({sourcePath:source}),input={id:file.id,expectedName:file.name};
+ for(const value of [{...input,id:source},{...input,path:source},{...input,expectedSha256:'0'.repeat(64)}])assert.throws(()=>host.operations.readPdfFile(value));
+ const renamed=await host.operations.renameFile({id:file.id,expectedName:file.name,name:'renamed.PDF'});assert.throws(()=>host.operations.readPdfFile(input),/文件名已变化/);assert.deepEqual(Buffer.from(host.operations.readPdfFile({id:renamed.id,expectedName:renamed.name}).pdf),bytes);
+ const managed=host.store.filePath(renamed.id),changed=Buffer.from(bytes);changed[0]^=1;fs.writeFileSync(managed,changed);assert.throws(()=>host.operations.readPdfFile({id:renamed.id,expectedName:renamed.name}),/已变化/);
+ fs.unlinkSync(managed);assert.throws(()=>host.operations.readPdfFile({id:renamed.id,expectedName:renamed.name}),e=>!e.message.includes(host.dir)&&!e.message.includes(managed));
+ const text=await host.operations.createTextFile({name:'not-pdf.txt',content:'%PDF-1.7'});assert.throws(()=>host.operations.readPdfFile({id:text.file.id,expectedName:text.file.name}),/格式不支持/);assert.equal(host.scheduled.length,0);
+});
+
+test('main offline PDF assets deliver only fixed font CMap and wasm bytes through the real reader',t=>{
+ const host=fixture(t);for(const input of [{kind:'standard-font',name:'FoxitFixed.pfb'},{kind:'cmap',name:'UniGB-UCS2-H.bcmap'},{kind:'wasm',name:'openjpeg.wasm'}]){
+  const directory={'standard-font':'standard_fonts',cmap:'cmaps',wasm:'wasm'}[input.kind],bytes=fs.readFileSync(path.join(appRoot,'node_modules/pdfjs-dist',directory,input.name)),result=host.operations.readPdfAsset(input);assert.equal(Object.prototype.toString.call(result),'[object ArrayBuffer]');assert.deepEqual(Buffer.from(result),bytes);
+ }
+ for(const input of [{kind:'cmap',name:'../LICENSE'},{kind:'cmap',name:'H.bcmap',path:host.dir},{kind:'wasm',name:'openjpeg_nowasm_fallback.js'},{kind:'standard-font',name:'LICENSE_FOXIT'}])assert.throws(()=>host.operations.readPdfAsset(input),e=>!e.message.includes(host.dir));
+ assert.equal(host.scheduled.length,0);assert.equal(host.external.length,0);assert.equal(host.store.snapshot().files.length,0);
+});
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
