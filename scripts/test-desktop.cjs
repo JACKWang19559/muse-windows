@@ -24,6 +24,26 @@ const server = http.createServer(async (request, response) => {
   const parsed = JSON.parse(body); requests.push(parsed);
   response.writeHead(200, { 'content-type':'text/event-stream' });
   const user = parsed.messages.filter(x => x.role === 'user').at(-1)?.content || '';
+  if (parsed.tools?.length && /AGENT_(CREATE|SAVE|DENY|STOP)_DEMO/.test(user)) {
+    const emitTool = (name, args) => {
+      const id = 'call-desktop-' + requests.length, data = JSON.stringify(args), cut = Math.floor(data.length / 2);
+      response.write('data: ' + JSON.stringify({ choices:[{delta:{tool_calls:[{index:0,id,type:'function',function:{name,arguments:data.slice(0,cut)}}]}}] }) + '\n\n');
+      setTimeout(() => response.end('data: ' + JSON.stringify({choices:[{delta:{tool_calls:[{index:0,function:{arguments:data.slice(cut)}}]},finish_reason:'tool_calls'}]}) + '\n\ndata: [DONE]\n\n'), 15);
+    };
+    const last = parsed.messages.at(-1);
+    if (last?.role === 'tool') {
+      const receipt = JSON.parse(last.content), previous = parsed.messages.filter(message=>message.role==='assistant'&&message.tool_calls?.length).at(-1).tool_calls.at(-1);
+      if (user.includes('AGENT_SAVE_DEMO') && receipt.ok) {
+        if (previous.function.name === 'workspace_list_files') { const file = receipt.result.files.find(file=>file.name==='agent-created.md'); if (file) { emitTool('workspace_read_file',{id:file.id}); return; } }
+        if (previous.function.name === 'workspace_read_file') { emitTool('workspace_save_text_file',{id:receipt.result.id,content:'# AGENT-SAVED-42',expectedSha256:receipt.result.sha256}); return; }
+      }
+      const text = receipt.ok ? '文件操作已完成，结果已回传。' : '用户没有批准，本次没有写入。';
+      response.end('data: '+JSON.stringify({choices:[{delta:{content:text},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n'); return;
+    }
+    if (user.includes('AGENT_SAVE_DEMO')) emitTool('workspace_list_files',{});
+    else emitTool('workspace_create_text_file',{name:user.includes('AGENT_DENY_DEMO')?'denied-agent.md':user.includes('AGENT_STOP_DEMO')?'stopped-agent.md':'agent-created.md',content:'# AGENT-CREATED-42'});
+    return;
+  }
   const chunks = user.includes('取消') ? Array(200).fill('进行中的回复。') : ['# 桌面验收通过\n\n','已收到你的问题。','参考资料代号：**WIND-CEDAR-42**。\n\n','- 流式中文回复\n- 本地文件上下文\n'];
   let index = 0;
   const timer = setInterval(() => {

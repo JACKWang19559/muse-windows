@@ -5,6 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { TextDecoder } = require('node:util');
 const { MAX_FILE_BYTES, MAX_TEXT_CHARS, TEXT_EXTENSIONS, describeFile, extractDocument } = require('./documents.cjs');
+const { normalizeToolTrace, cancelToolTrace, hasUnfinishedToolCalls, remapToolTrace } = require('./tool-trace.cjs');
 
 const STATE_VERSION = 1;
 const BACKUP_FORMAT = 'muse-windows-backup';
@@ -82,6 +83,8 @@ function messageShape(value) {
   const result = { id: identifier(value.id), role: value.role, content: string(value.content, '消息内容', 2000000), createdAt: date(value.createdAt) };
   if (value.status != null) result.status = value.status;
   if (value.error != null) result.error = string(value.error, '消息错误说明', 4000);
+  if (value.agentMode != null) { if (value.role !== 'assistant' || typeof value.agentMode !== 'boolean') fail('文件助手模式无效。'); result.agentMode = value.agentMode; }
+  if (value.toolTrace != null) { if (value.role !== 'assistant' || !value.agentMode) fail('工具记录只能属于文件助手回复。'); result.toolTrace = normalizeToolTrace(value.toolTrace); }
   if (value.attachmentIds != null) {
     if (!Array.isArray(value.attachmentIds) || value.attachmentIds.length > 100) fail('附件列表无效。');
     result.attachmentIds = [...new Set(value.attachmentIds.map(id => identifier(id, '附件标识符')))];
@@ -162,7 +165,7 @@ class Store {
     }
     this._recoverFileEdits();
     let interrupted = false;
-    for (const chat of this.state.chats) for (const message of chat.messages) if (message.status === 'streaming') { message.status = 'cancelled'; interrupted = true; }
+    for (const chat of this.state.chats) for (const message of chat.messages) if (message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace)) { message.status = 'cancelled'; if (message.toolTrace) message.toolTrace = cancelToolTrace(message.toolTrace); interrupted = true; }
     if (interrupted) this.recoveryNotice = '上次关闭时仍在生成的消息已标记为已停止，可以重试。';
     this._persistState(this.state);
   }
@@ -335,13 +338,13 @@ class Store {
   deleteChat(id) { this._chat(id); this._commit(next => { next.chats = next.chats.filter(item => item.id !== id); return null; }); return this.snapshot(); }
   getChat(id) { return copy(this._chat(id)); }
   appendMessage(chatId, input) {
-    record(input, '消息'); onlyKeys(input, ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error'], '消息');
+    record(input, '消息'); onlyKeys(input, ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace'], '消息');
     const message = messageShape({ id: input.id || uid('msg'), createdAt: stamp(), status: 'complete', ...input });
     for (const id of message.attachmentIds || []) this._file(id);
     return this._commit(next => { const chat = this._chat(chatId, next); if (chat.messages.some(item => item.id === message.id)) fail('消息标识符已存在。'); chat.messages.push(message); chat.updatedAt = stamp(); return message; });
   }
   updateMessage(chatId, messageId, patch) {
-    record(patch, '消息'); onlyKeys(patch, ['content', 'status', 'attachmentIds', 'error'], '消息');
+    record(patch, '消息'); onlyKeys(patch, ['content', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace'], '消息');
     return this._commit(next => { const chat = this._chat(chatId, next), index = chat.messages.findIndex(item => item.id === messageId); if (index < 0) fail('消息不存在。'); const value = messageShape({ ...chat.messages[index], ...patch }); for (const id of value.attachmentIds || []) this._file(id, next); chat.messages[index] = value; chat.updatedAt = stamp(); return value; });
   }
   async _prepareFile(buffer, name, workspaceId) {
@@ -470,7 +473,7 @@ class Store {
     for (const item of data.chats) {
       onlyKeys(record(item, '对话'), ['id', 'title', 'workspaceId', 'createdAt', 'updatedAt', 'pinned', 'messages'], '备份对话');
       if (!Array.isArray(item.messages)) fail('备份消息列表无效。');
-      for (const message of item.messages) onlyKeys(record(message, '消息'), ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error'], '备份消息');
+      for (const message of item.messages) onlyKeys(record(message, '消息'), ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace'], '备份消息');
     }
     let total = 0;
     const buffers = new Map(), source = { workspaces: data.workspaces.map(workspaceShape), chats: data.chats.map(chatShape), files: data.files.map(file => {
@@ -486,7 +489,7 @@ class Store {
     try {
       for (const item of source.files) { const file = await this._prepareFile(buffers.get(item.id), item.name, item.workspaceId === null ? null : workspaceIds.get(item.workspaceId)); file.createdAt = item.createdAt; prepared.push(file); fileIds.set(item.id, file.id); }
       const workspaces = source.workspaces.map(item => ({ ...item, id: workspaceIds.get(item.id) }));
-      const chats = source.chats.map(item => ({ ...item, id: uid('chat'), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), messages: item.messages.map(message => ({ ...message, id: uid('msg'), status: message.status === 'streaming' ? 'cancelled' : message.status, ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) }));
+      const chats = source.chats.map(item => ({ ...item, id: uid('chat'), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), messages: item.messages.map(message => ({ ...message, id: uid('msg'), status: message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace) ? 'cancelled' : message.status, ...(message.toolTrace ? { toolTrace: remapToolTrace(cancelToolTrace(message.toolTrace), { fileIds, workspaceIds }) } : {}), ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) }));
       this._commit(next => { if (next.workspaces.length + workspaces.length > 1000 || next.chats.length + chats.length > 5000 || next.files.length + prepared.length > 10000) fail('合并后的数据数量超出限制。'); next.settings = settings; next.workspaces.push(...workspaces); next.chats.push(...chats); next.files.push(...prepared); return null; });
       return this.snapshot();
     } catch (error) { for (const item of prepared) this._discardFile(item); throw error; }

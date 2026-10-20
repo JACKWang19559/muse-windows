@@ -12,10 +12,11 @@ import {
 } from 'lucide-react';
 import './styles.css';
 import FileEditor from './FileEditor.jsx';
+import { AgentActivity, ApprovalQueue } from './AgentActivity.jsx';
 
 const api = window.muse;
 const COLORS = ['#47766a', '#607eb3', '#a07cb5', '#c49456', '#bd7777', '#7c8992'];
-const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], app: {} };
+const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], approvals: [], app: {} };
 
 function Brand({ size = 28, className = '' }) {
   return <svg width={size} height={size} viewBox="0 0 40 40" fill="none" className={`brand-mark ${className}`} aria-hidden="true">
@@ -85,7 +86,7 @@ function Markdown({ content, notify }) {
   }} />;
 }
 
-function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport, onDrop, onSend, onStop, busy, importing, welcome = false, placeholder, model, configured }) {
+function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport, onDrop, onSend, onStop, busy, importing, welcome = false, placeholder, model, configured, useTools, onToolsChange }) {
   const input = useRef(null);
   const composing = useRef(false);
   useLayoutEffect(() => { if (input.current) { input.current.style.height = 'auto'; input.current.style.height = `${Math.min(input.current.scrollHeight, 190)}px`; } }, [value]);
@@ -101,6 +102,7 @@ function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport
       onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }}
       onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !composing.current && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); if (!busy && (value.trim() || attachedFiles.length)) onSend(); } }} />
     <div className="composer-toolbar"><div className="composer-tools"><IconButton icon={Paperclip} label="添加文件" data-testid="file-import" onClick={onImport} disabled={importing} />{importing && <Spinner size={15} />}
+      <button className={`agent-mode-toggle ${useTools ? 'enabled' : ''}`} aria-pressed={!!useTools} title="让模型读取当前工作区文件；创建或修改文件前会请求确认" data-testid="agent-mode-toggle" disabled={busy} onClick={() => onToolsChange(!useTools)}><ShieldCheck size={13} />文件助手</button>
       <span className="composer-model"><span className={`connection-dot ${configured ? 'connected' : ''}`} />{configured ? model || '选择模型' : '尚未连接模型'}</span></div>
       <div className="composer-submit"><span className="composer-keyhint">Shift + Enter 换行</span>{busy ? <button type="button" className="send-button stop-button" onClick={onStop} title="停止生成" aria-label="停止生成" data-testid="stop-generation"><Square size={13} fill="currentColor" /></button>
         : <button type="button" className="send-button" onClick={onSend} disabled={!value.trim() && !attachedFiles.length || importing} title="发送消息" aria-label="发送消息" data-testid="send-message"><ArrowUp size={19} strokeWidth={2} /></button>}</div>
@@ -237,6 +239,7 @@ function App() {
   const [menu, setMenu] = useState(null);
   const [drafts, setDrafts] = useState({});
   const [attachments, setAttachments] = useState({});
+  const [agentModes, setAgentModes] = useState({});
   const [importing, setImporting] = useState(false);
   const [pendingChats, setPendingChats] = useState(new Set());
   const [sending, setSending] = useState(false);
@@ -318,6 +321,7 @@ function App() {
   const workspace = route.type === 'workspace' ? data.workspaces.find(item => item.id === route.id) : chat?.workspaceId ? data.workspaces.find(item => item.id === chat.workspaceId) : route.workspaceId ? data.workspaces.find(item => item.id === route.workspaceId) : null;
   const workspaceId = workspace?.id || null;
   const composerKey = chat ? `chat:${chat.id}` : `new:${workspaceId || 'personal'}`;
+  const useTools = agentModes[composerKey] ?? !!chat?.messages.filter(message => message.role === 'assistant').at(-1)?.agentMode;
   const draft = drafts[composerKey] || '';
   const attachedIds = attachments[composerKey] || [];
   const attachedFiles = attachedIds.map(id => data.files.find(file => file.id === id)).filter(Boolean);
@@ -361,10 +365,10 @@ function App() {
     const key = composerKey, text = draft, files = [...attachedIds];
     let target = chat;
     try {
-      if (!target) { target = await api.createChat({ workspaceId }); setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, target) })); openRoute({ type: 'chat', id: target.id }); }
+      if (!target) { target = await api.createChat({ workspaceId }); setAgentModes(previous => ({ ...previous, [`chat:${target.id}`]: useTools })); setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, target) })); openRoute({ type: 'chat', id: target.id }); }
       setPendingChats(previous => new Set(previous).add(target.id));
       followBottom.current = true;
-      await api.sendMessage({ chatId: target.id, content: text, attachmentIds: files });
+      await api.sendMessage({ chatId: target.id, content: text, attachmentIds: files, useTools });
       setDrafts(previous => ({ ...previous, [key]: '' })); setAttachments(previous => ({ ...previous, [key]: [] }));
     } catch (error) {
       if (target) setPendingChats(previous => { const next = new Set(previous); next.delete(target.id); return next; });
@@ -388,7 +392,7 @@ function App() {
   const askDeleteChat = item => { setMenu(null); setConfirm({ title: '删除这段对话？', body: `“${item.title}”中的消息将从工作台删除。`, action: '删除对话', run: async () => { replaceSnapshot(await api.deleteChat({ id: item.id })); if (chat?.id === item.id) newChat(item.workspaceId); } }); };
   const askDeleteWorkspace = item => { setMenu(null); setConfirm({ title: '删除这个工作区？', body: `“${item.name}”将被删除，其中的对话和文件会保留在个人工作台。`, action: '删除工作区', run: async () => { replaceSnapshot(await api.deleteWorkspace({ id: item.id })); newChat(); } }); };
   const exportChat = async format => { setMenu(null); try { const result = await api.exportChat({ chatId: chat.id, format }); if (!result.cancelled) notify('对话已导出'); } catch (error) { notify(error.message, 'error'); } };
-  const composerProps = { value: draft, onChange: updateDraft, attachedFiles, onRemoveAttachment: id => setAttachments(previous => ({ ...previous, [composerKey]: attachedIds.filter(item => item !== id) })), onImport: () => addFiles(), onDrop: files => { dragCount.current = 0; setDragging(false); if (files.length) addFiles(files); }, onSend: send, onStop: stop, busy, importing, model: data.settings.model, configured };
+  const composerProps = { value: draft, onChange: updateDraft, attachedFiles, onRemoveAttachment: id => setAttachments(previous => ({ ...previous, [composerKey]: attachedIds.filter(item => item !== id) })), onImport: () => addFiles(), onDrop: files => { dragCount.current = 0; setDragging(false); if (files.length) addFiles(files); }, onSend: send, onStop: stop, busy, importing, model: data.settings.model, configured, useTools, onToolsChange: enabled => setAgentModes(previous => ({ ...previous, [composerKey]: enabled })) };
 
   if (!snapshot) return <div className="boot-screen"><Brand size={56} /><h1>Muse</h1>{bootError ? <><p className="boot-error">{bootError}</p><button className="button secondary" onClick={() => window.location.reload()}><RefreshCw size={15} />重新打开</button></> : <p><Spinner size={16} />正在打开你的工作台…</p>}</div>;
 
@@ -423,7 +427,8 @@ function App() {
           <div className="chat-scroll" ref={scroll} onScroll={() => { const element = scroll.current; const near = element.scrollHeight - element.scrollTop - element.clientHeight < 100; followBottom.current = near; setShowScrollBottom(!near); }} data-testid="chat-messages"><div className="chat-messages">
             {chat.messages.length ? chat.messages.map((message, index) => <article className={`message message-${message.role}`} key={message.id} data-role={message.role} data-message-id={message.id} data-status={message.status || 'complete'}>
               {message.role === 'assistant' && <span className="assistant-avatar"><Brand size={23} /></span>}<div className="message-body">{message.role === 'user' ? <><div className="user-message-content">{message.content}</div>{message.attachmentIds?.length > 0 && <div className="message-attachments">{message.attachmentIds.map(id => { const file = data.files.find(file => file.id === id); return file ? <button key={id} onClick={() => setFilePreviewId(id)}><FileText size={14} /><span>{file.name}</span></button> : null; })}</div>}</> : <>
-                {!message.content && message.status === 'streaming' ? <div className="thinking"><span /><span /><span /><small>正在思考</small></div> : <Markdown content={message.content} notify={notify} />}
+                <AgentActivity trace={message.toolTrace} files={data.files} onOpenFile={setFilePreviewId} />
+                {!message.content && message.status === 'streaming' ? <div className="thinking"><span /><span /><span /><small>{data.approvals.some(approval => approval.chatId === chat.id) ? '等待你确认文件操作' : '正在思考'}</small></div> : <Markdown content={message.content} notify={notify} />}
                 {message.status === 'streaming' && message.content && <span className="stream-caret" aria-label="正在生成" />}
                 {message.status === 'error' && <div className="message-error" role="alert"><AlertCircle size={16} /><div><strong>这次回复没有完成</strong><p>{message.error || '请检查模型连接后重试。'}</p></div></div>}
                 {message.status === 'cancelled' && <p className="message-stopped"><Square size={11} />已停止生成</p>}
@@ -441,6 +446,7 @@ function App() {
       </main>
       {filePreviewIds.length > 0 && <FileEditor ids={filePreviewIds} activeId={filePreviewId} files={data.files} onSelect={setFilePreviewId} onCloseTab={closeFilePreview} onClose={() => { setFilePreviewIds([]); selectFilePreview(null); }} onRemove={askRemoveFile} notify={notify} Modal={Modal} renderMarkdown={content => <Markdown content={content} notify={notify} />} />}
     </div>
+    <ApprovalQueue approvals={data.approvals} chats={data.chats} files={data.files} onRespond={input => api.respondApproval(input)} onOpenChat={id => openRoute({ type: 'chat', id })} notify={notify} />
     {dragging && <div className="drop-overlay"><div><span><Upload size={31} /></span><h2>把资料放到这里</h2><p>{route.type === 'workspace' ? `添加到「${workspace?.name || '工作区'}」` : '作为附件，和模型一起看看。'}</p></div></div>}
     {settingsOpen && <SettingsDialog settings={data.settings} app={data.app} onClose={() => { setSettingsOpen(false); setThemePreview(null); }} onSaved={settings => setSnapshot(previous => ({ ...previous, settings }))} onImport={replaceSnapshot} notify={notify} onThemePreview={setThemePreview} />}
     {searchOpen && <SearchDialog snapshot={data} onClose={() => setSearchOpen(false)} onSelect={item => { if (item.type === 'file') setFilePreviewId(item.id); else openRoute({ type: item.type, id: item.id }); }} />}

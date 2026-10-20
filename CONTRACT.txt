@@ -7,9 +7,10 @@ Data shape:
   Settings = {baseUrl, model, systemPrompt, temperature, hasApiKey, theme:'system'|'light'|'dark', language:'zh', transcriptionModel?}
   Workspace = {id,name,description,color,createdAt,updatedAt}
   Chat = {id,title,workspaceId:null|string,createdAt,updatedAt,pinned:boolean,messages:Message[]}
-  Message = {id,role:'user'|'assistant',content,createdAt,status?:'complete'|'streaming'|'error'|'cancelled',attachmentIds?:string[],error?:string}
+  Message = {id,role:'user'|'assistant',content,createdAt,status?:'complete'|'streaming'|'error'|'cancelled',attachmentIds?:string[],error?:string,agentMode?:boolean,toolTrace?:ToolRound[]}
+  ToolRound = {content,calls:[{id,name,arguments:string,status:'pending'|'running'|'awaiting_approval'|'complete'|'denied'|'error'|'cancelled',result?:string}]}
   File = {id,name,mime,size,workspaceId:null|string,createdAt,textStatus:'ready'|'unsupported'|'error',textPreview?,error?}
-  Snapshot = {settings,workspaces,chats,files,app:{version,platform,dataDirectory?}}
+  Snapshot = {settings,workspaces,chats,files,approvals:[{id,chatId,requestId,toolCallId,name,workspaceId,arguments,permissions,summary,createdAt}],app:{version,platform,dataDirectory?}}
 
 window.muse methods:
   bootstrap() -> Snapshot
@@ -22,8 +23,9 @@ window.muse methods:
   createChat({workspaceId?:string|null,title?:string}) -> Chat
   updateChat({id,title?,pinned?,workspaceId?}) -> Chat
   deleteChat({id}) -> Snapshot
-  sendMessage({chatId,content,attachmentIds?:string[]}) -> {requestId:string}
+  sendMessage({chatId,content,attachmentIds?:string[],useTools?:boolean}) -> {requestId:string}
   stopGeneration({chatId}) -> void
+  respondApproval({id,decision:'approve'|'deny'}) -> Snapshot  // current live request only; never restores approval after restart
   retryMessage({chatId}) -> {requestId:string}
   importFiles({workspaceId?:string|null}) -> File[]  // native picker
   importDroppedFiles(files:File[], workspaceId?:string|null) -> File[]  // preload uses webUtils, never trusts raw renderer paths
@@ -57,10 +59,21 @@ Backend module boundaries (main process):
     .exportData(), .importData(data), .flush()
     store methods may be awaited by caller; sync implementations are allowed.
     data mutations return corresponding public object; .snapshot() strips all secrets and private paths.
-  backend/provider.cjs exports streamCompletion({settings,apiKey,messages,signal,onDelta}), listModels({settings,apiKey,signal}), testConnection({settings,apiKey,signal})
-    streamCompletion returns {content,usage?}; onDelta receives text chunks; messages use provider-compatible role/content.
+  backend/provider.cjs exports streamCompletion({settings,apiKey,messages,signal,onDelta,tools?,toolChoice?}), listModels({settings,apiKey,signal}), testConnection({settings,apiKey,signal})
+    streamCompletion returns {content,usage?,toolCalls,finishReason}; onDelta receives text chunks.
+    Messages use provider role/content and optional assistant.tool_calls or tool.tool_call_id.
     Base URL may be a root, a /v1 prefix, or a full /chat/completions endpoint.
     Only sends requests to the user's configured provider. Never use Meta endpoints or tokens from the analyzed package.
+  backend/node-protocol.cjs exports parseActionSpec, validateArguments, toFunctionTool.
+    This is an internal normalized shape based on recovered metadata, not the original wire codec.
+  backend/agent-runtime.cjs exports AgentRuntime({store,workspaceId?,attachmentIds?,signal?,onApproval?,onToolEvent?}).
+    getTools(), execute(toolCall); exposes list/read/create/save managed file tools only.
+    Each write requires literal true from onApproval; scope and CAS are rechecked afterward.
+  backend/agent-loop.cjs exports runAgentConversation({provider,settings,apiKey,messages,runtime?,signal?,onText?,onTrace?}).
+    Returns {content,toolTrace,usage?}; bounds tool rounds/calls and persists committed receipts before stopping.
+  backend/tool-trace.cjs exports normalizeToolTrace, traceHistory, cancelToolTrace, hasUnfinishedToolCalls, remapToolTrace.
+    Trace rounds are {content,calls:[{id,name,arguments,status,result?}]}; arguments/results are JSON strings.
+    Only terminal calls carry results; replay emits matched assistant/tool pairs, never unfinished calls.
 
 Important invariants:
   One active request per chat, streaming messages persisted on completion/cancel/error.

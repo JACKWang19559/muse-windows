@@ -17,7 +17,7 @@ const appRoot = path.resolve(__dirname, '..');
 const mainFile = path.join(appRoot, 'main.cjs');
 const mainRequire = createRequire(mainFile);
 const rendererURL = pathToFileURL(path.join(appRoot, 'build', 'index.html')).href;
-const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat sendMessage stopGeneration retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe'.split(' ');
+const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat sendMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe'.split(' ');
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
@@ -59,14 +59,21 @@ function fixture(t, overrides = {}) {
     clipboard: { writeText() {} }, nativeTheme: {}, Menu: { setApplicationMenu() {} }
   };
   const sandbox = {
-    require: name => name === 'electron' ? electron : name === './backend/provider.cjs' ? provider : mainRequire(name),
+    require: name => name === 'electron' ? electron : name === './backend/provider.cjs' ? provider : name === './backend/agent-loop.cjs' ? {
+      // This VM is a separate JS realm. Recreate the host-owned wire payload
+      // in the module's realm, as the actual Electron main process constructs it.
+      runAgentConversation: options => mainRequire(name).runAgentConversation({ ...options, messages: JSON.parse(JSON.stringify(options.messages)) })
+    } : mainRequire(name),
     __dirname: appRoot, process, console: { log() {}, error: (...args) => errors.push(args.join(' ')) },
     Buffer, URL, AbortController, AbortSignal, setTimeout, clearTimeout,
     setImmediate: callback => { scheduled.push(callback); }
   };
   const expose = '\n;globalThis.hostUnderTest={operations,active,assertSender,contextMessages,cleanError,setState:(s,w)=>{store=s;window=w;}};';
   vm.runInNewContext(fs.readFileSync(mainFile, 'utf8') + expose, sandbox, { filename: mainFile });
-  sandbox.hostUnderTest.setState(store, window);
+  // Production main and Store share a realm; the VM fixture serializes its
+  // host-owned data at this test boundary without relaxing JSON validators.
+  const mainStore = new Proxy(store, { get(target, key) { const value = Reflect.get(target, key); return typeof value === 'function' ? (...args) => value.apply(target, args.map(arg => arg && typeof arg === 'object' ? JSON.parse(JSON.stringify(arg)) : arg)) : value; } });
+  sandbox.hostUnderTest.setState(mainStore, window);
   return { ...sandbox.hostUnderTest, store, dir, window, webContents, provider, scheduled, events, errors, external };
 }
 
@@ -84,6 +91,124 @@ async function runQueued(host) {
   await waitFor(() => host.active.size === 0, 'generation settles');
 }
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
+const toolCall = (id, name, args) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } });
+
+test('agent writes wait for a concrete one-shot approval and return the result to the model', async t => {
+  let requests = 0, finalHistory;
+  const host = fixture(t, { streamCompletion: async options => {
+    requests++;
+    if (requests === 1) { assert.ok(options.tools.some(tool => tool.function.name === 'workspace_create_text_file')); return { content: '准备创建文件。', toolCalls: [toolCall('call-create', 'workspace_create_text_file', { name: 'agent.md', content: '# APPROVED-CONTENT' })] }; }
+    finalHistory = options.messages;
+    return { content: '已按确认创建文件。' };
+  } });
+  const workspace = host.store.createWorkspace({ name: 'Agent approval' }), chat = host.store.createChat({ workspaceId: workspace.id });
+  await host.operations.sendMessage({ chatId: chat.id, content: '创建一份说明', useTools: true });
+  host.scheduled.shift()();
+  await waitFor(() => host.operations.bootstrap().approvals.length === 1, 'concrete approval appears');
+  const approval = host.operations.bootstrap().approvals[0];
+  assert.equal(approval.arguments.content, '# APPROVED-CONTENT');
+  assert.equal(host.store.snapshot().files.length, 0);
+  assert.equal(host.store.getChat(chat.id).messages.at(-1).toolTrace[0].calls[0].status, 'awaiting_approval');
+  assert.throws(() => host.operations.respondApproval({ id: approval.id, decision: true }), /允许或拒绝/);
+  host.operations.respondApproval({ id: approval.id, decision: 'approve' });
+  await waitFor(() => host.active.size === 0, 'approved agent completes');
+  const file = host.store.snapshot().files[0], answer = host.store.getChat(chat.id).messages.at(-1);
+  assert.equal(host.store.readFile(file.id).text, '# APPROVED-CONTENT');
+  assert.equal(file.workspaceId, workspace.id);
+  assert.equal(answer.status, 'complete'); assert.equal(answer.agentMode, true);
+  assert.equal(answer.toolTrace[0].calls[0].status, 'complete');
+  assert.ok(finalHistory.some(message => message.role === 'assistant' && message.tool_calls?.[0].id === 'call-create'));
+  assert.equal(JSON.parse(finalHistory.find(message => message.role === 'tool').content).result.file.id, file.id);
+  assert.equal(host.operations.bootstrap().approvals.length, 0);
+  assert.throws(() => host.operations.respondApproval({ id: approval.id, decision: 'approve' }), /失效/);
+});
+
+test('denied agent writes return denial to the model without creating a file', async t => {
+  let requests = 0, result;
+  const host = fixture(t, { streamCompletion: async options => ++requests === 1 ? { content: '', toolCalls: [toolCall('deny-call', 'workspace_create_text_file', { name: 'denied.txt', content: 'MUST NOT EXIST' })] } : (result = JSON.parse(options.messages.at(-1).content), { content: '没有写入。' }) });
+  const chat = host.store.createChat();
+  await host.operations.sendMessage({ chatId: chat.id, content: 'write', useTools: true }); host.scheduled.shift()();
+  await waitFor(() => host.operations.bootstrap().approvals.length === 1, 'denial prompt');
+  host.operations.respondApproval({ id: host.operations.bootstrap().approvals[0].id, decision: 'deny' });
+  await waitFor(() => host.active.size === 0, 'denied conversation completes');
+  assert.equal(host.store.snapshot().files.length, 0); assert.equal(result.ok, false); assert.equal(result.error.code, 'denied');
+  assert.equal(host.store.getChat(chat.id).messages.at(-1).toolTrace[0].calls[0].status, 'denied');
+});
+
+test('stopping an approval cancels it permanently and retry asks for fresh approval', async t => {
+  let attempt = 0;
+  const host = fixture(t, { streamCompletion: async () => ({ content: '', toolCalls: [toolCall(`retry-call-${++attempt}`, 'workspace_create_text_file', { name: 'retry.txt', content: 'not approved' })] }) });
+  const chat = host.store.createChat();
+  await host.operations.sendMessage({ chatId: chat.id, content: 'write', useTools: true }); host.scheduled.shift()();
+  await waitFor(() => host.operations.bootstrap().approvals.length === 1, 'cancel prompt');
+  const oldId = host.operations.bootstrap().approvals[0].id;
+  host.operations.stopGeneration({ chatId: chat.id });
+  await waitFor(() => host.active.size === 0, 'cancel waiting agent');
+  assert.equal(host.operations.bootstrap().approvals.length, 0); assert.equal(host.store.snapshot().files.length, 0);
+  assert.equal(host.store.getChat(chat.id).messages.at(-1).toolTrace[0].calls[0].status, 'cancelled');
+  assert.throws(() => host.operations.respondApproval({ id: oldId, decision: 'approve' }), /失效/);
+  await host.operations.retryMessage({ chatId: chat.id }); host.scheduled.shift()();
+  await waitFor(() => host.operations.bootstrap().approvals.length === 1, 'fresh retry prompt');
+  assert.notEqual(host.operations.bootstrap().approvals[0].id, oldId);
+  host.operations.stopGeneration({ chatId: chat.id }); await waitFor(() => host.active.size === 0, 'stop retried agent');
+});
+
+test('moving or deleting a workspace invalidates its pending write', async t => {
+  for (const operation of ['move', 'delete']) {
+    const host = fixture(t, { streamCompletion: async () => ({ content: '', toolCalls: [toolCall('scope-call', 'workspace_create_text_file', { name: 'scope.txt', content: 'MUST NOT WRITE' })] }) });
+    const workspace = host.store.createWorkspace({ name: 'Old scope' }), chat = host.store.createChat({ workspaceId: workspace.id });
+    await host.operations.sendMessage({ chatId: chat.id, content: 'write', useTools: true }); host.scheduled.shift()();
+    await waitFor(() => host.operations.bootstrap().approvals.length === 1, 'scope prompt');
+    const approvalId = host.operations.bootstrap().approvals[0].id;
+    if (operation === 'move') host.operations.updateChat({ id: chat.id, workspaceId: null }); else host.operations.deleteWorkspace({ id: workspace.id });
+    await waitFor(() => host.active.size === 0, 'scope changed');
+    assert.equal(host.store.snapshot().files.length, 0);
+    assert.throws(() => host.operations.respondApproval({ id: approvalId, decision: 'approve' }), /失效/);
+  }
+});
+
+test('completed writes remain recorded when Stop arrives immediately after the atomic commit', async t => {
+  let requests = 0;
+  const host = fixture(t, { streamCompletion: async () => { requests++; return { content: '', toolCalls: [toolCall('commit-call', 'workspace_create_text_file', { name: 'committed.txt', content: 'COMMITTED-ONCE' })] }; } });
+  const chat = host.store.createChat(), original = host.store.createTextFile.bind(host.store);
+  host.store.createTextFile = async input => { const result = await original(input); host.operations.stopGeneration({ chatId: chat.id }); return result; };
+  await host.operations.sendMessage({ chatId: chat.id, content: 'write', useTools: true }); host.scheduled.shift()();
+  await waitFor(() => host.operations.bootstrap().approvals.length === 1, 'commit prompt');
+  host.operations.respondApproval({ id: host.operations.bootstrap().approvals[0].id, decision: 'approve' });
+  await waitFor(() => host.active.size === 0, 'committed cancellation');
+  const answer = host.store.getChat(chat.id).messages.at(-1), call = answer.toolTrace[0].calls[0];
+  assert.equal(answer.status, 'cancelled'); assert.equal(call.status, 'complete'); assert.equal(JSON.parse(call.result).ok, true);
+  assert.equal(host.store.snapshot().files.length, 1); assert.equal(requests, 1);
+  let retryHistory;
+  host.provider.streamCompletion = async options => { retryHistory = options.messages; return { content: '确认前一次写入已完成。' }; };
+  await host.operations.retryMessage({ chatId: chat.id }); await runQueued(host);
+  const messages = host.store.getChat(chat.id).messages;
+  assert.equal(messages.length, 3); assert.equal(messages[1].id, answer.id);
+  assert.deepEqual(messages[1].toolTrace, answer.toolTrace);
+  assert.equal(JSON.parse(retryHistory.find(message => message.role === 'tool').content).ok, true);
+  assert.equal(host.store.snapshot().files.length, 1);
+});
+
+test('a failed final reply keeps committed tool receipts in the next conversation context', async t => {
+  let requests = 0, nextHistory;
+  const host = fixture(t, { streamCompletion: async options => {
+    if (++requests === 1) return { content: '准备写入', toolCalls: [toolCall('error-commit-call', 'workspace_create_text_file', { name: 'saved-before-error.md', content: 'KEPT' })] };
+    if (requests === 2) { options.onDelta('FAILED_FINAL_TEXT'); throw new Error('provider disconnected after write'); }
+    nextHistory = options.messages; return { content: '看到了上次的写入结果。' };
+  } });
+  const chat = host.store.createChat();
+  await host.operations.sendMessage({ chatId: chat.id, content: 'write', useTools: true }); host.scheduled.shift()();
+  await waitFor(() => host.operations.bootstrap().approvals.length === 1, 'write before failure');
+  host.operations.respondApproval({ id: host.operations.bootstrap().approvals[0].id, decision: 'approve' });
+  await waitFor(() => host.active.size === 0, 'final provider failure');
+  const failed = host.store.getChat(chat.id).messages.at(-1);
+  assert.equal(failed.status, 'error'); assert.equal(failed.toolTrace[0].calls[0].status, 'complete');
+  await host.operations.sendMessage({ chatId: chat.id, content: 'what happened?', useTools: true }); await runQueued(host);
+  assert.equal(JSON.parse(nextHistory.find(message => message.role === 'tool').content).ok, true);
+  assert.ok(!nextHistory.some(message => message.content === 'FAILED_FINAL_TEXT'));
+  assert.equal(host.store.getChat(chat.id).messages.find(message => message.id === failed.id).toolTrace[0].calls[0].status, 'complete');
+  assert.equal(host.store.snapshot().files.length, 1);
+});
 
 test('preload exposes the documented minimal API and accepts drop paths only through webUtils', async () => {
   const calls = [], approved = new WeakMap(), listeners = new Map();
