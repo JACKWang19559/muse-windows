@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import './styles.css';
 import FileEditor from './FileEditor.jsx';
+import RenameFileDialog from './RenameFileDialog.jsx';
 import { AgentActivity, ApprovalQueue } from './AgentActivity.jsx';
 import SearchDialog from './SearchDialog.jsx';
 import PendingSends from './PendingSends.jsx';
@@ -312,6 +313,7 @@ function App() {
   const [filePreviewId, selectFilePreview] = useState(null);
   const [filePreviewIds, setFilePreviewIds] = useState([]);
   const [newFile, setNewFile] = useState(null);
+  const [renameFile, setRenameFile] = useState(null);
   const setFilePreviewId = id => { if (id) setFilePreviewIds(previous => previous.includes(id) ? previous : [...previous, id]); selectFilePreview(id); };
   const closeFilePreview = id => { const remaining = filePreviewIds.filter(value => value !== id); setFilePreviewIds(remaining); if (filePreviewId === id) selectFilePreview(remaining.at(-1) || null); };
   const [menu, setMenu] = useState(null);
@@ -725,7 +727,7 @@ function App() {
           {!configured && <button className="welcome-connect-note" onClick={() => setSettingsOpen(true)}><span><KeyRound size={17} /></span><div><strong>带上你喜欢的模型</strong><small>连接自己的 API，开始真实对话。</small></div><ArrowRight size={16} /></button>}
         </section><footer className="welcome-footer"><ShieldCheck size={13} /><span>本地保存，安静思考。使用你自己的模型服务。</span></footer></div>}
       </main>
-      {filePreviewIds.length > 0 && <FileEditor ids={filePreviewIds} activeId={filePreviewId} files={data.files} onSelect={setFilePreviewId} onCloseTab={closeFilePreview} onClose={() => { setFilePreviewIds([]); selectFilePreview(null); }} onRemove={askRemoveFile} notify={notify} Modal={Modal} renderMarkdown={content => <Markdown content={content} notify={notify} />} />}
+      {filePreviewIds.length > 0 && <FileEditor ids={filePreviewIds} activeId={filePreviewId} files={data.files} onSelect={setFilePreviewId} onCloseTab={closeFilePreview} onClose={() => { setFilePreviewIds([]); selectFilePreview(null); }} onRemove={askRemoveFile} onRename={setRenameFile} notify={notify} Modal={Modal} renderMarkdown={content => <Markdown content={content} notify={notify} />} />}
     </div>
     <ApprovalQueue approvals={data.approvals} chats={data.chats} files={data.files} onRespond={input => api.respondApproval(input)} onOpenChat={id => openRoute({ type: 'chat', id })} notify={notify} />
     <AudioControls player={chatAudio}/>
@@ -738,6 +740,7 @@ function App() {
     {searchOpen && <SearchDialog snapshot={data} currentChatId={chat?.id} Modal={Modal} onClose={() => setSearchOpen(false)} onSelect={item => { if (item.type === 'file') setFilePreviewId(item.id); else openRoute({ type: item.type === 'message' ? 'chat' : item.type, id: item.id, ...(item.messageId ? { messageId: item.messageId, query: item.query } : {}) }); }} />}
     {entity && <EntityDialog key={`${entity.kind}:${entity.id || 'new'}`} entity={entity} onClose={() => setEntity(null)} onSave={saveEntity} />}
     {newFile && <NewFileDialog workspaceId={newFile.workspaceId} onClose={() => setNewFile(null)} notify={notify} onCreated={file => { setSnapshot(previous => ({ ...previous, files: upsert(previous.files, file) })); setFilePreviewId(file.id); setNewFile(null); notify('文件已创建'); }} />}
+    {renameFile && <RenameFileDialog key={renameFile.id} file={renameFile} Modal={Modal} onClose={() => setRenameFile(null)} onRenamed={file => { setSnapshot(previous => ({ ...previous, files: upsert(previous.files, file) })); setRenameFile(null); notify('文件已重命名'); }} />}
     {confirm && <Modal title={confirm.title} onClose={() => !confirmBusy && setConfirm(null)} className="confirm-modal"><p className="confirm-body">{confirm.body}</p><footer className="modal-footer"><button className="button secondary" onClick={() => setConfirm(null)} disabled={confirmBusy}>取消</button><button className="button danger" disabled={confirmBusy} data-testid="confirm-delete" onClick={async () => { setConfirmBusy(true); try { await confirm.run(); setConfirm(null); } catch (error) { notify(error.message, 'error'); } finally { setConfirmBusy(false); } }}>{confirmBusy && <Spinner size={15} />}{confirm.action}</button></footer></Modal>}
     {toast && <div className={`toast toast-${toast.kind}`} role="status">{toast.kind === 'error' ? <AlertCircle size={17} /> : toast.kind === 'info' ? <Info size={17} /> : <Check size={17} />}<span>{toast.message}</span><IconButton icon={X} label="关闭提示" onClick={() => setToast(null)} /></div>}
   </div>;

@@ -19,6 +19,8 @@ const mainRequire = createRequire(mainFile);
 const rendererURL = pathToFileURL(path.join(appRoot, 'build', 'index.html')).href;
 const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage cancelSendAdmission stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact previewSchedule createSchedule updateSchedule pauseSchedule deleteSchedule runScheduleNow stopSchedule saveBackgroundSettings getMemoryDocument saveMemoryDocument deleteMemoryDocument createMemory getMemory updateMemory deleteMemory rebuildMemoryIndex searchMemories getSkill importSkillPackage replaceSkillPackage updateSkill deleteSkill setSkillConsent getAgentProfile createAgentProfile updateAgentProfile captureProfileKnowledge refreshProfileKnowledge removeProfileKnowledge reviewAgentProfile deleteAgentProfile previewSelectedContext startDictation dictationCaptureReady finishDictation cancelDictation getDictationState prepareAudio updateAudioState stopAudio getAudioState'.split(' ');
 
+API_METHODS.push('renameFile');
+
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
   // can deny atomic rename. Keep integration fixtures in this writable project.
@@ -1707,6 +1709,24 @@ test('cancelled unsaved-window quit retains the tray and permits new chat admiss
   let prevented=false;host.windowEvents.get('close')({preventDefault(){prevented=true;}});assert.equal(prevented,true,'background Close is restored after cancelled quit');
   const chat=host.store.createChat();await host.operations.sendMessage({chatId:chat.id,content:'after cancelled quit'});await runQueued(host);assert.equal(host.store.getChat(chat.id).messages.at(-1).status,'complete');
   host.operations.saveBackgroundSettings({backgroundTasks:false,launchAtLogin:false});
+});
+
+test('main rename updates real managed identity, preview type and editor filename preconditions', async t => {
+  const host = fixture(t), created = await host.operations.createTextFile({ name: 'before.txt', content: '{}' });
+  const renamed = await host.operations.renameFile({ id: created.file.id, expectedName: created.file.name, name: 'after.json' });
+  assert.equal(renamed.id, created.file.id); assert.equal(renamed.mime, 'application/json');
+  assert.equal(host.operations.bootstrap().files.find(file => file.id === renamed.id).name, 'after.json');
+  assert.equal(host.operations.readFile({ id: renamed.id }).text, '{}');
+  assert.throws(() => host.operations.saveTextFile({ id: renamed.id, content: 'old draft', expectedSha256: created.preview.sha256, expectedName: created.file.name }), /文件名已变化/);
+  assert.equal(host.operations.saveTextFile({ id: renamed.id, content: '{"updated":true}', expectedSha256: renamed.sha256, expectedName: renamed.name }).preview.text, '{"updated":true}');
+});
+
+test('main rename refuses arbitrary paths and stale names without changing managed data', async t => {
+  const host = fixture(t), created = await host.operations.createTextFile({ name: 'safe.md', content: 'keep' });
+  await assert.rejects(host.operations.renameFile({ id: created.file.id, expectedName: 'safe.md', name: '../outside.md' }), /文件名/);
+  await assert.rejects(host.operations.renameFile({ id: created.file.id, expectedName: 'old.md', name: 'new.md' }), /已变化/);
+  await assert.rejects(host.operations.renameFile({ id: created.file.id, expectedName: 'safe.md', name: 'new.md', source: 'untrusted path' }), /不支持/);
+  assert.equal(host.operations.readFile({ id: created.file.id }).text, 'keep'); assert.equal(host.operations.bootstrap().files[0].name, 'safe.md');
 });
 
 test('provider redacts credentials before truncating an overlong remote error', async () => {

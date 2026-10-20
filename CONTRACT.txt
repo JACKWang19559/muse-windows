@@ -58,7 +58,8 @@ window.muse methods:
   removeFile({id}) -> Snapshot  // removes the app's managed copy
   readFile({id}) -> {name,text,truncated:boolean,sha256,editable:boolean}
   createTextFile({workspaceId?:string|null,name,content?:string}) -> {file:File,preview:readFileResult}
-  saveTextFile({id,content,expectedSha256}) -> {file:File,preview:readFileResult}  // compare-and-save managed UTF-8 text only; never the original source
+  saveTextFile({id,content,expectedSha256,expectedName?:string}) -> {file:File,preview:readFileResult}  // compare-and-save managed UTF-8 text only; optional filename precondition protects stale editor formats
+  renameFile({id,name,expectedName}) -> File  // managed copy only; trims safe basename <=240, rejects scoped name collisions and stale names; preserves ID/bytes/references, re-extracts on extension changes, journals source-suffix/cache/metadata recovery
   openFile({id}) -> void  // managed copy only
   exportChat({chatId,format:'markdown'|'json'}) -> {cancelled:boolean,path?:string}
   exportData() -> {cancelled:boolean,path?:string}

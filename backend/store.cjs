@@ -27,11 +27,34 @@ const uid = kind => `${kind}_${crypto.randomUUID()}`;
 const copy = value => structuredClone(value);
 const sha256 = value => crypto.createHash('sha256').update(value).digest('hex');
 
-function safeTextName(value) {
+function safeFileName(value) {
   const name = safeName(value), stem = name.split('.')[0].replace(/[. ]+$/, '');
   if (/[\p{Cc}\p{Cf}]/u.test(name) || /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])$/i.test(stem)) fail('文件名包含控制字符或 Windows 保留名称。');
+  if (Buffer.from(name, 'utf8').toString('utf8') !== name) fail('文件名包含无效的 Unicode 字符。');
+  return name;
+}
+function safeTextName(value) {
+  const name = safeFileName(value);
   if (!TEXT_EXTENSIONS.has(describeFile(name).ext)) fail('只能创建文本、Markdown、代码、JSON 或 CSV 等文本文件。');
   return name;
+}
+function boundedFileBytes(filename, limit = MAX_FILE_BYTES) {
+  let fd;
+  try {
+    fd = fs.openSync(filename, 'r');
+    const stat = fs.fstatSync(fd);
+    const limitError = limit === MAX_FILE_BYTES ? '文件不是普通文件，或超过 25 MB。' : '文件预览缓存无效。';
+    if (!stat.isFile() || stat.size > limit) fail(limitError);
+    const chunks = [], buffer = Buffer.alloc(64 * 1024); let total = 0;
+    while (true) {
+      const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, limit + 1 - total), null);
+      if (!count) break;
+      total += count;
+      if (total > limit) fail(limitError);
+      chunks.push(Buffer.from(buffer.subarray(0, count)));
+    }
+    return Buffer.concat(chunks, total);
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 function decodeEditableText(bytes) {
   const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
@@ -330,7 +353,7 @@ class Store {
     this._assertEditDirectory(directory);
     const filename = path.join(directory, name), stat = fs.lstatSync(filename);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_EDITABLE_FILE_BYTES) fail('文件编辑恢复数据无效。');
-    const bytes = fs.readFileSync(filename);
+    const bytes = boundedFileBytes(filename, MAX_EDITABLE_FILE_BYTES);
     if (bytes.length > MAX_EDITABLE_FILE_BYTES || sha256(bytes) !== digest) fail('文件编辑恢复数据校验失败。');
     return bytes;
   }
@@ -344,6 +367,18 @@ class Store {
   }
   _restoreFileEdit(directory, journal, side) {
     const metadata = journal[side];
+    if (journal.version === 2) {
+      const target = this._managedPath(metadata._storedName);
+      const otherName = journal[side === 'after' ? 'before' : 'after']._storedName;
+      const other = this._managedPath(otherName);
+      if (target !== other && fs.existsSync(target) && fs.existsSync(other)) fail('重命名恢复遇到重复文件，恢复数据已保留。');
+      const source = fs.existsSync(target) ? target : other;
+      if (sha256(boundedFileBytes(source)) !== journal.sourceSha256) fail('重命名文件内容已变化，恢复数据已保留。');
+      const text = this._readEditPart(directory, `${side}-text`, journal[`${side}TextSha256`]);
+      if (source !== target) fs.renameSync(source, target);
+      this._replaceManagedBytes(metadata._textName, text);
+      return;
+    }
     const source = this._readEditPart(directory, `${side}-source`, journal[`${side}SourceSha256`]);
     const text = this._readEditPart(directory, `${side}-text`, journal[`${side}TextSha256`]);
     this._replaceManagedBytes(metadata._storedName, source);
@@ -359,17 +394,18 @@ class Store {
       const stat = fs.lstatSync(manifest);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) fail('文件编辑恢复记录无效，已保留恢复数据。');
       const journal = JSON.parse(fs.readFileSync(manifest, 'utf8'));
-      if (journal.version !== 1 || !['prepared', 'committed'].includes(journal.phase)) fail('文件编辑恢复版本无效。');
+      if (![1, 2].includes(journal.version) || !['prepared', 'committed'].includes(journal.phase) || journal.version === 2 && journal.kind !== 'rename') fail('文件编辑恢复版本无效。');
       const before = fileShape(journal.before, true), after = fileShape(journal.after, true);
-      if (before.id !== after.id || before._storedName !== after._storedName || before._textName !== after._textName || !after._contentRevision || before._contentRevision === after._contentRevision) fail('文件编辑恢复对象不匹配。');
+      if (before.id !== after.id || journal.version === 1 && before._storedName !== after._storedName || before._textName !== after._textName || !after._contentRevision || before._contentRevision === after._contentRevision) fail('文件编辑恢复对象不匹配。');
+      if (journal.version === 2 && (typeof journal.sourceSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(journal.sourceSha256) || before._sha256 !== journal.sourceSha256 || after._sha256 !== journal.sourceSha256 || before.size !== after.size || before.workspaceId !== after.workspaceId)) fail('重命名恢复内容不匹配。');
       const current = this.state.files.find(file => file.id === after.id);
       // A later edit/delete makes an old committed journal obsolete. Never
       // resurrect deleted files or roll back a newer revision after cleanup fails.
-      if (!current || current._storedName !== after._storedName || current._contentRevision !== before._contentRevision && current._contentRevision !== after._contentRevision) { this._cleanupFileEdit(directory); continue; }
+      if (!current || ![before._storedName, after._storedName].includes(current._storedName) || current._contentRevision !== before._contentRevision && current._contentRevision !== after._contentRevision) { this._cleanupFileEdit(directory); continue; }
       const side = current._contentRevision === after._contentRevision || journal.phase === 'committed' ? 'after' : 'before';
       this._restoreFileEdit(directory, journal, side);
       const selected = side === 'after' ? after : before;
-      for (const key of ['size', 'mime', 'textStatus', 'textPreview', '_textTruncated', '_sha256', '_contentRevision']) {
+      for (const key of ['name', '_storedName', 'size', 'mime', 'textStatus', 'textPreview', '_textTruncated', '_sha256', '_contentRevision']) {
         if (key in selected) current[key] = selected[key]; else delete current[key];
       }
       if (selected.error) current.error = selected.error; else delete current.error;
@@ -577,8 +613,9 @@ class Store {
     } catch (error) { this._discardFile(item); throw error; }
   }
   saveTextFile(input) {
-    record(input, '保存文件'); onlyKeys(input, ['id', 'content', 'expectedSha256'], '保存文件');
+    record(input, '保存文件'); onlyKeys(input, ['id', 'content', 'expectedSha256', 'expectedName'], '保存文件');
     const item = this._file(input.id);
+    if (input.expectedName !== undefined && safeName(input.expectedName) !== item.name) fail('文件名已变化，请重新载入文件后再保存。');
     if (typeof input.expectedSha256 !== 'string' || !/^[a-fA-F0-9]{64}$/.test(input.expectedSha256)) fail('保存文件需要有效的原内容校验值，请重新载入文件。');
     const preview = this.readFile(item.id);
     if (preview.sha256 !== input.expectedSha256.toLowerCase()) fail('文件已被其他编辑器修改，请重新载入后再保存。');
@@ -616,6 +653,51 @@ class Store {
     try { journal.phase = 'committed'; this._writeEditManifest(directory, journal); this._persistState(this.state); this._cleanupFileEdit(directory); }
     catch { /* The committed bytes/state are valid; startup can finish cleanup. */ }
     return { file: this.getFile(item.id), preview: this.readFile(item.id) };
+  }
+  async renameFile(input) {
+    record(input, '重命名文件'); onlyKeys(input, ['id', 'name', 'expectedName'], '重命名文件');
+    const item = this._file(input.id), expectedName = safeName(input.expectedName);
+    if (item.name !== expectedName) fail('文件名已变化，请关闭窗口后重新命名。');
+    if (typeof input.name !== 'string') fail('文件名无效。');
+    const name = safeFileName(input.name.trim());
+    if (name === item.name) return this.getFile(item.id);
+    const collision = () => this.state.files.some(file => file.id !== item.id && file.workspaceId === item.workspaceId && file.name.normalize('NFC').toLowerCase() === name.normalize('NFC').toLowerCase());
+    if (collision()) fail('当前工作区已有同名文件，请使用其他名称。');
+    const before = copy(item), source = this._managedPath(item._storedName, true);
+    const bytes = boundedFileBytes(source), digest = sha256(bytes);
+    if (bytes.length !== before.size || before._sha256 && before._sha256 !== digest) fail('文件内容已发生变化，请重新载入后再重命名。');
+    const destinationName = `${item.id}.${describeFile(name).managedExtension}`;
+    const destination = this._managedPath(destinationName);
+    if (destination !== source && fs.existsSync(destination)) fail('文件存储位置发生冲突，未进行重命名。');
+    const extracted = await extractDocument(bytes, name);
+    const current = this._file(item.id);
+    if (current.name !== before.name || current._contentRevision !== before._contentRevision || current.workspaceId !== before.workspaceId || collision() || sha256(boundedFileBytes(this._managedPath(current._storedName, true))) !== digest) fail('文件已发生变化，请重新打开重命名窗口。');
+    before._sha256 = digest;
+    const after = { ...before, name, mime: extracted.mime, textStatus: extracted.textStatus, textPreview: extracted.text.slice(0, 1000), _storedName: destinationName, _textTruncated: extracted.truncated, _contentRevision: uid('revision') };
+    if (extracted.error) after.error = extracted.error; else delete after.error;
+    const cache = this._managedPath(item._textName, true);
+    if (fs.statSync(cache).size > MAX_EDITABLE_FILE_BYTES) fail('文件预览缓存无效。');
+    const beforeText = boundedFileBytes(cache, MAX_EDITABLE_FILE_BYTES), afterText = Buffer.from(extracted.text, 'utf8');
+    if (beforeText.length > MAX_EDITABLE_FILE_BYTES) fail('文件预览缓存无效。');
+    const directory = path.join(this.dataDir, `.file-edit-${crypto.randomUUID()}`);
+    const journal = { version: 2, kind: 'rename', phase: 'prepared', before, after, sourceSha256: digest, beforeTextSha256: sha256(beforeText), afterTextSha256: sha256(afterText) };
+    fs.mkdirSync(directory, { mode: 0o700 }); let prepared = false, committed = false;
+    try {
+      this._writeSynced(path.join(directory, 'before-text'), beforeText); this._writeSynced(path.join(directory, 'after-text'), afterText);
+      this._writeEditManifest(directory, journal); prepared = true;
+      this._restoreFileEdit(directory, journal, 'after');
+      this._commit(next => { const target = this._file(item.id, next); Object.assign(target, after); if (!after.error) delete target.error; return null; });
+      committed = true;
+    } catch (error) {
+      try { const disk = this._load(this.statePath); if (disk.files.find(file => file.id === item.id)?._contentRevision === after._contentRevision) { this.state = disk; committed = true; } } catch {}
+      if (!committed) {
+        try { if (prepared) this._restoreFileEdit(directory, journal, 'before'); this._cleanupFileEdit(directory); }
+        catch { fail('重命名被中断，恢复数据已保留；请重新打开应用。'); }
+        filesystemFailure(error, '无法重命名文件，原文件已恢复。请检查磁盘空间和文件权限。');
+      }
+    }
+    try { journal.phase = 'committed'; this._writeEditManifest(directory, journal); this._persistState(this.state); this._cleanupFileEdit(directory); } catch { /* Startup finishes the recorded decision. */ }
+    return this.getFile(item.id);
   }
   removeFile(id) {
     const item = this._file(id); this._managedPath(item._storedName); this._managedPath(item._textName);

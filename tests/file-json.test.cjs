@@ -48,20 +48,26 @@ const dirtyStart=source.indexOf('const dirty ='),start=source.indexOf('export de
 assert(dirtyStart>=0&&start>dirtyStart&&end>start);
 const actionCode=esbuild.transformSync(source.slice(dirtyStart,start)+source.slice(start,end).replace('export default ','')+'globalThis.probe={load,save,download,guard,patch,tabs,pending,saving,downloading};return null;}',{loader:'jsx',format:'cjs'}).code;
 function editor(name='fixture.json',baseline='{"before":true}'){
-  let cursor=0;const hooks=[],updates=[],calls=[],notices=[],downloads=[];let failSave=false,failDownload=false,downloadResult={cancelled:false,draft:true};
+  let cursor=0;const hooks=[],updates=[],calls=[],notices=[],downloads=[];let failSave=false,failRead=false,failDownload=false,downloadResult={cancelled:false,draft:true};
   const preview=text=>({name,text,editable:true,truncated:false,sha256:'a'.repeat(64)});
-  const api={readFile:async()=>preview(baseline),saveTextFile:async input=>{calls.push(JSON.parse(JSON.stringify(input)));if(failSave)throw Error('Synthetic save conflict');return{preview:preview(input.content)};},exportFile:async input=>{downloads.push(JSON.parse(JSON.stringify(input)));if(failDownload)throw Error('Synthetic download error');return await downloadResult;}};
+  const api={readFile:async()=>{if(failRead)throw Error('Synthetic unsupported format');return preview(baseline);},saveTextFile:async input=>{calls.push(JSON.parse(JSON.stringify(input)));if(failSave)throw Error('Synthetic save conflict');return{preview:preview(input.content)};},exportFile:async input=>{downloads.push(JSON.parse(JSON.stringify(input)));if(failDownload)throw Error('Synthetic download error');return await downloadResult;}};
   const useState=initial=>{const i=cursor++;if(!(i in hooks))hooks[i]=typeof initial==='function'?initial():initial;return[hooks[i],v=>updates.push(()=>{hooks[i]=typeof v==='function'?v(hooks[i]):v;})];};
   const useRef=initial=>{const i=cursor++;return hooks[i]||(hooks[i]={current:initial});};
   const context=vm.createContext({api,isJsonFile,jsonSaveError,useState,useRef,useEffect(){},props:{ids:['file_fixture'],activeId:'file_fixture',files:[{id:'file_fixture',name}],notify:(...args)=>notices.push(args)}});vm.runInContext(actionCode,context);
   const render=()=>{while(updates.length)updates.shift()();cursor=0;vm.runInContext('FileEditor(props)',context);return context.probe;};render();
-  return{calls,notices,downloads,render,get probe(){return context.probe;},async load(){await context.probe.load('file_fixture');return render();},edit(text){context.probe.patch('file_fixture',{text,mode:'edit'});return render();},fail(value){failSave=value;},failDownload(value){failDownload=value;},replyDownload(value){downloadResult=value;}};
+  return{calls,notices,downloads,render,get probe(){return context.probe;},async load(){await context.probe.load('file_fixture');return render();},edit(text){context.probe.patch('file_fixture',{text,mode:'edit'});return render();},fail(value){failSave=value;},failRead(value){failRead=value;},failDownload(value){failDownload=value;},replyDownload(value){downloadResult=value;}};
 }
+
+test('a failed reload clears previous editability instead of inheriting the old format capability',async()=>{
+  const h=editor();await h.load();assert.equal(h.probe.tabs.file_fixture.editable,true);h.failRead(true);await h.load();
+  assert.equal(h.probe.tabs.file_fixture.editable,false);assert.equal(h.probe.tabs.file_fixture.loading,false);assert.match(h.probe.tabs.file_fixture.error,/unsupported/);
+  await h.probe.save('file_fixture');assert.equal(h.calls.length,0);
+});
 test('invalid JSON Save preserves draft and baseline, reports the error and performs no host write',async()=>{
   const h=editor();await h.load();const invalid='{\n "a":1,\n}';h.edit(invalid);assert.equal(await h.probe.save('file_fixture'),false);h.render();assert.equal(h.calls.length,0);assert.equal(h.probe.tabs.file_fixture.text,invalid);assert.equal(h.probe.tabs.file_fixture.baseline,'{"before":true}');assert.match(h.probe.tabs.file_fixture.saveError,/JSON/);assert.equal(h.probe.saving,false);assert.equal(h.notices.at(-1)[1],'error');
 });
 test('valid JSON Save sends original source bytes and the existing CAS digest',async()=>{
-  const h=editor();await h.load();const text='{\n  "large":9007199254740993,\n  "字":"\\u4e2d"\n}\n';h.edit(text);assert.equal(await h.probe.save('file_fixture'),true);h.render();assert.deepEqual(h.calls,[{id:'file_fixture',content:text,expectedSha256:'a'.repeat(64)}]);assert.equal(h.probe.tabs.file_fixture.baseline,text);assert.equal(h.probe.tabs.file_fixture.saveError,'');
+  const h=editor();await h.load();const text='{\n  "large":9007199254740993,\n  "字":"\\u4e2d"\n}\n';h.edit(text);assert.equal(await h.probe.save('file_fixture'),true);h.render();assert.deepEqual(h.calls,[{id:'file_fixture',content:text,expectedSha256:'a'.repeat(64),expectedName:'fixture.json'}]);assert.equal(h.probe.tabs.file_fixture.baseline,text);assert.equal(h.probe.tabs.file_fixture.saveError,'');
 });
 test('JSONL editor Save retains the original single-JSON-value constraint',async()=>{
   const h=editor('rows.jsonl','{"line":1}');await h.load();h.edit('{"line":1}\n{"line":2}');assert.equal(await h.probe.save('file_fixture'),false);h.render();assert.equal(h.calls.length,0);assert.equal(h.probe.tabs.file_fixture.text,'{"line":1}\n{"line":2}');
