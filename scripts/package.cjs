@@ -46,7 +46,9 @@ function copyDependency(name, from, optional = false) {
 }
 for (const name of Object.keys(pkg.dependencies)) copyDependency(name, root);
 const instructions = `Muse Windows ${pkg.version}\r\n\r\n双击 Muse.exe 启动，无须安装 Node.js。\r\n首次打开设置，填写自己的兼容模型 API 地址、模型名称和可选 API Key。\r\n支持流式聊天、本地工作区、参考文档、对话导出和数据备份。\r\nAPI Key 在 Windows 上使用系统加密保存，不包含在备份中。\r\n此版本是独立重建的 Windows 客户端，尚未覆盖原产品全部服务和系统集成。\r\n请保留整个文件夹；不要只移动 Muse.exe。\r\n`;
-fs.writeFileSync(path.join(destination, '使用说明.txt'), instructions, 'utf8');
+// Windows tar writes legacy-codepage ZIP names for non-ASCII filenames.
+// Keep the portable package's instruction filename independent of that locale.
+fs.writeFileSync(path.join(destination, 'README-Windows.txt'), instructions, 'utf8');
 for (const name of ['LICENSE', 'README.md']) {
   const source = path.join(root, name);
   if (fs.existsSync(source)) fs.copyFileSync(source, path.join(destination, name));
