@@ -17,10 +17,11 @@ import SearchDialog from './SearchDialog.jsx';
 import PendingSends from './PendingSends.jsx';
 import ArtifactPanel from './ArtifactPanel.jsx';
 import SchedulePanel from './SchedulePanel.jsx';
+import KnowledgePanel from './KnowledgePanel.jsx';
 
 const api = window.muse;
 const COLORS = ['#47766a', '#607eb3', '#a07cb5', '#c49456', '#bd7777', '#7c8992'];
-const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], artifacts: [], schedules: [], scheduleRuns: [], approvals: [], pendingSends: [], app: {} };
+const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], artifacts: [], schedules: [], scheduleRuns: [], memoryDocuments:[],memories:[],skills:[],agentProfiles:[],memoryIndexes:[],approvals: [], pendingSends: [], app: {} };
 
 function Brand({ size = 28, className = '' }) {
   return <svg width={size} height={size} viewBox="0 0 40 40" fill="none" className={`brand-mark ${className}`} aria-hidden="true">
@@ -120,7 +121,7 @@ function Markdown({ content, notify, highlight }) {
   }} />;
 }
 
-function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport, onDrop, onSend, onStop, busy, admitting, importing, welcome = false, placeholder, model, configured, useTools, onToolsChange, quote, onClearQuote, historyMessages = [], historyKey }) {
+function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport, onDrop, onSend, onStop, busy, admitting, importing, welcome = false, placeholder, model, configured, useTools, onToolsChange, quote, onClearQuote, historyMessages = [], historyKey, knowledgeControl }) {
   const input = useRef(null);
   const composing = useRef(false);
   const recall = useRef(null);
@@ -132,6 +133,7 @@ function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport
     return () => window.removeEventListener('muse-focus-composer', focus);
   }, []);
   return <div className={`composer-shell ${welcome ? 'composer-welcome' : ''}`} data-testid="composer" onDragOver={event => { event.preventDefault(); event.stopPropagation(); }} onDrop={event => { event.preventDefault(); event.stopPropagation(); onDrop?.(Array.from(event.dataTransfer.files)); }}>
+    {knowledgeControl}
     {quote && <div className="composer-quote" data-testid="composer-quote"><Reply size={15} /><div><strong>回复 {quote.role === 'user' ? '你' : 'Muse'}</strong><span>{excerpt(quote.content || '附件消息', 180)}</span></div><IconButton icon={X} label="取消引用" onClick={onClearQuote} /></div>}
     {attachedFiles.length > 0 && <div className="attachment-tray">{attachedFiles.map(file => <div className="attachment-pill" key={file.id} title={file.name}><FileText size={15} /><span>{file.name}</span><IconButton icon={X} label={`移除附件 ${file.name}`} onClick={() => onRemoveAttachment(file.id)} /></div>)}</div>}
     <textarea ref={input} value={value} onChange={event => { recall.current = null; onChange(event.target.value); }} data-testid="composer-input" rows={welcome ? 2 : 1}
@@ -265,6 +267,9 @@ function App() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [artifactsOpen, setArtifactsOpen] = useState(false);
   const [schedulesOpen, setSchedulesOpen] = useState(false);
+  const [knowledgeOpen,setKnowledgeOpen]=useState(false);
+  const [draftProfiles,setDraftProfiles]=useState({});
+  const [contextPreview,setContextPreview]=useState(null);
   const [entity, setEntity] = useState(null);
   const [confirm, setConfirm] = useState(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
@@ -366,6 +371,8 @@ function App() {
   const workspace = route.type === 'workspace' ? data.workspaces.find(item => item.id === route.id) : chat?.workspaceId ? data.workspaces.find(item => item.id === chat.workspaceId) : route.workspaceId ? data.workspaces.find(item => item.id === route.workspaceId) : null;
   const workspaceId = workspace?.id || null;
   const composerKey = chat ? `chat:${chat.id}` : `new:${workspaceId || 'personal'}`;
+  const candidateProfileId=chat?.profileId||(!chat?draftProfiles[workspaceId||'global']||'':'');
+  const selectedProfileId=data.agentProfiles.some(item=>item.id===candidateProfileId&&item.workspaceId===workspaceId)?candidateProfileId:'';
   const useTools = agentModes[composerKey] ?? !!chat?.messages.filter(message => message.role === 'assistant').at(-1)?.agentMode;
   const draft = drafts[composerKey] || '';
   const attachedIds = attachments[composerKey] || [];
@@ -422,7 +429,7 @@ function App() {
     let target = chat;
     try {
       if (!target) {
-        target = await api.createChat({ workspaceId }); const nextKey = `chat:${target.id}`;
+        target = await api.createChat({ workspaceId,...(selectedProfileId?{profileId:selectedProfileId}:{}) }); const nextKey = `chat:${target.id}`;
         setDrafts(previous => ({ ...previous, [nextKey]: previous[key] || '', [key]: '' }));
         setAttachments(previous => ({ ...previous, [nextKey]: previous[key] || [], [key]: [] }));
         setQuotes(previous => ({ ...previous, [nextKey]: previous[key] || null, [key]: null }));
@@ -482,6 +489,7 @@ function App() {
   const askDeleteWorkspace = item => { setMenu(null); setConfirm({ title: '删除这个工作区？', body: `“${item.name}”将被删除，其中的对话和文件会保留在个人工作台。`, action: '删除工作区', run: async () => { replaceSnapshot(await api.deleteWorkspace({ id: item.id })); newChat(); } }); };
   const exportChat = async format => { setMenu(null); try { const result = await api.exportChat({ chatId: chat.id, format }); if (!result.cancelled) notify('对话已导出'); } catch (error) { notify(error.message, 'error'); } };
   const composerProps = { value: draft, onChange: updateDraft, attachedFiles, onRemoveAttachment: id => setAttachments(previous => ({ ...previous, [composerKey]: attachedIds.filter(item => item !== id) })), onImport: () => addFiles(), onDrop: files => { dragCount.current = 0; setDragging(false); if (files.length) addFiles(files); }, onSend: send, onStop: stop, busy, admitting: sending, importing, model: data.settings.model, configured, useTools, onToolsChange: enabled => { modeRevisions.current.set(composerKey, (modeRevisions.current.get(composerKey) || 0) + 1); setAgentModes(previous => ({ ...previous, [composerKey]: enabled })); }, quote, onClearQuote: () => setQuotes(previous => ({ ...previous, [composerKey]: null })), historyMessages: chat?.messages, historyKey: composerKey };
+  composerProps.knowledgeControl=<div className="knowledge-chatbar"><button className="text-button" data-testid="knowledge-open" onClick={()=>setKnowledgeOpen({workspaceId,workspaceName:workspace?.name})}><Database size={13}/>知识与技能</button><select aria-label="聊天知识配置" data-testid="chat-profile" value={selectedProfileId} disabled={busy||sending} onChange={async event=>{const profileId=event.target.value||null;try{if(chat)await api.updateChat({id:chat.id,profileId});else setDraftProfiles(previous=>({...previous,[workspaceId||'global']:profileId}));}catch(error){notify(error.message,'error');}}}><option value="">不附加知识配置</option>{data.agentProfiles.filter(item=>item.workspaceId===workspaceId).map(item=><option key={item.id} value={item.id} disabled={item.needsReview}>{item.name}{item.needsReview?'（待确认）':''}</option>)}</select>{chat&&selectedProfileId&&<button className="text-button" data-testid="context-preview" onClick={async()=>{try{setContextPreview(await api.previewSelectedContext({chatId:chat.id,useTools}));}catch(error){notify(error.message,'error');}}}>查看将发送的知识</button>}</div>;
 
   if (!snapshot) return <div className="boot-screen"><Brand size={56} /><h1>Muse</h1>{bootError ? <><p className="boot-error">{bootError}</p><button className="button secondary" onClick={() => window.location.reload()}><RefreshCw size={15} />重新打开</button></> : <p><Spinner size={16} />正在打开你的工作台…</p>}</div>;
 
@@ -541,6 +549,8 @@ function App() {
     </div>
     <ApprovalQueue approvals={data.approvals} chats={data.chats} files={data.files} onRespond={input => api.respondApproval(input)} onOpenChat={id => openRoute({ type: 'chat', id })} notify={notify} />
     {artifactsOpen && <ArtifactPanel artifacts={data.artifacts} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={()=>setArtifactsOpen(false)} notify={notify}/>}
+    {knowledgeOpen&&<KnowledgePanel data={data} workspaceId={knowledgeOpen.workspaceId} workspaceName={knowledgeOpen.workspaceName} onClose={()=>setKnowledgeOpen(false)} notify={notify}/>}
+    {contextPreview&&<Modal title="将发送的知识上下文" subtitle="包含所选配置的资料；不包含密钥和其他未选择的知识。" onClose={()=>setContextPreview(null)} wide><div className="context-preview">{contextPreview.messages.map((message,index)=><pre key={index}>{message.content}</pre>)}<details><summary>来源与版本记录</summary><pre>{JSON.stringify(contextPreview.receipt,null,2)}</pre></details></div></Modal>}
     {schedulesOpen&&<SchedulePanel schedules={data.schedules} runs={data.scheduleRuns} workspaceId={workspaceId} workspaces={data.workspaces} files={data.files} settings={data.settings} app={data.app} notify={notify} onClose={()=>setSchedulesOpen(false)} onOpenChat={id=>{setSchedulesOpen(false);openRoute({type:'chat',id});}}/>}
     {dragging && <div className="drop-overlay"><div><span><Upload size={31} /></span><h2>把资料放到这里</h2><p>{route.type === 'workspace' ? `添加到「${workspace?.name || '工作区'}」` : '作为附件，和模型一起看看。'}</p></div></div>}
     {settingsOpen && <SettingsDialog settings={data.settings} app={data.app} onClose={() => { setSettingsOpen(false); setThemePreview(null); }} onSaved={settings => setSnapshot(previous => ({ ...previous, settings }))} onImport={replaceSnapshot} notify={notify} onThemePreview={setThemePreview} />}

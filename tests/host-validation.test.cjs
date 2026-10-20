@@ -17,7 +17,7 @@ const appRoot = path.resolve(__dirname, '..');
 const mainFile = path.join(appRoot, 'main.cjs');
 const mainRequire = createRequire(mainFile);
 const rendererURL = pathToFileURL(path.join(appRoot, 'build', 'index.html')).href;
-const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact previewSchedule createSchedule updateSchedule pauseSchedule deleteSchedule runScheduleNow stopSchedule saveBackgroundSettings'.split(' ');
+const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact previewSchedule createSchedule updateSchedule pauseSchedule deleteSchedule runScheduleNow stopSchedule saveBackgroundSettings getMemoryDocument saveMemoryDocument deleteMemoryDocument createMemory getMemory updateMemory deleteMemory rebuildMemoryIndex searchMemories getSkill importSkillPackage replaceSkillPackage updateSkill deleteSkill setSkillConsent getAgentProfile createAgentProfile updateAgentProfile captureProfileKnowledge refreshProfileKnowledge removeProfileKnowledge reviewAgentProfile deleteAgentProfile previewSelectedContext'.split(' ');
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
@@ -64,7 +64,7 @@ function fixture(t, overrides = {}) {
       // This VM is a separate JS realm. Recreate the host-owned wire payload
       // in the module's realm, as the actual Electron main process constructs it.
       runAgentConversation: options => mainRequire(name).runAgentConversation({ ...options, messages: JSON.parse(JSON.stringify(options.messages)) })
-    } : name === './backend/schedule-tools.cjs'?{...mainRequire(name),createScheduleRuntime:options=>mainRequire(name).createScheduleRuntime({...options,attachmentIds:JSON.parse(JSON.stringify(options.attachmentIds)),getProviderBinding:()=>JSON.parse(JSON.stringify(options.getProviderBinding()))})}: name === './backend/schedule-time.cjs' ? Object.fromEntries(Object.entries(mainRequire(name)).map(([key,value])=>[key,['normalizeCadence','nextOccurrence','resolveLocalTime','localDateTime'].includes(key)?(...args)=>value(...args.map(arg=>arg&&typeof arg==='object'?JSON.parse(JSON.stringify(arg)):arg)):value])) : name === './backend/message-outbox.cjs' ? {
+    } : name === './backend/knowledge-tools.cjs' ? {...mainRequire(name),createKnowledgeRuntime:options=>mainRequire(name).createKnowledgeRuntime({...options,allowedMemoryIds:JSON.parse(JSON.stringify(options.allowedMemoryIds))})} : name === './backend/knowledge-search.cjs' ? Object.fromEntries(Object.entries(mainRequire(name)).map(([key,value])=>[key,typeof value==='function'?(...args)=>value(...args.map(arg=>arg&&typeof arg==='object'?JSON.parse(JSON.stringify(arg)):arg)):value])) : name === './backend/schedule-tools.cjs'?{...mainRequire(name),createScheduleRuntime:options=>mainRequire(name).createScheduleRuntime({...options,attachmentIds:JSON.parse(JSON.stringify(options.attachmentIds)),getProviderBinding:()=>JSON.parse(JSON.stringify(options.getProviderBinding()))})}: name === './backend/schedule-time.cjs' ? Object.fromEntries(Object.entries(mainRequire(name)).map(([key,value])=>[key,['normalizeCadence','nextOccurrence','resolveLocalTime','localDateTime'].includes(key)?(...args)=>value(...args.map(arg=>arg&&typeof arg==='object'?JSON.parse(JSON.stringify(arg)):arg)):value])) : name === './backend/message-outbox.cjs' ? {
       ...mainRequire(name), MessageOutbox: class extends mainRequire(name).MessageOutbox {
         // Production creates this host-owned envelope in the module's realm.
         reserve(input) { return super.reserve({ ...input, ...(input.metadata ? { metadata: JSON.parse(JSON.stringify(input.metadata)) } : {}) }); }
@@ -98,6 +98,51 @@ async function runQueued(host) {
 }
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
 const toolCall = (id, name, args) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } });
+
+test('selected knowledge is scoped, version-bound and invalidates queued sends when a live document changes', async t=>{
+  const entered=deferred(),done=deferred(),requests=[];
+  const host=fixture(t,{streamCompletion:async options=>{requests.push(options.messages);entered.resolve();await done.promise;return{content:'knowledge answer'};}});
+  const space=host.store.createWorkspace({name:'selected knowledge'}),other=host.store.createWorkspace({name:'excluded knowledge'});
+  const doc=host.store.saveMemoryDocument({workspaceId:space.id,expectedRevision:0,contentMarkdown:'HOST-LIVE-KNOWLEDGE'});
+  host.store.createMemory({workspaceId:other.id,name:'excluded',contentMarkdown:'HOST-EXCLUDED-KNOWLEDGE'});
+  let profile=host.store.createAgentProfile({workspaceId:space.id,name:'explicit',memoryDocumentIds:[doc.id],toolPolicy:'read'});
+  profile=host.store.reviewAgentProfile({id:profile.id,expectedRevision:profile.revision});
+  const chat=host.store.createChat({workspaceId:space.id,profileId:profile.id});
+  await host.operations.sendMessage({chatId:chat.id,content:'first'});host.scheduled.shift()();await entered.promise;
+  const queued=await host.operations.sendMessage({chatId:chat.id,content:'second'});
+  assert.ok(queued.queued);assert.ok(JSON.stringify(requests).includes('HOST-LIVE-KNOWLEDGE'));assert.ok(!JSON.stringify(requests).includes('HOST-EXCLUDED-KNOWLEDGE'));
+  host.operations.saveMemoryDocument({workspaceId:space.id,expectedRevision:doc.revision,contentMarkdown:'new live document'});
+  assert.equal(host.active.get(chat.id).controller.signal.aborted,true);
+  assert.equal(host.operations.bootstrap().pendingSends[0].state,'failed');
+  done.resolve();await waitFor(()=>host.active.size===0,'knowledge abort settles');
+  assert.equal(requests.length,1);assert.equal(host.store.getChat(chat.id).messages.at(-1).status,'cancelled');
+});
+
+test('read-only knowledge profile cannot grant a forged memory write and revocation blocks future dispatch', async t=>{
+  let requests=0;
+  const host=fixture(t,{streamCompletion:async options=>{requests++;return requests===1?{content:'',toolCalls:[toolCall('memory_forged_1','memory_create',{name:'forged',contentMarkdown:'must not write'})]}:{content:'done'};}});
+  const space=host.store.createWorkspace({name:'readonly knowledge'});
+  const skill=host.operations.importSkillPackage({workspaceId:space.id,markdown:'---\nname: context-guide\ndescription: reference\nversion: "1"\ntoolRequirements: []\n---\nHOST-SKILL-GUIDE'});
+  const approved=host.operations.setSkillConsent({id:skill.id,workspaceId:space.id,expectedRevision:skill.revision,approved:true});
+  let profile=host.store.createAgentProfile({workspaceId:space.id,name:'read profile',toolPolicy:'read',skillRefs:[{skillId:skill.id,digest:approved.digest,consentId:approved.consents.at(-1).id}]});
+  profile=host.store.reviewAgentProfile({id:profile.id,expectedRevision:profile.revision});
+  const chat=host.store.createChat({workspaceId:space.id,profileId:profile.id});
+  await host.operations.sendMessage({chatId:chat.id,content:'attempt',useTools:true});await runQueued(host);
+  assert.equal(host.store.snapshot().memories.length,0);assert.equal(host.operations.bootstrap().approvals.length,0);
+  host.operations.setSkillConsent({id:skill.id,workspaceId:space.id,expectedRevision:approved.revision,approved:false});
+  const before=requests;await assert.rejects(host.operations.sendMessage({chatId:chat.id,content:'revoked'}),/确认|授权|配置|skill|技能/i);assert.equal(requests,before);
+});
+
+test('historical memory receipts and write arguments remain archived but are not automatically forwarded again',t=>{
+  const host=fixture(t),chat=host.store.createChat();
+  host.store.appendMessage(chat.id,{id:'history_user',role:'user',content:'ordinary previous request',status:'complete',createdAt:new Date().toISOString()});
+  const trace=[{content:'',calls:[{id:'history_memory',name:'memory_update',arguments:JSON.stringify({id:'old_memory_id',expectedRevision:1,contentMarkdown:'HISTORICAL-MEMORY-BODY'}),status:'complete',result:JSON.stringify({ok:true,result:{memory:{id:'old_memory_id'},contentMarkdown:'HISTORICAL-MEMORY-BODY'}})}]}];
+  host.store.appendMessage(chat.id,{id:'history_assistant',role:'assistant',content:'previous result',status:'complete',agentMode:true,toolTrace:trace,createdAt:new Date().toISOString()});
+  const messages=host.contextMessages(host.store.getChat(chat.id),null,host.store.settings(),host.store.snapshot());
+  assert.ok(!JSON.stringify(messages).includes('HISTORICAL-MEMORY-BODY'));
+  assert.equal(messages.find(row=>row.tool_calls)?.tool_calls[0].function.arguments,'{}');
+  assert.ok(host.store.getChat(chat.id).messages.at(-1).toolTrace[0].calls[0].result.includes('HISTORICAL-MEMORY-BODY'));
+});
 
 test('same-chat sends wait in FIFO while other chats can generate and no intent is appended before dispatch', async t => {
   const entered = deferred(), firstDone = deferred(), requests = [];
@@ -529,7 +574,7 @@ test('explicit recent attachments take priority when workspace documents exceed 
   assert.match(JSON.stringify(context),/PRIORITY_EXPLICIT_DOCUMENT/);
 });
 
-test('queued generation retains its starting prompt and workspace document scope', async t => {
+test('a captured generation refuses dispatch if its workspace changes before the provider starts', async t => {
   let actual;
   const host = fixture(t, { streamCompletion: async options => { actual = options; return { content: 'ok' }; } });
   const workspaceA = host.store.createWorkspace({ name: 'A' });
@@ -543,10 +588,9 @@ test('queued generation retains its starting prompt and workspace document scope
   host.store.saveSettings({ systemPrompt: 'PROMPT_AFTER_SEND' });
   host.store.updateChat({ id: chat.id, workspaceId: workspaceB.id });
   await runQueued(host);
-  const context = JSON.stringify(actual.messages);
-  assert.match(context, /PROMPT_AT_SEND/);
-  assert.match(context, /DOC_AT_SEND/);
-  assert.doesNotMatch(context, /PROMPT_AFTER_SEND|DOC_AFTER_MOVE/);
+  assert.equal(actual,undefined);
+  assert.equal(host.store.getChat(chat.id).messages.at(-1).status,'error');
+  assert.match(host.store.getChat(chat.id).messages.at(-1).error,/知识配置已变化/);
 });
 
 test('deleting a queued chat leaves its provider signal aborted and produces no lifecycle errors', async t => {

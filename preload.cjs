@@ -14,4 +14,5 @@ api.subscribe = callback => {
   return () => ipcRenderer.removeListener('muse:event', listener);
 };
 for(const name of ['previewSchedule','createSchedule','updateSchedule','pauseSchedule','deleteSchedule','runScheduleNow','stopSchedule','saveBackgroundSettings'])api[name]=call(name);
+for(const name of ['getMemoryDocument','saveMemoryDocument','deleteMemoryDocument','createMemory','getMemory','updateMemory','deleteMemory','rebuildMemoryIndex','searchMemories','getSkill','importSkillPackage','replaceSkillPackage','updateSkill','deleteSkill','setSkillConsent','getAgentProfile','createAgentProfile','updateAgentProfile','captureProfileKnowledge','refreshProfileKnowledge','removeProfileKnowledge','reviewAgentProfile','deleteAgentProfile','previewSelectedContext'])api[name]=call(name);
 if (typeof process === 'undefined' || process.isMainFrame !== false) contextBridge.exposeInMainWorld('muse', Object.freeze(api));

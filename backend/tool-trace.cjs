@@ -73,12 +73,13 @@ function traceHistory(value) {
 function cancelRounds(rounds) { return rounds.map(round => ({ ...round, calls: round.calls.map(call => FINAL_STATES.has(call.status) ? call : { ...call, status: 'cancelled', result: CANCELLED_RESULT }) })); }
 function cancelToolTrace(value) { return cancelRounds(normalizeToolTrace(value)); }
 function hasUnfinishedToolCalls(value) { return normalizeToolTrace(value).some(round => round.calls.some(call => !FINAL_STATES.has(call.status))); }
-function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map(), artifactIds = new Map(), buildIds = new Map(), scheduleIds = new Map(), runIds = new Map(), chatIds = new Map(), messageIdsByChat = new Map() } = {}) {
-  if ([fileIds, workspaceIds, artifactIds, buildIds, scheduleIds, runIds, chatIds, messageIdsByChat].some(mapping => types.isProxy(mapping) || !(mapping instanceof Map))) fail();
+function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map(), artifactIds = new Map(), buildIds = new Map(), scheduleIds = new Map(), runIds = new Map(), chatIds = new Map(), messageIdsByChat = new Map(), memoryIds = new Map() } = {}) {
+  if ([fileIds, workspaceIds, artifactIds, buildIds, scheduleIds, runIds, chatIds, messageIdsByChat, memoryIds].some(mapping => types.isProxy(mapping) || !(mapping instanceof Map))) fail();
   for (const mapping of messageIdsByChat.values()) if (types.isProxy(mapping) || !(mapping instanceof Map)) fail();
   const known = new Set(['workspace_list_files', 'workspace_read_file', 'workspace_create_text_file', 'workspace_save_text_file']);
   const appTools = new Set(['muse_list_apps', 'muse_read_app', 'muse_create_app', 'muse_write_app', 'muse_build_app']);
   const scheduleTools = new Set(['muse_list_schedules', 'muse_read_schedule', 'muse_create_schedule', 'muse_update_schedule', 'muse_pause_schedule', 'muse_delete_schedule', 'muse_run_schedule']);
+  const memoryTools=new Set(['memory_search','memory_read','memory_create','memory_update','memory_delete','memory_rebuild_index']);
   const object = candidate => candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate);
   const rewrite = (source, transform) => {
     let parsed;
@@ -103,7 +104,7 @@ function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map(), 
     try { return JSON.stringify(parsed); } catch { return source; }
   };
   const rounds = normalizeToolTrace(value).map(round => ({ ...round, calls: round.calls.map(call => {
-    if (!known.has(call.name) && !appTools.has(call.name) && !scheduleTools.has(call.name)) return call;
+    if (!known.has(call.name) && !appTools.has(call.name) && !scheduleTools.has(call.name)&&!memoryTools.has(call.name)) return call;
     const result = { ...call };
     if (call.name === 'workspace_read_file' || call.name === 'workspace_save_text_file') {
       result.arguments = rewrite(call.arguments, (args, field) => field(args, 'id', fileIds));
@@ -115,6 +116,7 @@ function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map(), 
       if (['muse_read_schedule', 'muse_update_schedule', 'muse_pause_schedule', 'muse_delete_schedule', 'muse_run_schedule'].includes(call.name)) field(args, 'id', scheduleIds);
       if (['muse_create_schedule', 'muse_update_schedule'].includes(call.name)) list(args, 'attachmentIds', fileIds);
     });
+    if(['memory_read','memory_update','memory_delete'].includes(call.name))result.arguments=rewrite(call.arguments,(args,field)=>field(args,'id',memoryIds));
     if (call.result != null) result.result = rewrite(call.result, (envelope, field, list) => {
       if (!object(envelope) || envelope.ok !== true || !object(envelope.result)) return;
       const payload = envelope.result;
@@ -136,6 +138,11 @@ function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map(), 
         app(payload.app);
         if (Array.isArray(payload.apps)) for (const item of payload.apps) app(item);
         field(payload, 'buildId', buildIds);
+      } else if(memoryTools.has(call.name)) {
+        if(['memory_create','memory_update'].includes(call.name))field(payload,'id',memoryIds);
+        field(payload.memory,'id',memoryIds);field(payload.memory,'workspaceId',workspaceIds);
+        field(payload,'deletedId',memoryIds);
+        if(Array.isArray(payload.hits))for(const hit of payload.hits){field(hit,'id',memoryIds);field(hit,'workspaceId',workspaceIds);}
       } else if (scheduleTools.has(call.name)) {
         // Only schema-defined identity slots are relationships. Prompt text,
         // cadence, provider binding and arbitrary nested data remain opaque.

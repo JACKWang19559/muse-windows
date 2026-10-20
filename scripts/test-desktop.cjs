@@ -24,7 +24,7 @@ const server = http.createServer(async (request, response) => {
   const parsed = JSON.parse(body); requests.push(parsed);
   response.writeHead(200, { 'content-type':'text/event-stream' });
   const user = parsed.messages.filter(x => x.role === 'user').at(-1)?.content || '';
-  if (parsed.tools?.length && /AGENT_(CREATE|SAVE|DENY|STOP|APP|SCHEDULE)_DEMO|SCHEDULE_WRITE_DEMO/.test(user)) {
+  if (parsed.tools?.length && /AGENT_(CREATE|SAVE|DENY|STOP|APP|SCHEDULE|MEMORY)_DEMO|SCHEDULE_WRITE_DEMO/.test(user)) {
     const emitTool = (name, args) => {
       const id = 'call-desktop-' + requests.length, data = JSON.stringify(args), cut = Math.floor(data.length / 2);
       response.write('data: ' + JSON.stringify({ choices:[{delta:{tool_calls:[{index:0,id,type:'function',function:{name,arguments:data.slice(0,cut)}}]}}] }) + '\n\n');
@@ -33,6 +33,7 @@ const server = http.createServer(async (request, response) => {
     const last = parsed.messages.at(-1);
     if (last?.role === 'tool') {
       const receipt = JSON.parse(last.content), previous = parsed.messages.filter(message=>message.role==='assistant'&&message.tool_calls?.length).at(-1).tool_calls.at(-1);
+      if(user.includes('AGENT_MEMORY_DEMO')&&receipt.ok&&previous.function.name==='memory_create'){emitTool('memory_read',{id:receipt.result.memory.id});return;}
       if (user.includes('AGENT_APP_DEMO') && receipt.ok) {
         if (previous.function.name === 'muse_create_app') { emitTool('muse_write_app',{id:receipt.result.app.id,expectedRevision:receipt.result.app.sourceRevision,files:[{path:'index.html',text:'<!doctype html><h1>MODEL-APP-42</h1><button onclick="this.textContent=\'READY\'">Run</button>'}]}); return; }
         if (previous.function.name === 'muse_write_app') { emitTool('muse_build_app',{id:receipt.result.app.id,expectedRevision:receipt.result.app.sourceRevision}); return; }
@@ -44,7 +45,8 @@ const server = http.createServer(async (request, response) => {
       const text = receipt.ok ? '文件操作已完成，结果已回传。' : '用户没有批准，本次没有写入。';
       response.end('data: '+JSON.stringify({choices:[{delta:{content:text},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n'); return;
     }
-    if (user.includes('AGENT_SCHEDULE_DEMO')) emitTool('muse_create_schedule',{name:'模型创建的计划',prompt:'SCHEDULE_MODEL_CREATED_RESULT',cadence:{kind:'daily',timeZone:'Asia/Shanghai',time:'09:00'},enabled:false,notification:'none'});
+    if(user.includes('AGENT_MEMORY_DEMO'))emitTool('memory_create',{name:'模型创建的知识',contentMarkdown:'KNOWLEDGE-MODEL-CREATED-42'});
+    else if (user.includes('AGENT_SCHEDULE_DEMO')) emitTool('muse_create_schedule',{name:'模型创建的计划',prompt:'SCHEDULE_MODEL_CREATED_RESULT',cadence:{kind:'daily',timeZone:'Asia/Shanghai',time:'09:00'},enabled:false,notification:'none'});
     else if(user.includes('SCHEDULE_WRITE_DEMO'))emitTool('workspace_create_text_file',{name:'scheduled-write-rejected.md',content:'must not commit'});
     else if (user.includes('AGENT_APP_DEMO')) emitTool('muse_create_app',{name:'模型创建的应用',runtime:'html'});
     else if (user.includes('AGENT_SAVE_DEMO')) emitTool('workspace_list_files',{});

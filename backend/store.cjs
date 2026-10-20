@@ -8,6 +8,7 @@ const { MAX_FILE_BYTES, MAX_TEXT_CHARS, TEXT_EXTENSIONS, describeFile, extractDo
 const { normalizeToolTrace, cancelToolTrace, hasUnfinishedToolCalls, remapToolTrace } = require('./tool-trace.cjs');
 const { MAX_ARTIFACTS, strictRecord: artifactInput, validArray: artifactArray, artifactPath, revision: artifactRevision, dataKey: artifactDataKey, jsonValue: artifactJson, fileBytes: artifactFileBytes, sourceDigest, validateArtifactFiles, validateArtifactBuild, validateArtifact, publicArtifact, starterFiles } = require('./artifact-model.cjs');
 const scheduleModel = require('./scheduler-model.cjs');
+const knowledge = require('./knowledge-model.cjs');
 const { normalizeCadence, nextOccurrence } = require('./schedule-time.cjs');
 
 const STATE_VERSION = 1;
@@ -112,7 +113,8 @@ function messageShape(value) {
 function chatShape(value) {
   record(value, '对话');
   if (typeof value.pinned !== 'boolean' || !Array.isArray(value.messages) || value.messages.length > 20000) fail('对话格式无效。');
-  return { id: identifier(value.id), title: string(value.title, '对话标题', 200, { empty: false }), workspaceId: value.workspaceId === null ? null : identifier(value.workspaceId), createdAt: date(value.createdAt), updatedAt: date(value.updatedAt), pinned: value.pinned, messages: value.messages.map(messageShape) };
+  const result = { id: identifier(value.id), title: string(value.title, '对话标题', 200, { empty: false }), workspaceId: value.workspaceId === null ? null : identifier(value.workspaceId), createdAt: date(value.createdAt), updatedAt: date(value.updatedAt), pinned: value.pinned, messages: value.messages.map(messageShape) };
+  if (value.profileId != null) result.profileId = identifier(value.profileId); return result;
 }
 function publicFile(value) {
   const result = { id: value.id, name: value.name, mime: value.mime, size: value.size, workspaceId: value.workspaceId, createdAt: value.createdAt, textStatus: value.textStatus };
@@ -137,7 +139,60 @@ function fileShape(value, internal = false) {
   return result;
 }
 function unique(values, label) { if (new Set(values).size !== values.length) fail(`${label}存在重复的标识符。`); }
+function knowledgeFields(value) {
+  return { memoryDocuments: value.memoryDocuments === undefined ? [] : knowledge.array(value.memoryDocuments, 1001).map(knowledge.memoryDocument), memories: value.memories === undefined ? [] : knowledge.array(value.memories, knowledge.MAX_MEMORIES).map(knowledge.memory), skills: value.skills === undefined ? [] : knowledge.array(value.skills, knowledge.MAX_SKILLS).map(knowledge.skill), agentProfiles: value.agentProfiles === undefined ? [] : knowledge.array(value.agentProfiles, knowledge.MAX_PROFILES).map(knowledge.profile), memoryIndexes: value.memoryIndexes === undefined ? [] : knowledge.array(value.memoryIndexes, 1001).map(item => require('./knowledge-search.cjs').validateMemoryIndex(item)) };
+}
+function knowledgeSource(state, kind, id) {
+  const collections = { memory_document: 'memoryDocuments', memory: 'memories', file: 'files', chat: 'chats', artifact: 'artifacts' };
+  return (state[collections[kind]] || []).find(item => item.id === id);
+}
+function validSkillRef(state, profile, ref) {
+  const skill = state.skills.find(item => item.id === ref.skillId), consent = skill?.consents.find(item => item.id === ref.consentId);
+  return Boolean(skill && skill.workspaceId === profile.workspaceId && skill.enabled && skill.eligible && skill.digest === ref.digest && consent && consent.workspaceId === profile.workspaceId && consent.digest === skill.digest && consent.policyRevision === knowledge.POLICY_REVISION);
+}
+function validateKnowledgeRelations(state) {
+  const workspaces = new Set(state.workspaces.map(item => item.id)), documents = new Map((state.memoryDocuments || []).map(item => [item.id, item])), profiles = new Map((state.agentProfiles || []).map(item => [item.id, item]));
+  for (const key of ['memoryDocuments','memories','skills','agentProfiles']) { unique((state[key] || []).map(item => item.id), '知识记录'); for (const item of state[key] || []) if (item.workspaceId !== null && !workspaces.has(item.workspaceId)) fail('知识记录引用了不存在的工作区。'); }
+  unique((state.memoryDocuments || []).map(item => item.workspaceId), '记忆文档范围'); unique((state.memoryIndexes || []).map(item => item.workspaceId), '记忆索引范围');
+  for (const index of state.memoryIndexes || []) if (index.workspaceId !== null && !workspaces.has(index.workspaceId)) fail('记忆索引引用了不存在的工作区。');
+  for (const index of state.memoryIndexes || []) {
+    for (const doc of index.documents) { const memory = (state.memories || []).find(item => item.id === doc.id); if (!memory || memory.workspaceId !== index.workspaceId || doc.revision > memory.revision) fail('记忆索引引用了不存在、跨范围或未来版本的条目。'); }
+    if (index.status === 'ready' && index.sourceDigest === require('./knowledge-search.cjs').memorySourceDigest(state.memories, index.workspaceId)) {
+      const current = state.memories.filter(item => item.workspaceId === index.workspaceId); if (current.length !== index.documents.length || index.documents.some(doc => { const item = current.find(item => item.id === doc.id); return item.revision !== doc.revision || item.digest !== doc.digest; })) fail('记忆索引文档与来源不一致。');
+    }
+  }
+  for (const memory of state.memories || []) if (memory.provenance.kind !== 'manual') {
+    const source = knowledgeSource(state, memory.provenance.kind, memory.provenance.sourceId);
+    if (!source || source.workspaceId !== memory.workspaceId) fail('记忆来源必须存在并属于同一范围。');
+    if (memory.provenance.sourceRevision !== undefined && (source.revision ?? source.sourceRevision) !== undefined && memory.provenance.sourceRevision > (source.revision ?? source.sourceRevision)) fail('记忆来源不能指向未来版本。');
+    const seen = new Set([memory.id]); let cursor = memory;
+    while (cursor?.provenance.kind === 'memory') { const target = cursor.provenance.sourceId; if (seen.has(target)) fail('记忆来源不能循环引用。'); seen.add(target); cursor = (state.memories || []).find(item => item.id === target); }
+  }
+  for (const profile of profiles.values()) {
+    for (const id of profile.memoryDocumentIds) if (documents.get(id)?.workspaceId !== profile.workspaceId) fail('助手只能选择同范围的记忆文档。');
+    for (const snapshot of profile.knowledgeSnapshots) {
+      const source = knowledgeSource(state, snapshot.kind, snapshot.sourceId);
+      if (!source || source.workspaceId !== profile.workspaceId) fail('知识快照来源必须存在并属于同一范围。');
+      const actual = source.revision ?? source.sourceRevision;
+      if (snapshot.sourceRevision !== undefined && actual !== undefined && snapshot.sourceRevision > actual) fail('知识快照不能引用未来的来源版本。');
+    }
+    for (const ref of profile.skillRefs) { const skill = (state.skills || []).find(item => item.id === ref.skillId); if (!skill || skill.workspaceId !== profile.workspaceId || !profile.needsReview && !validSkillRef(state, profile, ref)) fail('助手技能引用或授权无效，请重新确认。'); }
+  }
+  for (const chat of state.chats) if (chat.profileId && profiles.get(chat.profileId)?.workspaceId !== chat.workspaceId) fail('对话助手必须存在并属于同一范围。');
+}
+function touchProfile(profile) { profile.revision = knowledge.bump(profile.revision); profile.updatedAt = stamp(); profile.needsReview = true; }
+function removeKnowledgeSources(state, initial) {
+  const removed = new Set(initial.map(item => `${item.kind}:${item.id}`)), scopes = new Set();
+  let changed = true;
+  while (changed) { changed = false; state.memories = state.memories.filter(item => { if (!removed.has(`memory:${item.id}`) && !removed.has(`${item.provenance.kind}:${item.provenance.sourceId}`)) return true; removed.add(`memory:${item.id}`); scopes.add(item.workspaceId); changed = true; return false; }); }
+  for (const profile of state.agentProfiles) {
+    const snapshots = profile.knowledgeSnapshots.filter(item => !removed.has(`${item.kind}:${item.sourceId}`)), documents = profile.memoryDocumentIds.filter(id => !removed.has(`memory_document:${id}`));
+    if (snapshots.length !== profile.knowledgeSnapshots.length || documents.length !== profile.memoryDocumentIds.length) { profile.knowledgeSnapshots = snapshots; profile.memoryDocumentIds = documents; touchProfile(profile); }
+  }
+  state.memoryIndexes = state.memoryIndexes.filter(index => !scopes.has(index.workspaceId));
+}
 function validateRelations(state) {
+  validateKnowledgeRelations(state);
   unique(state.workspaces.map(item => item.id), '工作区'); unique(state.chats.map(item => item.id), '对话'); unique(state.files.map(item => item.id), '文件');
   unique((state.artifacts || []).map(item => item.id), 'Space');
   unique((state.schedules || []).map(item => item.id), '计划'); unique((state.scheduleRuns || []).map(item => item.id), '计划执行记录');
@@ -182,7 +237,7 @@ function stateShape(value) {
   if (encrypted != null && (typeof encrypted !== 'string' || encrypted.length > 65536 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encrypted))) fail('本地密钥记录损坏。');
   const artifacts = value.artifacts === undefined ? [] : artifactArray(value.artifacts, MAX_ARTIFACTS, 'Space 列表').map(validateArtifact);
   const schedules = value.schedules === undefined ? [] : scheduleModel.array(value.schedules, scheduleModel.MAX_SCHEDULES, '计划列表').map(scheduleModel.scheduleShape), scheduleRuns = value.scheduleRuns === undefined ? [] : scheduleModel.array(value.scheduleRuns, scheduleModel.MAX_SCHEDULE_RUNS, '执行记录').map(scheduleModel.runShape);
-  const state = { schemaVersion: STATE_VERSION, settings: validateSettings(value.settings), encryptedApiKey: encrypted || null, workspaces: value.workspaces.map(workspaceShape), chats: value.chats.map(chatShape), files: value.files.map(item => fileShape(item, true)), artifacts, schedules, scheduleRuns };
+  const state = { schemaVersion: STATE_VERSION, settings: validateSettings(value.settings), encryptedApiKey: encrypted || null, workspaces: value.workspaces.map(workspaceShape), chats: value.chats.map(chatShape), files: value.files.map(item => fileShape(item, true)), artifacts, schedules, scheduleRuns, ...knowledgeFields(value) };
   validateRelations(state);
   return state;
 }
@@ -201,7 +256,7 @@ class Store {
         try { this.state = this._load(this.backupPath); }
         catch { fail('本地数据缺失且自动备份无法读取。文件已保留，请从手动备份恢复。'); }
         this.recoveryNotice = '本地数据文件缺失，已恢复上一次自动备份。';
-      } else this.state = { schemaVersion: 1, settings: { ...DEFAULTS }, encryptedApiKey: null, workspaces: [], chats: [], files: [], artifacts: [], schedules: [], scheduleRuns: [] };
+      } else this.state = { schemaVersion: 1, settings: { ...DEFAULTS }, encryptedApiKey: null, workspaces: [], chats: [], files: [], artifacts: [], schedules: [], scheduleRuns: [], ...knowledgeFields({}) };
     }
     else {
       try { this.state = this._load(this.statePath); }
@@ -351,7 +406,7 @@ class Store {
   _artifact(id, state = this.state) { identifier(id); const artifact = state.artifacts.find(item => item.id === id); if (!artifact) fail('Space 不存在。'); return artifact; }
   _schedule(id, state = this.state) { identifier(id); const schedule = state.schedules.find(item => item.id === id); if (!schedule) fail('计划不存在。'); return schedule; }
   _scheduleRun(id, state = this.state) { identifier(id); const run = state.scheduleRuns.find(item => item.id === id); if (!run) fail('计划执行记录不存在。'); return run; }
-  snapshot() { return { settings: this.settings(), workspaces: copy(this.state.workspaces), chats: copy(this.state.chats), files: this.state.files.map(publicFile), artifacts: this.state.artifacts.map(publicArtifact), schedules: copy(this.state.schedules), scheduleRuns: copy(this.state.scheduleRuns), app: { version: '0.1.0', platform: process.platform } }; }
+  snapshot() { return { settings: this.settings(), workspaces: copy(this.state.workspaces), chats: copy(this.state.chats), files: this.state.files.map(publicFile), artifacts: this.state.artifacts.map(publicArtifact), schedules: copy(this.state.schedules), scheduleRuns: copy(this.state.scheduleRuns), memoryDocuments: copy(this.state.memoryDocuments.map(knowledge.publicMemory)), memories: copy(this.state.memories.map(knowledge.publicMemory)), skills: copy(this.state.skills.map(knowledge.publicSkill)), agentProfiles: copy(this.state.agentProfiles.map(knowledge.publicProfile)), memoryIndexes: this.state.memoryIndexes.map(index => ({ schemaVersion: 1, workspaceId: index.workspaceId, revision: index.revision, status: index.sourceDigest !== require('./knowledge-search.cjs').memorySourceDigest(this.state.memories, index.workspaceId) ? 'stale' : index.status, sourceDigest: index.sourceDigest, indexDigest: index.indexDigest, builtAt: index.builtAt, documentCount: index.documents.length, ...(index.errorCode ? { errorCode: index.errorCode } : {}) })), app: { version: '0.1.0', platform: process.platform } }; }
   settings() { return { ...copy(this.state.settings), hasApiKey: Boolean(this.state.encryptedApiKey) }; }
   secret() {
     if (!this.state.encryptedApiKey) return '';
@@ -387,6 +442,11 @@ class Store {
   }
   deleteWorkspace(id) {
     this._workspace(id); this._commit(next => {
+      const sources = [...next.memoryDocuments.filter(item => item.workspaceId === id).map(item => ({ kind: 'memory_document', id: item.id })), ...next.memories.filter(item => item.workspaceId === id).map(item => ({ kind: 'memory', id: item.id }))];
+      const profileIds = new Set(next.agentProfiles.filter(item => item.workspaceId === id).map(item => item.id));
+      for (const key of ['memoryDocuments','memories','skills','agentProfiles','memoryIndexes']) next[key] = next[key].filter(item => item.workspaceId !== id);
+      for (const chat of next.chats) if (profileIds.has(chat.profileId)) delete chat.profileId;
+      removeKnowledgeSources(next, sources);
       next.workspaces = next.workspaces.filter(item => item.id !== id); for (const item of [...next.chats, ...next.files, ...next.artifacts]) if (item.workspaceId === id) { item.workspaceId = null; if ('updatedAt' in item) item.updatedAt = stamp(); }
       for (const schedule of next.schedules) if (schedule.workspaceId === id) { schedule.workspaceId = null; schedule.enabled = false; if (schedule.revision < Number.MAX_SAFE_INTEGER) schedule.revision++; schedule.updatedAt = stamp(); }
       for (const run of next.scheduleRuns) if (run.scopeSnapshot.workspaceId === id) run.scopeSnapshot.workspaceId = null;
@@ -394,16 +454,16 @@ class Store {
     }, { replaceBackup: true }); return this.snapshot();
   }
   createChat(input = {}) {
-    record(input, '对话'); onlyKeys(input, ['workspaceId', 'title'], '对话');
-    const now = stamp(), chat = chatShape({ id: uid('chat'), title: input.title || '新对话', workspaceId: this._workspaceId(input.workspaceId), createdAt: now, updatedAt: now, pinned: false, messages: [] });
-    return this._commit(next => { next.chats.push(chat); return chat; });
+    record(input, '对话'); onlyKeys(input, ['workspaceId', 'title', 'profileId'], '对话');
+    const now = stamp(), chat = chatShape({ id: uid('chat'), title: input.title || '新对话', workspaceId: this._workspaceId(input.workspaceId), ...(input.profileId == null ? {} : { profileId: input.profileId }), createdAt: now, updatedAt: now, pinned: false, messages: [] });
+    return this._commit(next => { if (chat.profileId) this._bindProfile(chat.profileId, chat.workspaceId, next); next.chats.push(chat); return chat; });
   }
   updateChat(input) {
-    record(input, '对话'); onlyKeys(input, ['id', 'title', 'pinned', 'workspaceId'], '对话'); this._chat(input.id);
+    record(input, '对话'); onlyKeys(input, ['id', 'title', 'pinned', 'workspaceId', 'profileId'], '对话'); this._chat(input.id);
     if ('workspaceId' in input) this._workspaceId(input.workspaceId);
-    return this._commit(next => { const item = this._chat(input.id, next), value = chatShape({ ...item, ...input, updatedAt: stamp() }); Object.assign(item, value); return item; });
+    return this._commit(next => { const item = this._chat(input.id, next), moved = 'workspaceId' in input && input.workspaceId !== item.workspaceId, value = chatShape({ ...item, ...input, updatedAt: stamp(), ...(moved ? { profileId: null } : {}) }); if (value.profileId && Object.hasOwn(input, 'profileId')) this._bindProfile(value.profileId, value.workspaceId, next); if (!value.profileId) delete item.profileId; Object.assign(item, value); if (moved) removeKnowledgeSources(next, [{ kind: 'chat', id: item.id }]); return item; }, { replaceBackup: true });
   }
-  deleteChat(id) { this._chat(id); this._commit(next => { next.chats = next.chats.filter(item => item.id !== id); for (const run of next.scheduleRuns) if (run.chatId === id) { run.chatId = null; run.messageId = null; } return null; }); return this.snapshot(); }
+  deleteChat(id) { this._chat(id); this._commit(next => { next.chats = next.chats.filter(item => item.id !== id); removeKnowledgeSources(next, [{ kind: 'chat', id }]); for (const run of next.scheduleRuns) if (run.chatId === id) { run.chatId = null; run.messageId = null; } return null; }, { replaceBackup: true }); return this.snapshot(); }
   getChat(id) { return copy(this._chat(id)); }
   appendMessage(chatId, input) {
     record(input, '消息'); onlyKeys(input, ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace', 'replyToMessageId'], '消息');
@@ -450,6 +510,7 @@ class Store {
       chat.messages[index] = { id: selected.id, role: 'user', content: '', createdAt: selected.createdAt, status: 'complete', isDeleted: true };
       for (const message of chat.messages) if (message.replyTo?.messageId === selected.id) message.replyTo.excerpt = '';
       chat.updatedAt = stamp();
+      removeKnowledgeSources(next, [{ kind: 'chat', id: chat.id }]);
       return { chat, deletedMessageIds: [selected.id] };
     }, { replaceBackup: true });
   }
@@ -536,6 +597,7 @@ class Store {
   removeFile(id) {
     const item = this._file(id); this._managedPath(item._storedName); this._managedPath(item._textName);
     this._commit(next => {
+      removeKnowledgeSources(next, [{ kind: 'file', id }]);
       next.files = next.files.filter(file => file.id !== id); for (const chat of next.chats) for (const message of chat.messages) if (message.attachmentIds) message.attachmentIds = message.attachmentIds.filter(fileId => fileId !== id);
       for (const schedule of next.schedules) if (schedule.attachmentIds.includes(id)) { schedule.attachmentIds = schedule.attachmentIds.filter(fileId => fileId !== id); schedule.enabled = false; if (schedule.revision < Number.MAX_SAFE_INTEGER) schedule.revision++; schedule.updatedAt = stamp(); }
       for (const run of next.scheduleRuns) run.scopeSnapshot.attachmentIds = run.scopeSnapshot.attachmentIds.filter(fileId => fileId !== id);
@@ -568,6 +630,84 @@ class Store {
     const chat = this._chat(chatId), explicit = new Set(attachmentIds.map(id => this._file(id).id));
     return this.state.files.filter(file => (chat.workspaceId !== null && file.workspaceId === chat.workspaceId) || explicit.has(file.id)).filter(file => file.textStatus === 'ready').map(file => ({ ...publicFile(file), ...this.readFile(file.id) }));
   }
+  _knowledgeItem(collection, id, state = this.state) { knowledge.id(id); const item = state[collection].find(item => item.id === id); if (!item) fail('所选知识记录不存在。'); return item; }
+  _bindProfile(id, workspaceId, state = this.state) { const profile = this._knowledgeItem('agentProfiles', id, state); if (profile.workspaceId !== workspaceId || profile.needsReview) fail('请先确认同一范围内的助手配置。'); for (const ref of profile.skillRefs) if (!validSkillRef(state, profile, ref)) fail('助手技能授权已变化，请重新确认。'); return profile; }
+  _captureKnowledgeSource(kind, id, workspaceId, state = this.state) {
+    if (!knowledge.SOURCE_KINDS.includes(kind)) fail('知识来源类型无效。'); knowledge.id(id);
+    const source = knowledgeSource(state, kind, id); if (!source || source.workspaceId !== workspaceId) fail('只能选择同一范围内的现有知识来源。');
+    let name, contentMarkdown, sourceDigest, sourceRevision, sourceTruncated = false;
+    if (kind === 'memory' || kind === 'memory_document') { name = source.name || 'MEMORY.md'; contentMarkdown = source.contentMarkdown; sourceDigest = source.digest; sourceRevision = source.revision; }
+    else if (kind === 'file') { const preview = this.readFile(id); name = source.name; contentMarkdown = preview.text; sourceDigest = preview.sha256; sourceTruncated = preview.truncated; }
+    else if (kind === 'chat') {
+      if (source.messages.some(item => item.status === 'streaming')) fail('请等待对话生成结束后再保存知识快照。');
+      const messages = source.messages.filter(item => !item.isDeleted).map(({ id, role, content }) => ({ id, role, content }));
+      name = source.title; sourceDigest = knowledge.hash(JSON.stringify(messages)); contentMarkdown = JSON.stringify(messages.slice(-32)); sourceTruncated = messages.length > 32; if ([...contentMarkdown].length > 100000) { contentMarkdown = [...contentMarkdown].slice(0, 100000).join(''); sourceTruncated = true; }
+    } else { name = source.name; sourceRevision = source.sourceRevision; sourceDigest = require('./artifact-model.cjs').sourceDigest(source); contentMarkdown = JSON.stringify({ name: source.name, runtime: source.runtime, entryPath: source.entryPath, files: source.files.map(file => Object.hasOwn(file, 'text') ? file : { path: file.path, binary: true, size: artifactFileBytes(file).length, sha256: sha256(artifactFileBytes(file)) }) }); if ([...contentMarkdown].length > 100000) { contentMarkdown = [...contentMarkdown].slice(0, 100000).join(''); sourceTruncated = true; } }
+    const captured = knowledge.truncateSnapshot(contentMarkdown); return { name, sourceDigest, ...(sourceRevision === undefined ? {} : { sourceRevision }), ...captured, truncated: sourceTruncated || captured.truncated };
+  }
+  _memoryProvenance(value, workspaceId, state = this.state) {
+    if (value === undefined) return { kind: 'manual', capturedAt: stamp() };
+    const result = knowledge.provenance(value); if (result.kind === 'manual') return result;
+    const captured = this._captureKnowledgeSource(result.kind, result.sourceId, workspaceId, state);
+    return { kind: result.kind, sourceId: result.sourceId, sourceDigest: captured.sourceDigest, ...(captured.sourceRevision === undefined ? {} : { sourceRevision: captured.sourceRevision }), capturedAt: result.capturedAt };
+  }
+  getMemoryDocument(input = {}) { knowledge.input(input, ['workspaceId']); const workspaceId = this._workspaceId(input.workspaceId); const item = this.state.memoryDocuments.find(item => item.workspaceId === workspaceId); return item ? copy(item) : null; }
+  saveMemoryDocument(input) {
+    knowledge.input(input, ['workspaceId','expectedRevision','contentMarkdown']); const workspaceId = this._workspaceId(input.workspaceId), expected = knowledge.revision(input.expectedRevision, true), contentMarkdown = knowledge.memoryText(input.contentMarkdown);
+    return this._commit(next => { const old = next.memoryDocuments.find(item => item.workspaceId === workspaceId); if ((old?.revision || 0) !== expected) fail('记忆文档已变化，请重新载入后再保存。'); const now = stamp(), item = knowledge.memoryDocument({ id: old?.id || uid('memorydoc'), workspaceId, path: 'MEMORY.md', contentMarkdown, revision: old ? knowledge.bump(old.revision) : 1, digest: knowledge.hash(contentMarkdown), createdAt: old?.createdAt || now, updatedAt: now }); if (old) Object.assign(old, item); else next.memoryDocuments.push(item); return item; }, { replaceBackup: true });
+  }
+  deleteMemoryDocument(input) { knowledge.input(input, ['id','expectedRevision']); this._commit(next => { const item = this._knowledgeItem('memoryDocuments', input.id, next); knowledge.checkRevision(item, input.expectedRevision); next.memoryDocuments = next.memoryDocuments.filter(item => item.id !== input.id); removeKnowledgeSources(next, [{ kind: 'memory_document', id: input.id }]); return null; }, { replaceBackup: true }); return this.snapshot(); }
+  createMemory(input) {
+    knowledge.input(input, ['name','contentMarkdown','workspaceId','provenance']); const workspaceId = this._workspaceId(input.workspaceId), contentMarkdown = knowledge.memoryText(input.contentMarkdown), now = stamp();
+    return this._commit(next => { if (next.memories.length >= knowledge.MAX_MEMORIES) fail('记忆条目数量超出限制。'); const item = knowledge.memory({ id: uid('memory'), name: input.name, contentMarkdown, workspaceId, revision: 1, digest: knowledge.hash(contentMarkdown), provenance: this._memoryProvenance(input.provenance, workspaceId, next), createdAt: now, updatedAt: now }); next.memories.push(item); return item; }, { replaceBackup: true });
+  }
+  getMemory(id) { return copy(this._knowledgeItem('memories', id)); }
+  updateMemory(input) {
+    knowledge.input(input, ['id','expectedRevision','name','contentMarkdown','provenance']);
+    return this._commit(next => { const item = this._knowledgeItem('memories', input.id, next); knowledge.checkRevision(item, input.expectedRevision); const contentMarkdown = input.contentMarkdown === undefined ? item.contentMarkdown : knowledge.memoryText(input.contentMarkdown), value = knowledge.memory({ ...item, ...(input.name === undefined ? {} : { name: input.name }), contentMarkdown, digest: knowledge.hash(contentMarkdown), provenance: input.provenance === undefined ? item.provenance : this._memoryProvenance(input.provenance, item.workspaceId, next), revision: knowledge.bump(item.revision), updatedAt: stamp() }); Object.assign(item, value); return item; }, { replaceBackup: true });
+  }
+  deleteMemory(input) { knowledge.input(input, ['id','expectedRevision']); this._commit(next => { const item = this._knowledgeItem('memories', input.id, next); knowledge.checkRevision(item, input.expectedRevision); removeKnowledgeSources(next, [{ kind: 'memory', id: input.id }]); return null; }, { replaceBackup: true }); return this.snapshot(); }
+  getMemoryIndex(input = {}) { knowledge.input(input, ['workspaceId']); const workspaceId = this._workspaceId(input.workspaceId), index = this.state.memoryIndexes.find(item => item.workspaceId === workspaceId); return index ? copy(index) : null; }
+  commitMemoryIndex(input) {
+    knowledge.input(input, ['workspaceId','expectedRevision','sourceDigest','index']); const workspaceId = this._workspaceId(input.workspaceId), expected = knowledge.revision(input.expectedRevision, true), sourceDigest = knowledge.digest(input.sourceDigest);
+    return this._commit(next => { const old = next.memoryIndexes.find(item => item.workspaceId === workspaceId); if ((old?.revision || 0) !== expected) fail('记忆索引已变化，请重新建立索引。'); if (require('./knowledge-search.cjs').memorySourceDigest(next.memories, workspaceId) !== sourceDigest) fail('记忆来源已变化，请重新建立索引。'); const index = require('./knowledge-search.cjs').validateMemoryIndex(input.index); if (index.workspaceId !== workspaceId || index.sourceDigest !== sourceDigest || index.revision !== expected + 1) fail('索引范围、来源或版本不匹配。'); if (old) next.memoryIndexes[next.memoryIndexes.indexOf(old)] = index; else next.memoryIndexes.push(index); return index; }, { replaceBackup: true });
+  }
+  createSkill(input) {
+    knowledge.input(input, ['name','description','version','manifestVersion','guidanceMarkdown','toolRequirements','workspaceId','digest','eligible','ineligibleReasons','enabled']); const workspaceId = this._workspaceId(input.workspaceId), now = stamp(); if (input.enabled !== undefined && input.enabled !== false) fail('请先明确批准技能指导授权。');
+    const base = { name: input.name, description: input.description, version: input.version, manifestVersion: input.manifestVersion === undefined ? 1 : input.manifestVersion, guidanceMarkdown: input.guidanceMarkdown, toolRequirements: knowledge.requirements(input.toolRequirements === undefined ? [] : input.toolRequirements) }, digest = knowledge.skillDigest(base), eligible = knowledge.eligibility(base.toolRequirements);
+    if (input.digest !== undefined && input.digest !== digest || input.eligible !== undefined && input.eligible !== eligible.eligible || input.ineligibleReasons !== undefined && JSON.stringify(input.ineligibleReasons) !== JSON.stringify(eligible.ineligibleReasons)) fail('技能解析元数据不匹配。');
+    return this._commit(next => { if (next.skills.length >= knowledge.MAX_SKILLS) fail('技能指导数量超出限制。'); const item = knowledge.skill({ id: uid('skill'), ...base, workspaceId, revision: 1, digest, enabled: false, ...eligible, consents: [], createdAt: now, updatedAt: now }); next.skills.push(item); return item; }, { replaceBackup: true });
+  }
+  getSkill(id) { return copy(this._knowledgeItem('skills', id)); }
+  updateSkill(input) {
+    knowledge.input(input, ['id','expectedRevision','name','description','version','guidanceMarkdown','toolRequirements','enabled']);
+    return this._commit(next => { const item = this._knowledgeItem('skills', input.id, next); knowledge.checkRevision(item, input.expectedRevision); const value = { ...item }; for (const key of ['name','description','version','guidanceMarkdown','toolRequirements','enabled']) if (Object.hasOwn(input, key)) value[key] = input[key]; value.toolRequirements = knowledge.requirements(value.toolRequirements); value.digest = knowledge.skillDigest(value); Object.assign(value, knowledge.eligibility(value.toolRequirements)); if (value.digest !== item.digest) { value.consents = []; value.enabled = false; } if (value.enabled && (!value.eligible || !value.consents.length)) fail('请先明确批准当前技能内容与工具需求。'); value.revision = knowledge.bump(item.revision); value.updatedAt = stamp(); Object.assign(item, knowledge.skill(value)); for (const profile of next.agentProfiles) if (profile.skillRefs.some(ref => ref.skillId === item.id)) touchProfile(profile); return item; }, { replaceBackup: true });
+  }
+  setSkillConsent(input) {
+    knowledge.input(input, ['id','expectedRevision','workspaceId','approved','policyRevision']); if (typeof input.approved !== 'boolean' || input.policyRevision !== knowledge.POLICY_REVISION) fail('技能授权选项无效。');
+    return this._commit(next => { const item = this._knowledgeItem('skills', input.id, next); knowledge.checkRevision(item, input.expectedRevision); const workspaceId = input.workspaceId === undefined ? item.workspaceId : this._workspaceId(input.workspaceId, next); if (workspaceId !== item.workspaceId) fail('技能授权必须属于相同范围。'); if (input.approved && !item.eligible) fail('技能包含不支持的工具需求，无法启用。'); item.consents = input.approved ? [{ id: uid('consent'), workspaceId, digest: item.digest, version: item.version, toolRequirements: copy(item.toolRequirements), policyRevision: knowledge.POLICY_REVISION, approvedAt: stamp() }] : []; item.enabled = input.approved; item.revision = knowledge.bump(item.revision); item.updatedAt = stamp(); for (const profile of next.agentProfiles) if (profile.skillRefs.some(ref => ref.skillId === item.id)) touchProfile(profile); return item; }, { replaceBackup: true });
+  }
+  deleteSkill(input) { knowledge.input(input, ['id','expectedRevision']); this._commit(next => { const item = this._knowledgeItem('skills', input.id, next); knowledge.checkRevision(item, input.expectedRevision); next.skills = next.skills.filter(item => item.id !== input.id); for (const profile of next.agentProfiles) if (profile.skillRefs.some(ref => ref.skillId === input.id)) { profile.skillRefs = profile.skillRefs.filter(ref => ref.skillId !== input.id); touchProfile(profile); } return null; }, { replaceBackup: true }); return this.snapshot(); }
+  createAgentProfile(input) {
+    knowledge.input(input, ['name','workspaceId','instructions','memoryDocumentIds','toolPolicy','skillRefs']); const workspaceId = this._workspaceId(input.workspaceId), now = stamp();
+    return this._commit(next => { if (next.agentProfiles.length >= knowledge.MAX_PROFILES) fail('助手配置数量超出限制。'); const item = knowledge.profile({ id: uid('profile'), name: input.name, workspaceId, instructions: input.instructions === undefined ? '' : input.instructions, revision: 1, needsReview: true, knowledgeSnapshots: [], skillRefs: input.skillRefs === undefined ? [] : input.skillRefs, memoryDocumentIds: input.memoryDocumentIds === undefined ? [] : input.memoryDocumentIds, toolPolicy: input.toolPolicy === undefined ? 'read' : input.toolPolicy, createdAt: now, updatedAt: now }); next.agentProfiles.push(item); return item; }, { replaceBackup: true });
+  }
+  getAgentProfile(id) { return copy(this._knowledgeItem('agentProfiles', id)); }
+  updateAgentProfile(input) {
+    knowledge.input(input, ['id','expectedRevision','name','instructions','memoryDocumentIds','toolPolicy','skillRefs']);
+    return this._commit(next => { const item = this._knowledgeItem('agentProfiles', input.id, next); knowledge.checkRevision(item, input.expectedRevision); const value = { ...item }; for (const key of ['name','instructions','memoryDocumentIds','toolPolicy','skillRefs']) if (Object.hasOwn(input, key)) value[key] = input[key]; touchProfile(value); Object.assign(item, knowledge.profile(value)); return item; }, { replaceBackup: true });
+  }
+  captureProfileKnowledge(input) {
+    knowledge.input(input, ['id','expectedRevision','kind','sourceId']);
+    return this._commit(next => { const item = this._knowledgeItem('agentProfiles', input.id, next); knowledge.checkRevision(item, input.expectedRevision); if (item.knowledgeSnapshots.some(snapshot => snapshot.kind === input.kind && snapshot.sourceId === input.sourceId)) fail('该来源已存在，请显式刷新已有快照。'); if (item.knowledgeSnapshots.length >= 50) fail('知识快照最多 50 项。'); const source = this._captureKnowledgeSource(input.kind, input.sourceId, item.workspaceId, next); item.knowledgeSnapshots.push(knowledge.knowledgeSnapshot({ id: uid('snapshot'), kind: input.kind, sourceId: input.sourceId, ...source, contentDigest: knowledge.hash(source.contentMarkdown), capturedAt: stamp() })); touchProfile(item); return item; }, { replaceBackup: true });
+  }
+  refreshProfileKnowledge(input) {
+    knowledge.input(input, ['id','expectedRevision','snapshotId']);
+    return this._commit(next => { const item = this._knowledgeItem('agentProfiles', input.id, next); knowledge.checkRevision(item, input.expectedRevision); const index = item.knowledgeSnapshots.findIndex(snapshot => snapshot.id === input.snapshotId); if (index < 0) fail('知识快照不存在。'); const old = item.knowledgeSnapshots[index], source = this._captureKnowledgeSource(old.kind, old.sourceId, item.workspaceId, next); item.knowledgeSnapshots[index] = knowledge.knowledgeSnapshot({ id: old.id, kind: old.kind, sourceId: old.sourceId, ...source, contentDigest: knowledge.hash(source.contentMarkdown), capturedAt: stamp() }); touchProfile(item); return item; }, { replaceBackup: true });
+  }
+  removeProfileKnowledge(input) { knowledge.input(input, ['id','expectedRevision','snapshotId']); return this._commit(next => { const item = this._knowledgeItem('agentProfiles', input.id, next); knowledge.checkRevision(item, input.expectedRevision); if (!item.knowledgeSnapshots.some(snapshot => snapshot.id === input.snapshotId)) fail('知识快照不存在。'); item.knowledgeSnapshots = item.knowledgeSnapshots.filter(snapshot => snapshot.id !== input.snapshotId); touchProfile(item); return item; }, { replaceBackup: true }); }
+  reviewAgentProfile(input) { knowledge.input(input, ['id','expectedRevision']); return this._commit(next => { const item = this._knowledgeItem('agentProfiles', input.id, next); knowledge.checkRevision(item, input.expectedRevision); for (const ref of item.skillRefs) if (!validSkillRef(next, item, ref)) fail('请重新批准并选择当前有效的技能指导。'); item.needsReview = false; item.revision = knowledge.bump(item.revision); item.updatedAt = stamp(); return item; }, { replaceBackup: true }); }
+  deleteAgentProfile(input) { knowledge.input(input, ['id','expectedRevision']); this._commit(next => { const item = this._knowledgeItem('agentProfiles', input.id, next); knowledge.checkRevision(item, input.expectedRevision); next.agentProfiles = next.agentProfiles.filter(item => item.id !== input.id); for (const chat of next.chats) if (chat.profileId === input.id) delete chat.profileId; return null; }, { replaceBackup: true }); return this.snapshot(); }
   getSchedule(id) { return copy(this._schedule(id)); }
   getScheduleRun(id) { return copy(this._scheduleRun(id)); }
   createSchedule(input, at = stamp()) {
@@ -701,7 +841,7 @@ class Store {
     const build = input.buildId == null ? artifact.builds.at(-1) : artifact.builds.find(item => item.id === input.buildId);
     if (!build) fail('Space 尚无可用构建。'); return copy(build);
   }
-  deleteArtifact(id) { this._artifact(id); this._commit(next => { next.artifacts = next.artifacts.filter(item => item.id !== id); return null; }, { replaceBackup: true }); return this.snapshot(); }
+  deleteArtifact(id) { this._artifact(id); this._commit(next => { next.artifacts = next.artifacts.filter(item => item.id !== id); removeKnowledgeSources(next, [{ kind: 'artifact', id }]); return null; }, { replaceBackup: true }); return this.snapshot(); }
   artifactDataGet(input) {
     artifactInput(input, ['id', 'key']); const key = artifactDataKey(input.key), data = this._artifact(input.id).data;
     return { key, found: Object.hasOwn(data.values, key), ...(Object.hasOwn(data.values, key) ? { value: copy(data.values[key]) } : {}), version: data.version };
@@ -729,12 +869,12 @@ class Store {
       if (message) { message.status = 'cancelled'; message.error = run.error; if (message.toolTrace) message.toolTrace = cancelToolTrace(message.toolTrace); }
       return run;
     });
-    const data = { format: BACKUP_FORMAT, schemaVersion: 1, exportedAt, settings: { ...copy(this.state.settings), backgroundTasks: false }, workspaces: copy(this.state.workspaces), chats, files, artifacts: this.state.artifacts.map(artifact => ({ ...copy(artifact), builds: copy(artifact.builds.slice(-1)) })), schedules, scheduleRuns };
+    const data = { format: BACKUP_FORMAT, schemaVersion: 1, exportedAt, settings: { ...copy(this.state.settings), backgroundTasks: false }, workspaces: copy(this.state.workspaces), chats, files, artifacts: this.state.artifacts.map(artifact => ({ ...copy(artifact), builds: copy(artifact.builds.slice(-1)) })), schedules, scheduleRuns, memoryDocuments: copy(this.state.memoryDocuments), memories: copy(this.state.memories), skills: copy(this.state.skills), agentProfiles: copy(this.state.agentProfiles), memoryIndexes: copy(this.state.memoryIndexes) };
     if (Buffer.byteLength(JSON.stringify(data)) > MAX_BACKUP_JSON_BYTES) fail('备份超过 150 MB，请先减少附件数量后重试。');
     return data;
   }
   async importData(data) {
-    record(data, '备份'); onlyKeys(data, ['format', 'schemaVersion', 'exportedAt', 'settings', 'workspaces', 'chats', 'files', 'artifacts', 'schedules', 'scheduleRuns'], '备份');
+    record(data, '备份'); onlyKeys(data, ['format', 'schemaVersion', 'exportedAt', 'settings', 'workspaces', 'chats', 'files', 'artifacts', 'schedules', 'scheduleRuns','memoryDocuments','memories','skills','agentProfiles','memoryIndexes'], '备份');
     let serialized;
     try { serialized = JSON.stringify(data); } catch { fail('备份结构无效，无法读取。'); }
     if (Buffer.byteLength(serialized) > MAX_BACKUP_JSON_BYTES) fail('备份超过 150 MB，无法导入。');
@@ -744,7 +884,7 @@ class Store {
     if (!Array.isArray(data.workspaces) || data.workspaces.length > 1000 || !Array.isArray(data.chats) || data.chats.length > 5000 || !Array.isArray(data.files) || data.files.length > 10000) fail('备份内容超出限制或格式无效。');
     for (const item of data.workspaces) onlyKeys(record(item, '工作区'), ['id', 'name', 'description', 'color', 'createdAt', 'updatedAt'], '备份工作区');
     for (const item of data.chats) {
-      onlyKeys(record(item, '对话'), ['id', 'title', 'workspaceId', 'createdAt', 'updatedAt', 'pinned', 'messages'], '备份对话');
+      onlyKeys(record(item, '对话'), ['id', 'title', 'workspaceId', 'createdAt', 'updatedAt', 'pinned', 'messages','profileId'], '备份对话');
       if (!Array.isArray(item.messages)) fail('备份消息列表无效。');
       for (const message of item.messages) onlyKeys(record(message, '消息'), ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace', 'replyTo', 'isDeleted'], '备份消息');
     }
@@ -756,12 +896,17 @@ class Store {
       const bytes = Buffer.from(file.dataBase64, 'base64'); total += bytes.length;
       if (total > MAX_BACKUP_BYTES || bytes.length !== item.size || typeof file.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(file.sha256) || crypto.createHash('sha256').update(bytes).digest('hex') !== file.sha256) fail('备份附件大小或校验值不匹配。');
       buffers.set(item.id, bytes); return item;
-    }), artifacts: data.artifacts === undefined ? [] : artifactArray(data.artifacts, MAX_ARTIFACTS, '备份 Space').map(validateArtifact), schedules: data.schedules === undefined ? [] : scheduleModel.array(data.schedules, scheduleModel.MAX_SCHEDULES, '备份计划').map(scheduleModel.scheduleShape), scheduleRuns: data.scheduleRuns === undefined ? [] : scheduleModel.array(data.scheduleRuns, scheduleModel.MAX_SCHEDULE_RUNS, '备份执行记录').map(scheduleModel.runShape) };
+    }), artifacts: data.artifacts === undefined ? [] : artifactArray(data.artifacts, MAX_ARTIFACTS, '备份 Space').map(validateArtifact), schedules: data.schedules === undefined ? [] : scheduleModel.array(data.schedules, scheduleModel.MAX_SCHEDULES, '备份计划').map(scheduleModel.scheduleShape), scheduleRuns: data.scheduleRuns === undefined ? [] : scheduleModel.array(data.scheduleRuns, scheduleModel.MAX_SCHEDULE_RUNS, '备份执行记录').map(scheduleModel.runShape), ...knowledgeFields(data) };
     validateRelations(source);
+    const importedGlobalDocument = source.memoryDocuments.find(item => item.workspaceId === null), existingGlobalDocument = this.state.memoryDocuments.find(item => item.workspaceId === null);
+    if (importedGlobalDocument && existingGlobalDocument && importedGlobalDocument.digest !== existingGlobalDocument.digest) fail('全局长期记忆 MEMORY.md 内容冲突，导入未改变任何数据。请保留两边备份，明确整理或删除当前全局记忆后再导入。');
+    const reusedGlobalDocument = importedGlobalDocument && existingGlobalDocument ? existingGlobalDocument : null;
     const workspaceIds = new Map(source.workspaces.map(item => [item.id, uid('ws')])), fileIds = new Map(), prepared = [];
     const artifactIds = new Map(source.artifacts.map(item => [item.id, uid('artifact')])), buildIds = new Map();
     const chatIds = new Map(source.chats.map(item => [item.id, uid('chat')])), messageIdsByChat = new Map(source.chats.map(chat => [chat.id, new Map(chat.messages.map(message => [message.id, uid('msg')]))]));
     const scheduleIds = new Map(source.schedules.map(item => [item.id, uid('schedule')])), runIds = new Map(source.scheduleRuns.map(item => [item.id, uid('run')]));
+    const memoryDocumentIds = new Map(source.memoryDocuments.map(item => [item.id, reusedGlobalDocument && item.id === importedGlobalDocument.id ? reusedGlobalDocument.id : uid('memorydoc')])), memoryIds = new Map(source.memories.map(item => [item.id, uid('memory')])), skillIds = new Map(source.skills.map(item => [item.id, uid('skill')])), profileIds = new Map(source.agentProfiles.map(item => [item.id, uid('profile')]));
+    const snapshotIds = new Map(source.agentProfiles.flatMap(profile => profile.knowledgeSnapshots.map(item => [item.id, uid('snapshot')])));
     // Only the retained latest build exists after import. Older historical IDs
     // stay historical instead of being remapped to phantom build identities.
     for (const item of source.artifacts) for (const build of item.builds.slice(-1)) if (!buildIds.has(build.id)) buildIds.set(build.id, uid('build'));
@@ -769,13 +914,24 @@ class Store {
       for (const item of source.files) { const file = await this._prepareFile(buffers.get(item.id), item.name, item.workspaceId === null ? null : workspaceIds.get(item.workspaceId)); file.createdAt = item.createdAt; prepared.push(file); fileIds.set(item.id, file.id); }
       const workspaces = source.workspaces.map(item => ({ ...item, id: workspaceIds.get(item.id) }));
       const artifacts = source.artifacts.map(item => ({ ...item, id: artifactIds.get(item.id), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), builds: item.builds.slice(-1).map(build => ({ ...build, id: buildIds.get(build.id) })) }));
+      const remapSource = (kind, id) => ({ memory_document: memoryDocumentIds, memory: memoryIds, file: fileIds, chat: chatIds, artifact: artifactIds }[kind]).get(id), remapWorkspace = id => id === null ? null : workspaceIds.get(id);
+      const remapSourceVersion = item => reusedGlobalDocument && item.kind === 'memory_document' && item.sourceId === importedGlobalDocument.id ? { sourceRevision: reusedGlobalDocument.revision, sourceDigest: reusedGlobalDocument.digest } : {};
+      const memoryDocuments = source.memoryDocuments.filter(item => !(reusedGlobalDocument && item.id === importedGlobalDocument.id)).map(item => ({ ...item, id: memoryDocumentIds.get(item.id), workspaceId: remapWorkspace(item.workspaceId) }));
+      const memories = source.memories.map(item => ({ ...item, id: memoryIds.get(item.id), workspaceId: remapWorkspace(item.workspaceId), provenance: item.provenance.kind === 'manual' ? item.provenance : { ...item.provenance, ...remapSourceVersion(item.provenance), sourceId: remapSource(item.provenance.kind, item.provenance.sourceId) } }));
+      const skills = source.skills.map(item => ({ ...item, id: skillIds.get(item.id), workspaceId: remapWorkspace(item.workspaceId), enabled: false, consents: [] }));
+      const agentProfiles = source.agentProfiles.map(item => ({ ...item, id: profileIds.get(item.id), workspaceId: remapWorkspace(item.workspaceId), needsReview: true, memoryDocumentIds: item.memoryDocumentIds.map(id => memoryDocumentIds.get(id)), skillRefs: item.skillRefs.map(ref => ({ ...ref, skillId: skillIds.get(ref.skillId), consentId: null })), knowledgeSnapshots: item.knowledgeSnapshots.map(snapshot => ({ ...snapshot, ...remapSourceVersion(snapshot), id: snapshotIds.get(snapshot.id), sourceId: remapSource(snapshot.kind, snapshot.sourceId) })) }));
+      // A stale index is a derived cache, not source knowledge. Keep no stale
+      // imported postings. Global merging also needs an explicit rebuild.
+      const memoryIndexes = source.memoryIndexes.filter(index => index.workspaceId !== null && index.sourceDigest === require('./knowledge-search.cjs').memorySourceDigest(source.memories, index.workspaceId)).map(index => {
+        const result = { ...index, workspaceId: remapWorkspace(index.workspaceId), sourceDigest: require('./knowledge-search.cjs').memorySourceDigest(memories, remapWorkspace(index.workspaceId)), documents: index.documents.map(doc => ({ ...doc, id: memoryIds.get(doc.id) })).sort((a,b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0), postings: index.postings.map(term => ({ ...term, documents: term.documents.map(doc => ({ ...doc, id: memoryIds.get(doc.id) })).sort((a,b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0) })) }; result.indexDigest = require('./knowledge-search.cjs').indexHash(result); return require('./knowledge-search.cjs').validateMemoryIndex(result);
+      });
       const schedules = source.schedules.map(item => ({ ...item, id: scheduleIds.get(item.id), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), attachmentIds: item.attachmentIds.map(id => fileIds.get(id)), enabled: false, ...(item.lastRunId ? { lastRunId: runIds.get(item.lastRunId) } : {}) }));
       const scheduleRuns = source.scheduleRuns.map(item => ({ ...item, id: runIds.get(item.id), scheduleId: item.scheduleId === null ? null : scheduleIds.get(item.scheduleId), chatId: item.chatId === null ? null : chatIds.get(item.chatId), messageId: item.chatId === null ? null : messageIdsByChat.get(item.chatId).get(item.messageId), scopeSnapshot: { workspaceId: item.scopeSnapshot.workspaceId === null ? null : workspaceIds.get(item.scopeSnapshot.workspaceId), attachmentIds: item.scopeSnapshot.attachmentIds.map(id => fileIds.get(id)) }, ...(item.status === 'running' ? { status: 'interrupted', finishedAt: stamp(), error: '导入的计划执行已停止，不会自动重发。' } : {}) }));
       const chats = source.chats.map(item => {
         const messageIds = messageIdsByChat.get(item.id);
-        return { ...item, id: chatIds.get(item.id), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), messages: item.messages.map(message => ({ ...message, id: messageIds.get(message.id), status: message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace) ? 'cancelled' : message.status, ...(message.replyTo ? { replyTo: { ...message.replyTo, messageId: messageIds.get(message.replyTo.messageId) } } : {}), ...(message.toolTrace ? { toolTrace: remapToolTrace(cancelToolTrace(message.toolTrace), { fileIds, workspaceIds, artifactIds, buildIds, scheduleIds, runIds, chatIds, messageIdsByChat }) } : {}), ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) };
+        return { ...item, id: chatIds.get(item.id), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), ...(item.profileId ? { profileId: profileIds.get(item.profileId) } : {}), messages: item.messages.map(message => ({ ...message, id: messageIds.get(message.id), status: message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace) ? 'cancelled' : message.status, ...(message.replyTo ? { replyTo: { ...message.replyTo, messageId: messageIds.get(message.replyTo.messageId) } } : {}), ...(message.toolTrace ? { toolTrace: remapToolTrace(cancelToolTrace(message.toolTrace), { fileIds, workspaceIds, artifactIds, buildIds, scheduleIds, runIds, chatIds, messageIdsByChat, memoryIds }) } : {}), ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) };
       });
-      this._commit(next => { if (next.workspaces.length + workspaces.length > 1000 || next.chats.length + chats.length > 5000 || next.files.length + prepared.length > 10000 || next.artifacts.length + artifacts.length > MAX_ARTIFACTS || next.schedules.length + schedules.length > scheduleModel.MAX_SCHEDULES) fail('合并后的数据数量超出限制。'); next.settings = settings; next.workspaces.push(...workspaces); next.chats.push(...chats); next.files.push(...prepared); next.artifacts.push(...artifacts); next.schedules.push(...schedules); next.scheduleRuns.push(...scheduleRuns); scheduleModel.pruneRuns(next); return null; });
+      this._commit(next => { if (next.workspaces.length + workspaces.length > 1000 || next.chats.length + chats.length > 5000 || next.files.length + prepared.length > 10000 || next.artifacts.length + artifacts.length > MAX_ARTIFACTS || next.schedules.length + schedules.length > scheduleModel.MAX_SCHEDULES) fail('合并后的数据数量超出限制。'); next.settings = settings; next.workspaces.push(...workspaces); next.chats.push(...chats); next.files.push(...prepared); next.artifacts.push(...artifacts); next.schedules.push(...schedules); next.scheduleRuns.push(...scheduleRuns); next.memoryDocuments.push(...memoryDocuments); next.memories.push(...memories); next.skills.push(...skills); next.agentProfiles.push(...agentProfiles); next.memoryIndexes.push(...memoryIndexes); scheduleModel.pruneRuns(next); return null; });
       return this.snapshot();
     } catch (error) { for (const item of prepared) this._discardFile(item); throw error; }
   }

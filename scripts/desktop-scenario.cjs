@@ -5,7 +5,11 @@ const {dialog} = require('electron');
 module.exports = async ({ app, window, store, operations, snapshot }) => {
   const folder = process.env.MUSE_E2E_FOLDER;
   const checks = [];
-  const page = (fn, value) => window.webContents.executeJavaScript(`(${fn.toString()})(${JSON.stringify(value)})`);
+  const page = async (fn, value) => {
+    const reply=await window.webContents.executeJavaScript(`(async()=>{try{return {ok:true,value:await (${fn.toString()})(${JSON.stringify(value)})};}catch(error){return {ok:false,error:String(error?.message||error)}}})()`);
+    if(!reply.ok)throw new Error(reply.error+' in '+fn.toString().slice(0,220));
+    return reply.value;
+  };
   const wait = async (fn, value, timeout = 10000) => {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) { const result = await page(fn, value); if (result) return result; await new Promise(r=>setTimeout(r,60)); }
@@ -40,6 +44,10 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await new Promise(r=>setTimeout(r,300));
     await window.webContents.capturePage().then(image=>fs.writeFileSync(path.join(folder,'settings.png'),image.toPNG()));
     await page(()=>Array.from(document.querySelectorAll('.settings-footer button')).find(x=>x.textContent==='关闭').click());
+    if(process.env.MUSE_E2E_SCENARIO==='knowledge'){
+      await require('./knowledge-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+      fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'knowledge only',provider:'local deterministic test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
+    }
     await page(()=>document.querySelector('[data-testid="workspace-new"]').click());
     await wait(()=>!!document.querySelector('[data-testid="workspace-name"]'));
     await fill('workspace-name','桌面验收工作区');
@@ -210,6 +218,7 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await require('./artifact-editing-scenario.cjs')({window,store,operations,folder,page,wait,check,fill});
     await require('./scheduler-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./quit-cancel-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+    await require('./knowledge-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     const report={passed:true,checks,check_count:checks.length,provider:'local deterministic test server only',target_mac_app_executed:false};
     fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify(report,null,2));
     app.exit(0);
