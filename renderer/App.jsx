@@ -18,6 +18,7 @@ import PendingSends from './PendingSends.jsx';
 import ArtifactPanel from './ArtifactPanel.jsx';
 import SchedulePanel from './SchedulePanel.jsx';
 import KnowledgePanel from './KnowledgePanel.jsx';
+import { useDictation } from './DictationControl.jsx';
 
 const api = window.muse;
 const COLORS = ['#47766a', '#607eb3', '#a07cb5', '#c49456', '#bd7777', '#7c8992'];
@@ -121,7 +122,8 @@ function Markdown({ content, notify, highlight }) {
   }} />;
 }
 
-function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport, onDrop, onSend, onStop, busy, admitting, importing, welcome = false, placeholder, model, configured, useTools, onToolsChange, quote, onClearQuote, historyMessages = [], historyKey, knowledgeControl }) {
+function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport, onDrop, onSend, onStop, busy, admitting, importing, welcome = false, placeholder, model, configured, useTools, onToolsChange, quote, onClearQuote, historyMessages = [], historyKey, knowledgeControl, dictationProps }) {
+  const dictation=useDictation({...dictationProps,value,onChange,onSend});
   const input = useRef(null);
   const composing = useRef(false);
   const recall = useRef(null);
@@ -134,9 +136,10 @@ function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport
   }, []);
   return <div className={`composer-shell ${welcome ? 'composer-welcome' : ''}`} data-testid="composer" onDragOver={event => { event.preventDefault(); event.stopPropagation(); }} onDrop={event => { event.preventDefault(); event.stopPropagation(); onDrop?.(Array.from(event.dataTransfer.files)); }}>
     {knowledgeControl}
+    {dictation.banner}
     {quote && <div className="composer-quote" data-testid="composer-quote"><Reply size={15} /><div><strong>回复 {quote.role === 'user' ? '你' : 'Muse'}</strong><span>{excerpt(quote.content || '附件消息', 180)}</span></div><IconButton icon={X} label="取消引用" onClick={onClearQuote} /></div>}
     {attachedFiles.length > 0 && <div className="attachment-tray">{attachedFiles.map(file => <div className="attachment-pill" key={file.id} title={file.name}><FileText size={15} /><span>{file.name}</span><IconButton icon={X} label={`移除附件 ${file.name}`} onClick={() => onRemoveAttachment(file.id)} /></div>)}</div>}
-    <textarea ref={input} value={value} onChange={event => { recall.current = null; onChange(event.target.value); }} data-testid="composer-input" rows={welcome ? 2 : 1}
+    <textarea ref={input} value={value} disabled={dictation.finishing} onChange={event => { recall.current = null; onChange(event.target.value); }} data-testid="composer-input" rows={welcome ? 2 : 1}
       aria-label="发送消息" placeholder={placeholder || (configured ? '写下你的想法，或拖入一份文件…' : '先连接你的模型，再聊聊想做什么…')}
       onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }}
       onKeyDown={event => {
@@ -157,13 +160,13 @@ function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport
             }
           }
         }
-        if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (value.trim() || attachedFiles.length) onSend(); }
+        if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (value.trim() || attachedFiles.length || dictation.active) dictation.send(); }
       }} />
-    <div className="composer-toolbar"><div className="composer-tools"><IconButton icon={Paperclip} label="添加文件" data-testid="file-import" onClick={onImport} disabled={importing} />{importing && <Spinner size={15} />}
-      <button className={`agent-mode-toggle ${useTools ? 'enabled' : ''}`} aria-pressed={!!useTools} title="让模型使用当前工作区的文件、应用和计划工具；更改前会请求确认" data-testid="agent-mode-toggle" disabled={admitting} onClick={() => onToolsChange(!useTools)}><ShieldCheck size={13} />工作区助手</button>
+    <div className="composer-toolbar"><div className="composer-tools">{dictation.toolbar}<IconButton icon={Paperclip} label="添加文件" data-testid="file-import" onClick={onImport} disabled={importing||dictation.finishing} />{importing && <Spinner size={15} />}
+      <button className={`agent-mode-toggle ${useTools ? 'enabled' : ''}`} aria-pressed={!!useTools} title="让模型使用当前工作区的文件、应用和计划工具；更改前会请求确认" data-testid="agent-mode-toggle" disabled={admitting||dictation.finishing} onClick={() => onToolsChange(!useTools)}><ShieldCheck size={13} />工作区助手</button>
       <span className="composer-model"><span className={`connection-dot ${configured ? 'connected' : ''}`} />{configured ? model || '选择模型' : '尚未连接模型'}</span></div>
       <div className="composer-submit"><span className="composer-keyhint">Shift + Enter 换行</span>{busy && <button type="button" className="send-button stop-button" onClick={onStop} title="停止生成及等待发送" aria-label="停止生成" data-testid="stop-generation"><Square size={13} fill="currentColor" /></button>}
-        {(!busy || value.trim() || attachedFiles.length > 0) && <button type="button" className="send-button" onClick={onSend} disabled={!value.trim() && !attachedFiles.length || importing || admitting} title={busy ? '加入待发送' : '发送消息'} aria-label={busy ? '加入待发送' : '发送消息'} data-testid="send-message"><ArrowUp size={19} strokeWidth={2} /></button>}</div>
+        {(!busy || value.trim() || attachedFiles.length > 0 || dictation.active) && <button type="button" className="send-button" onClick={dictation.send} disabled={!value.trim() && !attachedFiles.length && !dictation.active || importing || admitting || dictation.finishing} title={busy ? '加入待发送' : '发送消息'} aria-label={busy ? '加入待发送' : '发送消息'} data-testid="send-message"><ArrowUp size={19} strokeWidth={2} /></button>}</div>
     </div>
   </div>;
 }
@@ -209,26 +212,27 @@ function EntityDialog({ entity, onClose, onSave }) {
 
 function SettingsDialog({ settings, app, onClose, onSaved, onImport, notify, onThemePreview }) {
   const [tab, setTab] = useState('connection');
-  const [draft, setDraft] = useState({ ...settings, apiKey: '', clearApiKey: false });
+  const [draft, setDraft] = useState({ ...settings, apiKey: '', clearApiKey: false, speechApiKey:'', clearSpeechApiKey:false });
   const [models, setModels] = useState([]);
   const [busy, setBusy] = useState('');
   const [result, setResult] = useState(null);
   const [showKey, setShowKey] = useState(false);
   const set = (name, value) => setDraft(previous => ({ ...previous, [name]: value }));
   const save = async () => {
-    const input = { baseUrl: (draft.baseUrl || '').trim(), model: (draft.model || '').trim(), systemPrompt: draft.systemPrompt || '', temperature: Number(draft.temperature ?? .7), theme: draft.theme || 'system', transcriptionModel: draft.transcriptionModel || '' };
+    const input = { baseUrl: (draft.baseUrl || '').trim(), model: (draft.model || '').trim(), systemPrompt: draft.systemPrompt || '', temperature: Number(draft.temperature ?? .7), theme: draft.theme || 'system', speechBaseUrl:draft.speechBaseUrl||'', transcriptionModel: draft.transcriptionModel || '', dictationAutoSend:draft.dictationAutoSend===true };
     if (draft.apiKey.trim()) input.apiKey = draft.apiKey.trim();
     else if (draft.clearApiKey) input.clearApiKey = true;
+    if(draft.speechApiKey.trim())input.speechApiKey=draft.speechApiKey.trim();else if(draft.clearSpeechApiKey)input.clearSpeechApiKey=true;
     const saved = await api.saveSettings(input);
     onSaved(saved);
-    setDraft(previous => ({ ...previous, ...saved, apiKey: '', clearApiKey: false }));
+    setDraft(previous => ({ ...previous, ...saved, apiKey: '', clearApiKey: false, speechApiKey:'', clearSpeechApiKey:false }));
     return saved;
   };
   const perform = async (kind, task) => { if (busy) return; setBusy(kind); setResult(null); try { await task(); } catch (error) { setResult({ ok: false, message: error.message }); } finally { setBusy(''); } };
   const close = () => { if (!busy) { onThemePreview(null); onClose(); } };
   return <Modal title="设置" subtitle="让 Muse 按你的方式工作。" onClose={close} className="settings-modal" testId="settings-dialog">
     <div className="settings-layout"><nav className="settings-nav" aria-label="设置分类">{[
-      ['connection', Server, '模型连接'], ['preferences', SlidersHorizontal, '使用偏好'], ['data', Database, '数据管理'],
+      ['connection', Server, '模型连接'], ['speech', MessageCircle, '语音输入'], ['preferences', SlidersHorizontal, '使用偏好'], ['data', Database, '数据管理'],
     ].map(([id, Icon, label]) => <button type="button" key={id} className={tab === id ? 'active' : ''} onClick={() => { setTab(id); setResult(null); }}><Icon size={17} />{label}</button>)}<span className="settings-version">Muse Windows<br />版本 {app.version || '0.1.0'}</span></nav>
       <div className="settings-pane">{tab === 'connection' && <>
         <div className="section-heading"><span className="section-icon"><Server size={20} /></span><div><h3>连接你的模型</h3><p>支持 OpenAI 兼容的模型 API。</p></div></div>
@@ -238,6 +242,15 @@ function SettingsDialog({ settings, app, onClose, onSaved, onImport, notify, onT
         <label className="field"><span>模型名称</span><div className="model-input-row"><input data-testid="settings-model" value={draft.model || ''} list="provider-models" onChange={event => set('model', event.target.value)} placeholder="服务商提供的模型名" spellCheck={false} /><button className="button secondary" disabled={!!busy} data-testid="settings-models" onClick={() => perform('models', async () => { await save(); const list = await api.listModels(); setModels(list); setResult({ ok: true, message: list.length ? `已读取 ${list.length} 个可用模型，可在下方选择。` : '服务已连接，但没有返回模型列表。请手动填写模型名。' }); })}>{busy === 'models' ? <Spinner size={15} /> : <RefreshCw size={15} />}读取模型</button></div><datalist id="provider-models">{models.map(model => <option value={model} key={model} />)}</datalist></label>
         {models.length > 0 && <div className="available-models">{models.slice(0, 30).map(model => <button key={model} className={`model-option ${draft.model === model ? 'selected' : ''}`} onClick={() => set('model', model)} title={model}>{draft.model === model && <Check size={12} />}{model}</button>)}{models.length > 30 && <span className="muted tiny">更多模型可在输入框中搜索选择</span>}</div>}
         <div className="connection-test-row"><button className="button secondary" disabled={!!busy} data-testid="settings-test" onClick={() => perform('test', async () => { await save(); const response = await api.testConnection(); if (response.models) setModels(response.models); setResult(response); })}>{busy === 'test' ? <Spinner size={15} /> : <ShieldCheck size={15} />}保存并测试连接</button><span>将向当前服务发送真实测试请求</span></div>
+      </>}
+      {tab === 'speech' && <>
+        <div className="section-heading"><span className="section-icon"><MessageCircle size={20}/></span><div><h3>把想法说出来</h3><p>录音结束后，由你选择的语音服务识别为文字。</p></div></div>
+        <label className="field"><span>语音识别服务地址</span><input data-testid="settings-speech-url" value={draft.speechBaseUrl||''} onChange={event=>set('speechBaseUrl',event.target.value)} placeholder="https://speech-provider.example/v1" spellCheck={false}/><small>服务需支持音频文件转写。聊天模型连接不会自动用于听写。</small></label>
+        <label className="field"><span>语音识别模型</span><input data-testid="settings-speech-model" value={draft.transcriptionModel||''} onChange={event=>set('transcriptionModel',event.target.value)} placeholder="服务商提供的语音识别模型名" spellCheck={false}/></label>
+        <label className="field"><span>语音服务密钥 <span className="key-status">{draft.clearSpeechApiKey?'将清除':draft.hasSpeechApiKey?'已安全保存':'尚未设置'}</span></span><input data-testid="settings-speech-key" type="password" value={draft.speechApiKey} onChange={event=>{set('speechApiKey',event.target.value);set('clearSpeechApiKey',false);}} placeholder="留空保留已保存的语音密钥；免密本地服务可留空" autoComplete="off" spellCheck={false}/><small>单独加密保存，不会自动使用聊天密钥。</small></label>
+        {(draft.hasSpeechApiKey||draft.clearSpeechApiKey)&&<button className="text-button danger-text" onClick={()=>{set('clearSpeechApiKey',!draft.clearSpeechApiKey);set('speechApiKey','');}}>{draft.clearSpeechApiKey?'撤销清除语音密钥':'清除语音密钥'}</button>}
+        <label className="speech-auto-send"><input type="checkbox" data-testid="settings-dictation-auto-send" checked={draft.dictationAutoSend===true} onChange={event=>set('dictationAutoSend',event.target.checked)}/>停止录音后自动发送识别文字</label>
+        <p className="field-hint">默认先放回草稿审阅，也可在录音时点“识别后发送”。每段最多两分钟；识别请求只发送这段录音，音频不保存到聊天或备份。转写后发送聊天会使用当前资料和模型设置。</p>
       </>}
       {tab === 'preferences' && <>
         <div className="section-heading"><span className="section-icon"><SlidersHorizontal size={20} /></span><div><h3>为你的想法，留一点空间</h3><p>调整助手的回应方式和工作台外观。</p></div></div>
@@ -416,14 +429,15 @@ function App() {
       }
     } catch (error) { notify(error.message, 'error'); } finally { setImporting(false); }
   };
-  const send = async () => {
-    if (sendLock.current || !draft.trim() && !attachedIds.length) return;
+  const send = async (inputText) => {
+    const submittedText=typeof inputText==='string'?inputText:draft;
+    if (sendLock.current || !submittedText.trim() && !attachedIds.length) return;
     if (!configured) { setSettingsOpen(true); notify('连接你的模型后，就可以开始对话了', 'info'); return; }
     sendLock.current = true; setSending(true);
-    const key = composerKey, text = draft, files = [...attachedIds], quotedId = quote?.id, clientMessageId = crypto.randomUUID();
+    const key = composerKey, text = submittedText, files = [...attachedIds], quotedId = quote?.id, clientMessageId = crypto.randomUUID();
     // Remove only this submitted draft now. New typing during admission stays
     // separate and cannot be erased by a later IPC response.
-    setDrafts(previous => ({ ...previous, [key]: previous[key] === text ? '' : previous[key] }));
+    setDrafts(previous => ({ ...previous, [key]: previous[key] === text || previous[key] === draft ? '' : previous[key] }));
     setAttachments(previous => ({ ...previous, [key]: (previous[key] || []).filter(id => !files.includes(id)) }));
     setQuotes(previous => previous[key] === quotedId ? { ...previous, [key]: null } : previous);
     let target = chat;
@@ -490,6 +504,7 @@ function App() {
   const exportChat = async format => { setMenu(null); try { const result = await api.exportChat({ chatId: chat.id, format }); if (!result.cancelled) notify('对话已导出'); } catch (error) { notify(error.message, 'error'); } };
   const composerProps = { value: draft, onChange: updateDraft, attachedFiles, onRemoveAttachment: id => setAttachments(previous => ({ ...previous, [composerKey]: attachedIds.filter(item => item !== id) })), onImport: () => addFiles(), onDrop: files => { dragCount.current = 0; setDragging(false); if (files.length) addFiles(files); }, onSend: send, onStop: stop, busy, admitting: sending, importing, model: data.settings.model, configured, useTools, onToolsChange: enabled => { modeRevisions.current.set(composerKey, (modeRevisions.current.get(composerKey) || 0) + 1); setAgentModes(previous => ({ ...previous, [composerKey]: enabled })); }, quote, onClearQuote: () => setQuotes(previous => ({ ...previous, [composerKey]: null })), historyMessages: chat?.messages, historyKey: composerKey };
   composerProps.knowledgeControl=<div className="knowledge-chatbar"><button className="text-button" data-testid="knowledge-open" onClick={()=>setKnowledgeOpen({workspaceId,workspaceName:workspace?.name})}><Database size={13}/>知识与技能</button><select aria-label="聊天知识配置" data-testid="chat-profile" value={selectedProfileId} disabled={busy||sending} onChange={async event=>{const profileId=event.target.value||null;try{if(chat)await api.updateChat({id:chat.id,profileId});else setDraftProfiles(previous=>({...previous,[workspaceId||'global']:profileId}));}catch(error){notify(error.message,'error');}}}><option value="">不附加知识配置</option>{data.agentProfiles.filter(item=>item.workspaceId===workspaceId).map(item=><option key={item.id} value={item.id} disabled={item.needsReview}>{item.name}{item.needsReview?'（待确认）':''}</option>)}</select>{chat&&selectedProfileId&&<button className="text-button" data-testid="context-preview" onClick={async()=>{try{setContextPreview(await api.previewSelectedContext({chatId:chat.id,useTools}));}catch(error){notify(error.message,'error');}}}>查看将发送的知识</button>}</div>;
+  composerProps.dictationProps={owner:{scopeKey:composerKey,workspaceId,chatId:chat?.id||null,profileId:selectedProfileId||null,useTools},contextKey:JSON.stringify([composerKey,workspaceId,selectedProfileId,data.agentProfiles.find(item=>item.id===selectedProfileId)?.revision,useTools,attachedIds,quote?.id,data.settings]),settings:data.settings,onConfigure:()=>setSettingsOpen(true),notify};
 
   if (!snapshot) return <div className="boot-screen"><Brand size={56} /><h1>Muse</h1>{bootError ? <><p className="boot-error">{bootError}</p><button className="button secondary" onClick={() => window.location.reload()}><RefreshCw size={15} />重新打开</button></> : <p><Spinner size={16} />正在打开你的工作台…</p>}</div>;
 

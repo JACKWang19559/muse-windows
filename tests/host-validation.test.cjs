@@ -17,7 +17,7 @@ const appRoot = path.resolve(__dirname, '..');
 const mainFile = path.join(appRoot, 'main.cjs');
 const mainRequire = createRequire(mainFile);
 const rendererURL = pathToFileURL(path.join(appRoot, 'build', 'index.html')).href;
-const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact previewSchedule createSchedule updateSchedule pauseSchedule deleteSchedule runScheduleNow stopSchedule saveBackgroundSettings getMemoryDocument saveMemoryDocument deleteMemoryDocument createMemory getMemory updateMemory deleteMemory rebuildMemoryIndex searchMemories getSkill importSkillPackage replaceSkillPackage updateSkill deleteSkill setSkillConsent getAgentProfile createAgentProfile updateAgentProfile captureProfileKnowledge refreshProfileKnowledge removeProfileKnowledge reviewAgentProfile deleteAgentProfile previewSelectedContext'.split(' ');
+const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact previewSchedule createSchedule updateSchedule pauseSchedule deleteSchedule runScheduleNow stopSchedule saveBackgroundSettings getMemoryDocument saveMemoryDocument deleteMemoryDocument createMemory getMemory updateMemory deleteMemory rebuildMemoryIndex searchMemories getSkill importSkillPackage replaceSkillPackage updateSkill deleteSkill setSkillConsent getAgentProfile createAgentProfile updateAgentProfile captureProfileKnowledge refreshProfileKnowledge removeProfileKnowledge reviewAgentProfile deleteAgentProfile previewSelectedContext startDictation dictationCaptureReady finishDictation cancelDictation getDictationState'.split(' ');
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
@@ -43,15 +43,16 @@ function fixture(t, overrides = {}) {
     decrypt: bytes => Buffer.from(bytes).toString().slice('test-encrypted:'.length)
   });
   store.saveSettings({ baseUrl: 'https://provider-a.example/v1', model: 'model-a', apiKey: 'review-key-original-12345', systemPrompt: 'PROMPT_AT_SEND' });
-  const scheduled = [], events = [], errors = [], external = [], handlers = new Map(), appEvents=new Map(), windowEvents=new Map(),webEvents=new Map();
+  const scheduled = [], events = [], errors = [], external = [], speechRequests = [], permissions = {}, handlers = new Map(), appEvents=new Map(), windowEvents=new Map(),webEvents=new Map();
   const provider = {
     configuredUrl: mainRequire('./backend/provider.cjs').configuredUrl,
     streamCompletion: async options => { options.onDelta('answer'); return { content: 'answer' }; },
     listModels: async () => ['model-a'], testConnection: async () => ({ ok: true, message: 'local stub' }),
     ...overrides
   };
-  const webContents = { mainFrame: { url: rendererURL }, send: (_channel, event) => events.push(structuredClone(event)),on:(name,fn)=>webEvents.set(name,fn),setWindowOpenHandler(){},session:{on(){},setPermissionCheckHandler(){},setPermissionRequestHandler(){}} };
-  const window = { webContents, isDestroyed: () => false, minimize() {}, maximize() {}, unmaximize() {}, isMaximized: () => false, close() {},on:(name,fn)=>windowEvents.set(name,fn),loadFile(){},show(){},focus(){},hide(){},isMinimized:()=>false };
+  const asrProvider = { ...mainRequire('./backend/asr-provider.cjs'), transcribeAudio: async input => { speechRequests.push(input); return overrides.transcribeAudio ? overrides.transcribeAudio(input) : { text: 'HOST_SYNTHETIC_TRANSCRIPT' }; } };
+  const webContents = { mainFrame: { url: rendererURL }, send: (_channel, event) => events.push(structuredClone(event)),on:(name,fn)=>webEvents.set(name,fn),setWindowOpenHandler(){},session:{on(){},setPermissionCheckHandler:fn=>{permissions.check=fn;},setPermissionRequestHandler:fn=>{permissions.request=fn;}} };
+  const window = { webContents, isDestroyed: () => false, isVisible: () => true, minimize() {}, maximize() {}, unmaximize() {}, isMaximized: () => false, close() {},on:(name,fn)=>windowEvents.set(name,fn),loadFile(){},show(){},focus(){},hide(){},isMinimized:()=>false };
   const app = { setName() {}, getVersion: () => 'test', getPath: () => dir, on:(name,fn)=>appEvents.set(name,fn), requestSingleInstanceLock: () => true, quit() {}, whenReady: () => ({ then: () => ({ catch() {} }) }) };
   const electron = {
     app, BrowserWindow: function () {return window;}, ipcMain: { handle: (channel, callback) => handlers.set(channel, callback) },
@@ -60,7 +61,22 @@ function fixture(t, overrides = {}) {
     clipboard: { writeText() {} }, nativeTheme: {}, Menu: { setApplicationMenu() {},buildFromTemplate:entries=>entries }, protocol: {registerSchemesAsPrivileged(){},handle(){}},Tray:class{setToolTip(){}setContextMenu(){}on(){}isDestroyed(){return false;}destroy(){}}
   };
   const sandbox = {
-    require: name => name === 'electron' ? electron : name === './backend/provider.cjs' ? provider : name === './backend/agent-loop.cjs' ? {
+    require: name => name === 'electron' ? electron : name === './backend/provider.cjs' ? provider : name === './backend/asr-provider.cjs' ? asrProvider : name === './backend/dictation-session.cjs' ? {
+      ...mainRequire(name), createDictationSessionManager: options => {
+        // IPC envelopes and main-created provider bindings share the module's
+        // realm in production. Recreate that boundary without weakening its
+        // plain-object validators; preserve the real ArrayBuffer audio payload.
+        const manager = mainRequire(name).createDictationSessionManager({ ...options, getProviderBinding: () => JSON.parse(JSON.stringify(options.getProviderBinding())) });
+        return new Proxy(manager, { get(target, key) {
+          const value = Reflect.get(target, key, target);
+          return typeof value === 'function' ? (...args) => value.apply(target, args.map(arg => {
+            if (!arg || typeof arg !== 'object') return arg;
+            if (key === 'finish') return { id: arg.id, audio: arg.audio };
+            return JSON.parse(JSON.stringify(arg));
+          })) : value;
+        } });
+      }
+    } : name === './backend/agent-loop.cjs' ? {
       // This VM is a separate JS realm. Recreate the host-owned wire payload
       // in the module's realm, as the actual Electron main process constructs it.
       runAgentConversation: options => mainRequire(name).runAgentConversation({ ...options, messages: JSON.parse(JSON.stringify(options.messages)) })
@@ -74,13 +90,14 @@ function fixture(t, overrides = {}) {
     Buffer, URL, AbortController, AbortSignal, setTimeout, clearTimeout,
     setImmediate: callback => { scheduled.push(callback); }
   };
-  const expose = '\n;globalThis.hostUnderTest={operations,active,assertSender,contextMessages,cleanError,createWindow,setState:(s,w)=>{store=s;window=w;}};';
+  const expose = '\n;globalThis.hostUnderTest={operations,active,assertSender,contextMessages,cleanError,createWindow,disposeDictation:()=>dictation?.dispose(),setState:(s,w)=>{store=s;window=w;previewRuntime={closeAll(){},document(){throw new Error("not a preview");}};}};';
   vm.runInNewContext(fs.readFileSync(mainFile, 'utf8') + expose, sandbox, { filename: mainFile });
   // Production main and Store share a realm; the VM fixture serializes its
   // host-owned data at this test boundary without relaxing JSON validators.
   const mainStore = new Proxy(store, { get(target, key) { const value = Reflect.get(target, key); return typeof value === 'function' ? (...args) => value.apply(target, args.map(arg => arg && typeof arg === 'object' ? JSON.parse(JSON.stringify(arg)) : arg)) : value; } });
   sandbox.hostUnderTest.setState(mainStore, window);
-  return { ...sandbox.hostUnderTest, store, dir, window, webContents, provider, scheduled, events, errors, external, appEvents,windowEvents,webEvents };
+  t.after(() => sandbox.hostUnderTest.disposeDictation());
+  return { ...sandbox.hostUnderTest, store, dir, window, webContents, provider, speechRequests, permissions, scheduled, events, errors, external, appEvents,windowEvents,webEvents };
 }
 
 async function waitFor(predicate, label) {
@@ -98,6 +115,245 @@ async function runQueued(host) {
 }
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
 const toolCall = (id, name, args) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } });
+
+function speechAudio() {
+  const data = Buffer.alloc(3244);
+  data.write('RIFF', 0); data.writeUInt32LE(data.length - 8, 4); data.write('WAVE', 8); data.write('fmt ', 12); data.writeUInt32LE(16, 16);
+  data.writeUInt16LE(1, 20); data.writeUInt16LE(1, 22); data.writeUInt32LE(16000, 24); data.writeUInt32LE(32000, 28);
+  data.writeUInt16LE(2, 32); data.writeUInt16LE(16, 34); data.write('data', 36); data.writeUInt32LE(3200, 40);
+  return Uint8Array.from(data).buffer;
+}
+function speechSetup(host, chat = host.store.createChat()) {
+  host.store.saveSettings({ speechBaseUrl: 'https://speech.example/v1', transcriptionModel: 'speech-model', speechApiKey: 'synthetic-speech-key-independent-12345' });
+  return { scopeKey: `chat:${chat.id}`, workspaceId: chat.workspaceId, chatId: chat.id };
+}
+
+test('host dictation uses the independent speech endpoint/key and returns one final transcript without sending chat or persisting audio', async t => {
+  let chatRequests = 0;
+  const host = fixture(t, { streamCompletion: async () => { chatRequests++; return { content: 'unexpected' }; } });
+  const owner = speechSetup(host), session = host.operations.startDictation(owner);
+  assert.equal(session.state, 'preparing'); assert.deepEqual(session.owner, owner);
+  assert.equal(host.operations.dictationCaptureReady({ id: session.id }).state, 'recording');
+  const result = await host.operations.finishDictation({ id: session.id, audio: speechAudio() });
+  assert.equal(result.state, 'complete'); assert.equal(result.text, 'HOST_SYNTHETIC_TRANSCRIPT'); assert.equal(chatRequests, 0);
+  assert.equal(host.speechRequests.length, 1); assert.equal(host.speechRequests[0].settings.speechBaseUrl, 'https://speech.example/v1');
+  assert.equal(host.speechRequests[0].apiKey, 'synthetic-speech-key-independent-12345');
+  assert.notEqual(host.speechRequests[0].apiKey, host.store.secret());
+  assert.equal(host.operations.getDictationState().text, undefined);
+  assert.equal(JSON.stringify(host.events).includes('HOST_SYNTHETIC_TRANSCRIPT'), false);
+  assert.equal(JSON.stringify(host.store.exportData()).includes('HOST_SYNTHETIC_TRANSCRIPT'), false);
+  assert.equal(host.store.getChat(owner.chatId).messages.length, 0);
+  const duplicate = await host.operations.finishDictation({ id: session.id, audio: speechAudio() });
+  assert.equal(duplicate.state, 'complete'); assert.equal(duplicate.text, undefined); assert.equal(host.speechRequests.length, 1);
+});
+
+test('host dictation rejects absent speech configuration and mismatched or deleted owners before capture', t => {
+  const host = fixture(t), chat = host.store.createChat();
+  assert.throws(() => host.operations.startDictation({ scopeKey: 'valid', workspaceId: null, chatId: chat.id }), /配置/);
+  const owner = speechSetup(host, chat), workspace = host.store.createWorkspace({ name: 'foreign speech scope' });
+  assert.throws(() => host.operations.startDictation({ ...owner, workspaceId: workspace.id }), /范围|所属|变化/);
+  assert.throws(() => host.operations.startDictation({ ...owner, chatId: 'chat_missing' }), /范围|所属|变化/);
+  assert.throws(() => host.operations.startDictation({ ...owner, workspaceId: 'ws_missing' }), /范围|所属|变化/);
+  assert.throws(() => host.operations.startDictation({ ...owner, extra: true }), /范围/);
+  assert.equal(host.speechRequests.length, 0);
+});
+
+test('renderer speech owner accepts profile/tool selection while the manager receives only its three scope fields', async t => {
+  const host = fixture(t), owner = speechSetup(host);
+  const session = host.operations.startDictation({ ...owner, profileId: null, useTools: false });
+  assert.deepEqual(session.owner, owner);
+  assert.equal(host.operations.dictationCaptureReady({ id: session.id }).state, 'recording');
+  assert.equal((await host.operations.finishDictation({ id: session.id, audio: speechAudio() })).state, 'complete');
+  assert.throws(() => host.operations.startDictation({ ...owner, profileId: null, useTools: 'true' }), /工具范围/);
+});
+
+test('ordinary settings saves work with empty speech configuration and retain independently configured speech settings and key', t => {
+  const host = fixture(t);
+  assert.doesNotThrow(() => host.operations.saveSettings({ theme: 'dark' }));
+  assert.equal(host.operations.bootstrap().settings.speechBaseUrl, '');
+  assert.equal(host.operations.bootstrap().settings.hasSpeechApiKey, false);
+  speechSetup(host);
+  assert.doesNotThrow(() => host.operations.saveSettings({ temperature: 0.4 }));
+  const result = host.operations.saveSettings({ speechApiKey: '', dictationAutoSend: false });
+  assert.equal(result.speechBaseUrl, 'https://speech.example/v1'); assert.equal(result.transcriptionModel, 'speech-model');
+  assert.equal(result.hasSpeechApiKey, true); assert.equal(host.store.speechSecret(), 'synthetic-speech-key-independent-12345');
+});
+
+test('host never borrows a saved chat key for a keyless speech service', async t => {
+  const host = fixture(t), owner = speechSetup(host);
+  host.operations.saveSettings({ speechBaseUrl: 'http://127.0.0.1:9900/v1', clearSpeechApiKey: true });
+  assert.ok(host.store.secret()); assert.equal(host.store.speechSecret(), '');
+  const session = host.operations.startDictation(owner);
+  host.operations.dictationCaptureReady({ id: session.id });
+  assert.equal((await host.operations.finishDictation({ id: session.id, audio: speechAudio() })).state, 'complete');
+  assert.equal(host.speechRequests[0].apiKey, ''); assert.equal(host.speechRequests[0].settings.speechBaseUrl, 'http://127.0.0.1:9900/v1');
+});
+
+test('a selected live memory document change or skill consent withdrawal aborts ASR and invalidates late text', async t => {
+  for (const kind of ['memory_update', 'memory_delete', 'skill_revoke']) {
+    const entered = deferred(), done = deferred(), host = fixture(t, { transcribeAudio: async () => { entered.resolve(); return done.promise; } });
+    const workspace = host.store.createWorkspace({ name: `speech-lease-${kind}` });
+    const document = host.store.saveMemoryDocument({ workspaceId: workspace.id, expectedRevision: 0, contentMarkdown: 'SPEECH-LIVE-KNOWLEDGE' });
+    const skill = host.operations.importSkillPackage({ workspaceId: workspace.id, markdown: '---\nname: speech-guide\ndescription: speech context\nversion: "1"\ntoolRequirements: []\n---\nSPEECH-SKILL-CONTEXT' });
+    const approved = host.operations.setSkillConsent({ id: skill.id, workspaceId: workspace.id, expectedRevision: skill.revision, approved: true });
+    let profile = host.store.createAgentProfile({ workspaceId: workspace.id, name: 'speech selected context', memoryDocumentIds: [document.id], toolPolicy: 'read', skillRefs: [{ skillId: skill.id, digest: approved.digest, consentId: approved.consents.at(-1).id }] });
+    profile = host.store.reviewAgentProfile({ id: profile.id, expectedRevision: profile.revision });
+    const chat = host.store.createChat({ workspaceId: workspace.id, profileId: profile.id }), owner = speechSetup(host, chat);
+    const session = host.operations.startDictation({ ...owner, profileId: profile.id, useTools: false });
+    host.operations.dictationCaptureReady({ id: session.id });
+    const pending = host.operations.finishDictation({ id: session.id, audio: speechAudio() }); await entered.promise;
+    if (kind === 'memory_update') host.operations.saveMemoryDocument({ workspaceId: workspace.id, expectedRevision: document.revision, contentMarkdown: 'CHANGED-REVOKES-SPEECH-LEASE' });
+    else if (kind === 'memory_delete') host.operations.deleteMemoryDocument({ id: document.id, expectedRevision: document.revision });
+    else host.operations.setSkillConsent({ id: skill.id, workspaceId: workspace.id, expectedRevision: approved.revision, approved: false });
+    assert.equal(host.operations.getDictationState().state, 'cancelled', kind);
+    assert.equal(host.speechRequests[0].signal.aborted, true, kind);
+    const result = await pending; assert.equal(result.state, 'cancelled', kind); assert.equal(result.text, undefined, kind);
+    done.resolve({ text: `LATE_REVOKED_${kind}` }); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(JSON.stringify(host.events).includes(`LATE_REVOKED_${kind}`), false, kind);
+    assert.equal(host.store.getChat(chat.id).messages.length, 0, kind);
+  }
+});
+
+test('host cancellation settles an uncooperative ASR request and ignores its late final result', async t => {
+  const entered = deferred(), done = deferred();
+  const host = fixture(t, { transcribeAudio: async () => { entered.resolve(); return done.promise; } });
+  const owner = speechSetup(host), session = host.operations.startDictation(owner);
+  host.operations.dictationCaptureReady({ id: session.id });
+  const pending = host.operations.finishDictation({ id: session.id, audio: speechAudio() });
+  await entered.promise;
+  assert.equal(host.operations.cancelDictation({ id: session.id }).state, 'cancelled');
+  assert.equal(host.speechRequests[0].signal.aborted, true);
+  assert.equal((await pending).text, undefined);
+  done.resolve({ text: 'LATE_CANCELLED_TRANSCRIPT_MUST_NOT_ESCAPE' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(host.operations.getDictationState().state, 'cancelled');
+  assert.equal(JSON.stringify(host.events).includes('LATE_CANCELLED_TRANSCRIPT_MUST_NOT_ESCAPE'), false);
+  assert.equal(host.store.getChat(owner.chatId).messages.length, 0);
+});
+
+test('moving/deleting the owner or changing its profile cancels pending transcription and suppresses late results', async t => {
+  for (const kind of ['move_chat', 'delete_chat', 'delete_workspace', 'change_profile']) {
+    const entered = deferred(), done = deferred(), host = fixture(t, { transcribeAudio: async () => { entered.resolve(); return done.promise; } });
+    const workspace = host.store.createWorkspace({ name: kind }), chat = host.store.createChat({ workspaceId: workspace.id });
+    const owner = speechSetup(host, chat), session = host.operations.startDictation(owner);
+    host.operations.dictationCaptureReady({ id: session.id });
+    const pending = host.operations.finishDictation({ id: session.id, audio: speechAudio() });
+    await entered.promise;
+    if (kind === 'move_chat') host.operations.updateChat({ id: chat.id, workspaceId: null });
+    else if (kind === 'delete_chat') host.operations.deleteChat({ id: chat.id });
+    else if (kind === 'delete_workspace') host.operations.deleteWorkspace({ id: workspace.id });
+    else {
+      let profile = host.store.createAgentProfile({ workspaceId: workspace.id, name: 'replacement' });
+      profile = host.store.reviewAgentProfile({ id: profile.id, expectedRevision: profile.revision });
+      host.operations.updateChat({ id: chat.id, profileId: profile.id });
+    }
+    assert.equal(host.operations.getDictationState().state, 'cancelled', kind);
+    assert.equal(host.speechRequests[0].signal.aborted, true, kind);
+    assert.equal((await pending).text, undefined, kind);
+    done.resolve({ text: `LATE_${kind}_TRANSCRIPT` }); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(JSON.stringify(host.events).includes(`LATE_${kind}_TRANSCRIPT`), false, kind);
+  }
+});
+
+test('speech endpoint/model/key changes cancel finishing before a late transcript can use the new configuration', async t => {
+  for (const change of [{ speechBaseUrl: 'https://new-speech.example/v1' }, { transcriptionModel: 'new-asr-model' }, { speechApiKey: 'synthetic-new-speech-key' }, { clearSpeechApiKey: true }]) {
+    const entered = deferred(), done = deferred(), host = fixture(t, { transcribeAudio: async () => { entered.resolve(); return done.promise; } });
+    const owner = speechSetup(host), session = host.operations.startDictation(owner);
+    host.operations.dictationCaptureReady({ id: session.id });
+    const pending = host.operations.finishDictation({ id: session.id, audio: speechAudio() }); await entered.promise;
+    host.operations.saveSettings(change);
+    const result = await pending;
+    assert.equal(result.state, 'cancelled'); assert.equal(result.text, undefined); assert.equal(host.speechRequests.length, 1);
+    assert.equal(host.speechRequests[0].signal.aborted, true);
+    done.resolve({ text: 'LATE_OLD_SPEECH_CONFIGURATION' }); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(JSON.stringify(host.events).includes('LATE_OLD_SPEECH_CONFIGURATION'), false);
+  }
+});
+
+test('an unrelated snapshot refresh preserves finishing while microphone permission remains revoked', async t => {
+  const entered = deferred(), done = deferred(), host = fixture(t, { transcribeAudio: async () => { entered.resolve(); return done.promise; } });
+  host.createWindow();
+  const owner = speechSetup(host), session = host.operations.startDictation(owner);
+  host.operations.dictationCaptureReady({ id: session.id });
+  const pending = host.operations.finishDictation({ id: session.id, audio: speechAudio() }); await entered.promise;
+  host.operations.createWorkspace({ name: 'unrelated refresh during ASR' });
+  const state = host.operations.getDictationState();
+  assert.equal(state.state, 'finishing'); assert.equal(host.speechRequests[0].signal.aborted, false);
+  assert.equal(host.permissions.check(host.webContents, 'media', 'file://', { isMainFrame: true, requestingUrl: rendererURL, mediaType: 'audio' }), false);
+  done.resolve({ text: 'VALID_AFTER_UNRELATED_REFRESH' });
+  assert.equal((await pending).text, 'VALID_AFTER_UNRELATED_REFRESH');
+});
+
+test('microphone permissions require an active capture, exact trusted main frame and audio only', t => {
+  const host = fixture(t); host.createWindow();
+  const check = details => host.permissions.check(host.webContents, 'media', 'file://', details);
+  const request = details => { let result; host.permissions.request(host.webContents, 'media', value => { result = value; }, details); return result; };
+  const details = { isMainFrame: true, requestingUrl: rendererURL, mediaType: 'audio' };
+  assert.equal(check(details), false);
+  const owner = speechSetup(host), session = host.operations.startDictation(owner);
+  assert.equal(check(details), true); assert.equal(request({ ...details, mediaTypes: ['audio'] }), true);
+  for (const changed of [{ isMainFrame: false }, { requestingUrl: 'https://remote.example/' }, { requestingUrl: `${rendererURL}?untrusted=1` }, { mediaType: 'video' }, { mediaType: undefined }]) assert.equal(check({ ...details, ...changed }), false);
+  for (const mediaTypes of [undefined, [], ['video'], ['audio', 'video'], ['audio', 'audio']]) assert.equal(request({ ...details, mediaTypes }), false);
+  assert.equal(host.permissions.check({ mainFrame: host.webContents.mainFrame }, 'media', 'file://', details), false);
+  assert.equal(host.permissions.check(host.webContents, 'camera', 'file://', details), false);
+  host.webContents.mainFrame.url = 'https://remote.example/'; assert.equal(check(details), false);
+  host.webContents.mainFrame.url = `${rendererURL}#chat/host`; assert.equal(check(details), true);
+  host.operations.cancelDictation({ id: session.id }); assert.equal(check(details), false);
+});
+
+test('hidden or minimized windows reject late start IPC and audio permissions before and after capture invalidation', t => {
+  for (const kind of ['hide', 'minimize']) {
+    const host = fixture(t); host.createWindow();
+    let visible = true, minimized = false;
+    host.window.isVisible = () => visible; host.window.isMinimized = () => minimized;
+    const owner = speechSetup(host), details = { isMainFrame: true, requestingUrl: rendererURL, mediaType: 'audio' };
+    const check = () => host.permissions.check(host.webContents, 'media', 'file://', details);
+    const request = () => { let allowed; host.permissions.request(host.webContents, 'media', value => { allowed = value; }, { ...details, mediaTypes: ['audio'] }); return allowed; };
+    const unavailable = () => { if (kind === 'hide') visible = false; else minimized = true; };
+    unavailable();
+    assert.throws(() => host.operations.startDictation(owner), /窗口|还原/, kind);
+    assert.equal(check(), false, kind); assert.equal(request(), false, kind); assert.equal(host.speechRequests.length, 0);
+    visible = true; minimized = false;
+    const session = host.operations.startDictation(owner); assert.equal(check(), true); assert.equal(request(), true);
+    unavailable(); host.windowEvents.get(kind)();
+    assert.equal(host.operations.getDictationState().state, 'cancelled', kind);
+    assert.throws(() => host.operations.startDictation(owner), /窗口|还原/, `late ${kind} start`);
+    assert.equal(check(), false, kind); assert.equal(request(), false, kind);
+    assert.equal(host.operations.dictationCaptureReady({ id: session.id }).state, 'cancelled', kind);
+  }
+});
+
+test('window hide, main-document navigation and renderer crash invalidate dictation and suppress late completion', async t => {
+  for (const trigger of ['hide', 'minimize', 'navigate', 'crash', 'closed']) {
+    const entered = deferred(), done = deferred(), host = fixture(t, { transcribeAudio: async () => { entered.resolve(); return done.promise; } });
+    host.createWindow();
+    const owner = speechSetup(host), session = host.operations.startDictation(owner);
+    host.operations.dictationCaptureReady({ id: session.id });
+    const pending = host.operations.finishDictation({ id: session.id, audio: speechAudio() }); await entered.promise;
+    if (trigger === 'navigate') {
+      host.webEvents.get('did-start-navigation')({ isMainFrame: false, isSameDocument: false });
+      host.webEvents.get('did-start-navigation')({ isMainFrame: true, isSameDocument: true });
+      assert.equal(host.operations.getDictationState().state, 'finishing');
+      host.webEvents.get('did-start-navigation')({ isMainFrame: true, isSameDocument: false });
+    } else if (trigger === 'crash') host.webEvents.get('render-process-gone')();
+    else host.windowEvents.get(trigger)();
+    assert.equal(host.speechRequests[0].signal.aborted, true, trigger);
+    const result = await pending; assert.equal(result.state, 'cancelled', trigger); assert.equal(result.text, undefined, trigger);
+    done.resolve({ text: `LATE_LIFECYCLE_${trigger}` }); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(JSON.stringify(host.events).includes(`LATE_LIFECYCLE_${trigger}`), false, trigger);
+  }
+});
+
+test('ASR failure cannot leak raw keys or provider error detail through host state, events or the stored chat', async t => {
+  const secret = 'SYNTHETIC_ASR_FAILURE_SECRET';
+  const host = fixture(t, { transcribeAudio: async () => { throw Error(`remote failure includes ${secret}`); } });
+  const owner = speechSetup(host), session = host.operations.startDictation(owner);
+  host.operations.dictationCaptureReady({ id: session.id });
+  const result = await host.operations.finishDictation({ id: session.id, audio: speechAudio() });
+  assert.equal(result.state, 'error'); assert.equal(result.text, undefined);
+  assert.equal(JSON.stringify({ result, events: host.events, snapshot: host.operations.bootstrap(), errors: host.errors }).includes(secret), false);
+  assert.equal(host.store.getChat(owner.chatId).messages.length, 0);
+});
 
 test('selected knowledge is scoped, version-bound and invalidates queued sends when a live document changes', async t=>{
   const entered=deferred(),done=deferred(),requests=[];

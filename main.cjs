@@ -22,6 +22,8 @@ const { rebuildMemoryIndex, searchMemories, memorySourceDigest } = require('./ba
 const { parseSkillPackage, HOST_TOOL_NAMES } = require('./backend/skill-package.cjs');
 const { buildSelectedContext, validateContextLease } = require('./backend/context-builder.cjs');
 const { createKnowledgeRuntime } = require('./backend/knowledge-tools.cjs');
+const { createDictationSessionManager } = require('./backend/dictation-session.cjs');
+const { transcribeAudio, normalizeSpeechBaseUrl } = require('./backend/asr-provider.cjs');
 
 app.setName('Muse Windows');
 if(process.platform==='win32')app.setAppUserModelId?.('com.jackwang19559.musewindows');
@@ -42,6 +44,7 @@ const pendingSends = new Map();
 let shuttingDown = false;
 let quitRequested = false;
 let latestNotificationChatId=null;
+let dictation, dictationOwnerBinding;
 const rendererFile = path.join(__dirname, 'build', 'index.html');
 const rendererURL = pathToFileURL(rendererFile).href;
 
@@ -61,7 +64,7 @@ function snapshot() {
 function emit(event) {
   if (window && !window.isDestroyed()) window.webContents.send('muse:event', event);
 }
-function refresh() { invalidateKnowledgeContexts(); const value = snapshot(); emit({ type: 'snapshot', snapshot: value }); return value; }
+function refresh() { invalidateKnowledgeContexts(); dictation?.validateCurrent(); const value = snapshot(); emit({ type: 'snapshot', snapshot: value }); return value; }
 const READ_TOOLS = new Set(['workspace_list_files','workspace_read_file','muse_list_apps','muse_read_app','memory_search','memory_read']);
 function selectedContext(chat, useTools) {
   const profile = chat.profileId ? store.getAgentProfile(chat.profileId) : null;
@@ -96,6 +99,32 @@ function endpointConfigured() {
   return settings;
 }
 function providerBinding() { const settings=endpointConfigured();return{baseUrl:provider.configuredUrl(settings).href,model:settings.model}; }
+function dictationWindowAvailable(){return !!window&&!window.isDestroyed()&&window.isVisible()&&!window.isMinimized();}
+function dictationScopeValid({owner}) {
+  if(!store||!dictationWindowAvailable())return false;
+  const current=store.snapshot();
+  if(owner.workspaceId&&!current.workspaces.some(item=>item.id===owner.workspaceId))return false;
+  const chat=owner.chatId?current.chats.find(item=>item.id===owner.chatId):null;
+  if(owner.chatId&&(!chat||chat.workspaceId!==owner.workspaceId||(chat.profileId||null)!==dictationOwnerBinding?.profileId))return false;
+  const selection=dictationOwnerBinding?.selection;
+  if(selection?.context)validateContextLease(store,selection.context.lease,{workspaceId:owner.workspaceId,availableToolNames:selection.availableToolNames});
+  return true;
+}
+function dictationManager() {
+  if(!dictation)dictation=createDictationSessionManager({
+    timeoutMs:270000,
+    getProviderBinding:()=>({settings:store.settings(),speechKey:crypto.createHash('sha256').update(store.state.encryptedSpeechApiKey||'').digest('hex'),chatKey:crypto.createHash('sha256').update(store.state.encryptedApiKey||'').digest('hex')}),
+    validateScope:dictationScopeValid,
+    transcribe:({audio,signal})=>transcribeAudio({settings:store.settings(),apiKey:store.speechSecret(),audio,signal}),
+    onState:state=>emit({type:'dictation-state',session:state})
+  });
+  return dictation;
+}
+function dictationPermission(contents,permission,details,request=false) {
+  if(permission!=='media'||!dictationWindowAvailable()||contents!==window.webContents||contents.mainFrame?.url?.split('#')[0]!==rendererURL||details?.isMainFrame!==true||details?.requestingUrl?.split('#')[0]!==rendererURL)return false;
+  if(request ? !Array.isArray(details.mediaTypes)||details.mediaTypes.length!==1||details.mediaTypes[0]!=='audio' : details.mediaType!=='audio')return false;
+  return dictation?.allowsCapture()===true;
+}
 function showWindow(chatId) { if(!window||window.isDestroyed())createWindow();window.show();if(window.isMinimized())window.restore();window.focus();if(chatId){if(window.webContents.isLoadingMainFrame())window.webContents.once('did-finish-load',()=>emit({type:'open-chat',chatId}));else emit({type:'open-chat',chatId});} }
 function syncTray() {
   if(testMode&&!testBackground)return;
@@ -474,6 +503,26 @@ const operations = {
     return { cancelled:false, path:choice.filePath, buildId:build.id };
   },
   saveSettings: input => { const result = store.saveSettings(input || {}); if (input?.theme) nativeTheme.themeSource = input.theme; refresh(); return result; },
+  startDictation: input => {
+    if(!dictationWindowAvailable())throw new Error('请打开并还原工作台窗口后开始听写。');
+    if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).some(key=>!['scopeKey','workspaceId','chatId','profileId','useTools'].includes(key)))throw new Error('听写范围无效。');
+    text(input.scopeKey,4000);if(!input.scopeKey)throw new Error('听写范围无效。');
+    const owner={scopeKey:input.scopeKey,workspaceId:input.workspaceId??null,chatId:input.chatId??null};
+    for(const id of [owner.workspaceId,owner.chatId])if(id!==null&&(typeof id!=='string'||!/^[A-Za-z0-9_-]{1,100}$/.test(id)))throw new Error('听写范围无效。');
+    const settings=store.settings();if(!settings.speechBaseUrl||!settings.transcriptionModel)throw new Error('请先在设置的“语音输入”中配置识别服务和模型。');
+    normalizeSpeechBaseUrl(settings.speechBaseUrl);
+    const prior=store.snapshot().chats.find(item=>item.id===owner.chatId);
+    if(input.useTools!==undefined&&typeof input.useTools!=='boolean')throw new Error('听写工具范围无效。');
+    const profileId=input.profileId??prior?.profileId??null;
+    if(profileId!==null&&(typeof profileId!=='string'||!/^[A-Za-z0-9_-]{1,100}$/.test(profileId)))throw new Error('听写知识配置无效。');
+    if(prior&&(prior.profileId||null)!==profileId)throw new Error('听写知识配置已变化。');
+    if(!dictation?.snapshot()||!['preparing','recording','finishing'].includes(dictation.snapshot().state))dictationOwnerBinding={profileId,selection:selectedContext(prior||{workspaceId:owner.workspaceId,profileId},input.useTools===true)};
+    return dictationManager().start({owner});
+  },
+  dictationCaptureReady: input => dictationManager().captureReady(input),
+  finishDictation: input => dictationManager().finish(input),
+  cancelDictation: input => dictationManager().cancel(input),
+  getDictationState: () => dictation?.snapshot()||null,
   testConnection: () => provider.testConnection({ settings: store.settings(), apiKey: store.secret(), signal: AbortSignal.timeout(20000) }),
   listModels: () => provider.listModels({ settings: store.settings(), apiKey: store.secret(), signal: AbortSignal.timeout(20000) }),
   createWorkspace: input => { const x = store.createWorkspace(input); refresh(); return x; },
@@ -559,19 +608,22 @@ function createWindow() {
     if (event.isMainFrame || ['about:srcdoc','about:blank'].includes(event.url)) return;
     try { previewRuntime.document(event.url); } catch { event.preventDefault(); }
   });
-  window.webContents.on('did-start-navigation', event => { if (event.isMainFrame && !event.isSameDocument) previewRuntime.closeAll(); });
+  window.webContents.on('did-start-navigation', event => { if (event.isMainFrame && !event.isSameDocument) { previewRuntime.closeAll();dictation?.invalidate('navigation'); } });
   window.webContents.session.on('will-download', event => event.preventDefault());
-  window.webContents.session.setPermissionCheckHandler(() => false);
+  window.webContents.session.setPermissionCheckHandler((contents,permission,_origin,details)=>dictationPermission(contents,permission,details));
   window.webContents.on('will-prevent-unload', event => {
     const choice = dialog.showMessageBoxSync(window, { type: 'warning', title: '有未保存的文件', message: '文件还有未保存的修改。', detail: '继续编辑并保存，或放弃这些修改后关闭。', buttons: ['继续编辑', '放弃修改并关闭'], defaultId: 0, cancelId: 0, noLink: true });
     if (choice === 1) event.preventDefault();
     else quitRequested=false;
   });
   window.webContents.on('will-navigate', (event, target) => { if (target.split('#')[0] !== rendererURL) event.preventDefault(); });
-  window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  window.webContents.session.setPermissionRequestHandler((contents,permission,callback,details)=>callback(dictationPermission(contents,permission,details,true)));
+  window.webContents.on('render-process-gone',()=>dictation?.invalidate('renderer_gone'));
   window.loadFile(rendererFile, process.argv.includes('--settings') ? { hash: 'settings' } : {});
   window.on('close',event=>{if(!quitRequested&&!shuttingDown&&store.settings().backgroundTasks&&(!testMode||testBackground)){event.preventDefault();syncTray();window.hide();}});
-  window.on('closed', () => { window = null; });
+  window.on('hide',()=>dictation?.invalidate('window_hidden'));
+  window.on('minimize',()=>dictation?.invalidate('window_hidden'));
+  window.on('closed', () => { dictation?.dispose();dictation=null;window = null; });
   return window;
 }
 app.whenReady().then(async () => {
@@ -607,4 +659,4 @@ app.whenReady().then(async () => {
 }).catch(error => { console.error('Muse startup:', error.message); app.exit(1); });
 app.on('window-all-closed', () => app.quit());
 app.on('before-quit',()=>{quitRequested=true;});
-app.on('will-quit', () => { shuttingDown = true;scheduler?.stop();tray?.destroy();tray=null;previewRuntime?.closeAll(); sendOutbox.cancelAll('shutdown'); pendingSends.clear(); for (const job of active.values()) job.controller.abort(); store?.flush(); });
+app.on('will-quit', () => { shuttingDown = true;dictation?.dispose();scheduler?.stop();tray?.destroy();tray=null;previewRuntime?.closeAll(); sendOutbox.cancelAll('shutdown'); pendingSends.clear(); for (const job of active.values()) job.controller.abort(); store?.flush(); });

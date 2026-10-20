@@ -20,7 +20,7 @@ const MAX_EDITABLE_FILE_BYTES = 1024 * 1024;
 const MAX_REPLY_EXCERPT_CHARS = 2000;
 const FILE_EDIT_DIRECTORY = /^\.file-edit-[0-9a-f-]{36}$/;
 const ID = /^[A-Za-z0-9_-]{1,100}$/;
-const DEFAULTS = { baseUrl: 'https://api.openai.com/v1', model: '', systemPrompt: '你是一位认真、清晰、乐于协作的 AI 助手。请优先使用中文回答，并明确区分事实与推测。', temperature: 0.7, theme: 'system', language: 'zh', transcriptionModel: '', backgroundTasks: false };
+const DEFAULTS = { baseUrl: 'https://api.openai.com/v1', model: '', systemPrompt: '你是一位认真、清晰、乐于协作的 AI 助手。请优先使用中文回答，并明确区分事实与推测。', temperature: 0.7, theme: 'system', language: 'zh', speechBaseUrl: '', transcriptionModel: '', dictationAutoSend: false, backgroundTasks: false };
 const SETTINGS_KEYS = Object.keys(DEFAULTS);
 const stamp = () => new Date().toISOString();
 const uid = kind => `${kind}_${crypto.randomUUID()}`;
@@ -65,17 +65,19 @@ function validateSettings(value, current = DEFAULTS, patch = false) {
   record(value, '设置');
   const result = { ...current };
   for (const key of SETTINGS_KEYS) if (key in value) {
-    if (key === 'backgroundTasks') { if (typeof value[key] !== 'boolean') fail('后台运行选项必须是布尔值。'); result[key] = value[key]; }
+    if (key === 'backgroundTasks' || key === 'dictationAutoSend') { if (typeof value[key] !== 'boolean') fail('偏好选项必须是布尔值。'); result[key] = value[key]; }
     else if (key === 'temperature') { if (typeof value[key] !== 'number' || !Number.isFinite(value[key]) || value[key] < 0 || value[key] > 2) fail('温度必须在 0 到 2 之间。'); result[key] = value[key]; }
     else if (key === 'theme') { if (!['light', 'dark', 'system'].includes(value[key])) fail('主题设置无效。'); result[key] = value[key]; }
     else if (key === 'language') { if (value[key] !== 'zh') fail('语言设置无效。'); result[key] = 'zh'; }
-    else result[key] = string(value[key], '设置字段', key === 'systemPrompt' ? 50000 : key === 'baseUrl' ? 2048 : 500).trim();
+    else result[key] = string(value[key], '设置字段', key === 'systemPrompt' ? 50000 : ['baseUrl','speechBaseUrl'].includes(key) ? 2048 : 500).trim();
   }
   if (!patch) onlyKeys(value, SETTINGS_KEYS, '设置');
   if (result.baseUrl) {
     let url; try { url = new URL(result.baseUrl); } catch { fail('API 地址无效，请填写完整的 HTTP/HTTPS 地址。'); }
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) fail('API 地址仅支持 HTTP/HTTPS，且不能包含登录信息或片段。');
   }
+  if (result.speechBaseUrl) require('./asr-provider.cjs').normalizeSpeechBaseUrl(result.speechBaseUrl);
+  if ([...result.transcriptionModel].length>300 || /[\u0000-\u001f\u007f]/.test(result.transcriptionModel)) fail('语音模型名称无效。');
   return result;
 }
 function workspaceShape(value) {
@@ -233,11 +235,11 @@ function validateRelations(state) {
 function stateShape(value) {
   record(value, '本地数据');
   if (value.schemaVersion !== STATE_VERSION || !Array.isArray(value.workspaces) || value.workspaces.length > 1000 || !Array.isArray(value.chats) || value.chats.length > 5000 || !Array.isArray(value.files) || value.files.length > 10000) fail('本地数据版本或结构不受支持。');
-  const encrypted = value.encryptedApiKey;
-  if (encrypted != null && (typeof encrypted !== 'string' || encrypted.length > 65536 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encrypted))) fail('本地密钥记录损坏。');
+  const encrypted = value.encryptedApiKey, encryptedSpeech = value.encryptedSpeechApiKey;
+  for (const key of [encrypted, encryptedSpeech]) if (key != null && (typeof key !== 'string' || key.length > 65536 || !/^[A-Za-z0-9+/]+={0,2}$/.test(key))) fail('本地密钥记录损坏。');
   const artifacts = value.artifacts === undefined ? [] : artifactArray(value.artifacts, MAX_ARTIFACTS, 'Space 列表').map(validateArtifact);
   const schedules = value.schedules === undefined ? [] : scheduleModel.array(value.schedules, scheduleModel.MAX_SCHEDULES, '计划列表').map(scheduleModel.scheduleShape), scheduleRuns = value.scheduleRuns === undefined ? [] : scheduleModel.array(value.scheduleRuns, scheduleModel.MAX_SCHEDULE_RUNS, '执行记录').map(scheduleModel.runShape);
-  const state = { schemaVersion: STATE_VERSION, settings: validateSettings(value.settings), encryptedApiKey: encrypted || null, workspaces: value.workspaces.map(workspaceShape), chats: value.chats.map(chatShape), files: value.files.map(item => fileShape(item, true)), artifacts, schedules, scheduleRuns, ...knowledgeFields(value) };
+  const state = { schemaVersion: STATE_VERSION, settings: validateSettings(value.settings), encryptedApiKey: encrypted || null, encryptedSpeechApiKey: encryptedSpeech || null, workspaces: value.workspaces.map(workspaceShape), chats: value.chats.map(chatShape), files: value.files.map(item => fileShape(item, true)), artifacts, schedules, scheduleRuns, ...knowledgeFields(value) };
   validateRelations(state);
   return state;
 }
@@ -407,7 +409,13 @@ class Store {
   _schedule(id, state = this.state) { identifier(id); const schedule = state.schedules.find(item => item.id === id); if (!schedule) fail('计划不存在。'); return schedule; }
   _scheduleRun(id, state = this.state) { identifier(id); const run = state.scheduleRuns.find(item => item.id === id); if (!run) fail('计划执行记录不存在。'); return run; }
   snapshot() { return { settings: this.settings(), workspaces: copy(this.state.workspaces), chats: copy(this.state.chats), files: this.state.files.map(publicFile), artifacts: this.state.artifacts.map(publicArtifact), schedules: copy(this.state.schedules), scheduleRuns: copy(this.state.scheduleRuns), memoryDocuments: copy(this.state.memoryDocuments.map(knowledge.publicMemory)), memories: copy(this.state.memories.map(knowledge.publicMemory)), skills: copy(this.state.skills.map(knowledge.publicSkill)), agentProfiles: copy(this.state.agentProfiles.map(knowledge.publicProfile)), memoryIndexes: this.state.memoryIndexes.map(index => ({ schemaVersion: 1, workspaceId: index.workspaceId, revision: index.revision, status: index.sourceDigest !== require('./knowledge-search.cjs').memorySourceDigest(this.state.memories, index.workspaceId) ? 'stale' : index.status, sourceDigest: index.sourceDigest, indexDigest: index.indexDigest, builtAt: index.builtAt, documentCount: index.documents.length, ...(index.errorCode ? { errorCode: index.errorCode } : {}) })), app: { version: '0.1.0', platform: process.platform } }; }
-  settings() { return { ...copy(this.state.settings), hasApiKey: Boolean(this.state.encryptedApiKey) }; }
+  settings() { return { ...copy(this.state.settings), hasApiKey: Boolean(this.state.encryptedApiKey), hasSpeechApiKey: Boolean(this.state.encryptedSpeechApiKey) }; }
+  speechSecret() {
+    if (!this.state.encryptedSpeechApiKey) return '';
+    if (typeof this.decrypt !== 'function') fail('系统语音密钥解密服务不可用，请重新输入。');
+    try { const value = this.decrypt(Buffer.from(this.state.encryptedSpeechApiKey, 'base64')); if (typeof value !== 'string') fail('invalid'); return value; }
+    catch { fail('无法解密本机语音密钥，请在设置中重新输入。'); }
+  }
   secret() {
     if (!this.state.encryptedApiKey) return '';
     if (typeof this.decrypt !== 'function') fail('系统密钥解密服务不可用，请重新输入 API 密钥。');
@@ -415,7 +423,7 @@ class Store {
     catch { fail('无法解密本机 API 密钥，请在设置中重新输入。'); }
   }
   saveSettings(input) {
-    record(input, '设置'); onlyKeys(input, [...SETTINGS_KEYS, 'apiKey', 'clearApiKey'], '设置');
+    record(input, '设置'); onlyKeys(input, [...SETTINGS_KEYS, 'apiKey', 'clearApiKey', 'speechApiKey', 'clearSpeechApiKey'], '设置');
     const settings = validateSettings(input, this.state.settings, true);
     let encrypted = this.state.encryptedApiKey;
     if (input.clearApiKey != null && typeof input.clearApiKey !== 'boolean') fail('清除密钥选项无效。');
@@ -429,7 +437,19 @@ class Store {
       try { const bytes = this.encrypt(key); if (!(bytes instanceof Uint8Array) || !bytes.length) fail('invalid'); encrypted = Buffer.from(bytes).toString('base64'); }
       catch { fail('系统无法加密 API 密钥，设置未保存。'); }
     }
-    this._commit(next => { next.settings = settings; next.encryptedApiKey = encrypted; return null; }); return this.settings();
+    let encryptedSpeech = this.state.encryptedSpeechApiKey || null;
+    if (input.clearSpeechApiKey != null && typeof input.clearSpeechApiKey !== 'boolean') fail('清除语音密钥选项无效。');
+    if (input.speechApiKey != null && typeof input.speechApiKey !== 'string') fail('语音密钥格式无效。');
+    const speechKey = typeof input.speechApiKey === 'string' ? input.speechApiKey.trim() : '';
+    if (speechKey.length > 8192 || speechKey && /[^\x21-\x7e]/.test(speechKey)) fail('语音密钥格式无效。');
+    if (speechKey && input.clearSpeechApiKey) fail('不能同时保存和清除语音密钥。');
+    if (input.clearSpeechApiKey) encryptedSpeech = null;
+    else if (speechKey) {
+      if (typeof this.encrypt !== 'function') fail('系统加密服务不可用，语音密钥未保存。');
+      try { const bytes = this.encrypt(speechKey); if (!(bytes instanceof Uint8Array) || !bytes.length) fail('invalid'); encryptedSpeech = Buffer.from(bytes).toString('base64'); }
+      catch { fail('系统无法加密语音密钥，设置未保存。'); }
+    }
+    this._commit(next => { next.settings = settings; next.encryptedApiKey = encrypted; next.encryptedSpeechApiKey = encryptedSpeech; return null; }); return this.settings();
   }
   createWorkspace(input) {
     record(input, '工作区'); onlyKeys(input, ['name', 'description', 'color'], '工作区');
@@ -881,6 +901,7 @@ class Store {
     if (data.format !== BACKUP_FORMAT || data.schemaVersion !== 1) fail('不是受支持的 Muse Windows 备份。');
     date(data.exportedAt);
     const settings = validateSettings(data.settings); settings.backgroundTasks = this.state.settings.backgroundTasks;
+    settings.speechBaseUrl=this.state.settings.speechBaseUrl;settings.transcriptionModel=this.state.settings.transcriptionModel;settings.dictationAutoSend=false;
     if (!Array.isArray(data.workspaces) || data.workspaces.length > 1000 || !Array.isArray(data.chats) || data.chats.length > 5000 || !Array.isArray(data.files) || data.files.length > 10000) fail('备份内容超出限制或格式无效。');
     for (const item of data.workspaces) onlyKeys(record(item, '工作区'), ['id', 'name', 'description', 'color', 'createdAt', 'updatedAt'], '备份工作区');
     for (const item of data.chats) {

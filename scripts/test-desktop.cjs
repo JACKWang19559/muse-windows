@@ -17,8 +17,20 @@ fs.writeFileSync(path.join(folder,'reference.docx'),zipSync({'word/document.xml'
   fs.writeFileSync(path.join(folder,'reference.pdf'),data);
 }
 const requests = [];
+const speechRequests=[];
 const server = http.createServer(async (request, response) => {
   if (request.url === '/v1/models') { response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify({ data:[{id:'desktop-test-model'}] })); return; }
+  if(request.url==='/v1/audio/transcriptions'){
+    try{
+      const chunks=[];let size=0;for await(const chunk of request){size+=chunk.length;if(size>3900000)throw new Error('Synthetic audio upload too large');chunks.push(chunk);}
+      const form=await new Request('http://localhost/v1/audio/transcriptions',{method:'POST',headers:request.headers,body:Buffer.concat(chunks)}).formData();
+      const file=form.get('file'),model=form.get('model');
+      const audio=require('../backend/asr-provider.cjs').validateWavAudio(await file.arrayBuffer());
+      if(request.headers.authorization!=='Bearer desktop-speech-secret'||file.name!=='voice.wav'||form.get('response_format')!=='json'||!['desktop-asr','desktop-asr-slow','desktop-asr-error'].includes(model))throw new Error('Invalid synthetic ASR request');
+      const ordinal=speechRequests.length+1;speechRequests.push({ordinal,model,filename:file.name,bytes:audio.bytes.length,durationMs:audio.durationMs,sampleRate:audio.sampleRate,channels:audio.channels});audio.bytes.fill(0);
+      setTimeout(()=>{if(response.destroyed)return;response.writeHead(model==='desktop-asr-error'?503:200,{'content-type':'application/json'});response.end(JSON.stringify(model==='desktop-asr-error'?{error:{message:'synthetic failure'}}:{text:`听写验收 DICTATION-RESULT-${ordinal}`}));},model==='desktop-asr-slow'?900:30);
+    }catch{response.writeHead(400,{'content-type':'application/json'});response.end(JSON.stringify({error:{message:'Invalid synthetic WAV multipart'}}));}return;
+  }
   if (request.url !== '/v1/chat/completions') { response.writeHead(404); response.end('Not found'); return; }
   let body = ''; for await (const chunk of request) body += chunk;
   const parsed = JSON.parse(body); requests.push(parsed);
@@ -65,9 +77,20 @@ server.listen(0, '127.0.0.1', async () => {
   const env = { ...process.env, MUSE_E2E_BASE_URL:`http://127.0.0.1:${server.address().port}/v1`, MUSE_E2E_FOLDER:folder };
   delete env.ELECTRON_RUN_AS_NODE;
   const binary = process.env.MUSE_PACKAGED_EXE || require('electron');
+  const crypto=require('node:crypto');
+  const application=process.env.MUSE_PACKAGED_EXE?path.join(path.dirname(binary),'resources','app'):root;
+  const hash=file=>crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const manifest=()=>{
+    const result={};const visit=relative=>{const file=path.join(application,relative);if(fs.statSync(file).isDirectory()){for(const name of fs.readdirSync(file).sort())visit(relative+'/'+name);}else result[relative]=hash(file);};
+    for(const name of ['main.cjs','preload.cjs','package.json','backend','build'])visit(name);
+    for(const name of fs.readdirSync(path.join(application,'scripts')).filter(name=>/scenario\.cjs$/.test(name)).sort())visit('scripts/'+name);
+    return result;
+  };
+  const runtimeAtLaunch=manifest(),executableAtLaunch=hash(binary);
   const args = process.env.MUSE_PACKAGED_EXE ? [] : [root];
   args.push('--desktop-test', '--data-dir=' + path.join(folder, 'data'));
   args.push('--background-lifecycle-test');
+  args.push('--use-fake-device-for-media-stream','--autoplay-policy=no-user-gesture-required');
   const child = spawn(binary, args, { cwd:root, env, windowsHide:true, stdio:['ignore','pipe','pipe'] });
   let output = '';
   child.stdout.on('data', x => { output += x; }); child.stderr.on('data', x => { output += x; });
@@ -77,12 +100,12 @@ server.listen(0, '127.0.0.1', async () => {
     clearTimeout(timeout); server.close();
     fs.writeFileSync(path.join(folder, 'electron.log'), output);
     fs.writeFileSync(path.join(folder, 'provider-requests.json'), JSON.stringify(requests, null, 2));
-    const crypto = require('node:crypto');
+    fs.writeFileSync(path.join(folder,'speech-requests.json'),JSON.stringify({capture:'Chromium fake device only',requests:speechRequests},null,2));
     let desktopChecks;try{desktopChecks=JSON.parse(fs.readFileSync(path.join(folder,'desktop-checks.json'),'utf8'));}catch{}
-    const application = process.env.MUSE_PACKAGED_EXE ? path.join(path.dirname(binary),'resources','app') : root;
-    const evidence = { exit_code:code, desktop_checks_completed:desktopChecks?.passed===true, desktop_check_count:desktopChecks?.check_count||0, folder, application, executable:binary, executable_sha256:crypto.createHash('sha256').update(fs.readFileSync(binary)).digest('hex'), version:JSON.parse(fs.readFileSync(path.join(application,'package.json'),'utf8')).version, main_sha256:crypto.createHash('sha256').update(fs.readFileSync(path.join(application,'main.cjs'))).digest('hex'), provider_requests:requests.length, workspace_document_reached_provider:requests.some(x=>JSON.stringify(x.messages).includes('WIND-CEDAR-42')) };
+    const runtimeAtExit=manifest(),driftedFiles=[...new Set([...Object.keys(runtimeAtLaunch),...Object.keys(runtimeAtExit)])].filter(name=>runtimeAtLaunch[name]!==runtimeAtExit[name]);
+    const evidence = { exit_code:code, desktop_checks_completed:desktopChecks?.passed===true, desktop_check_count:desktopChecks?.check_count||0, folder, application, executable:binary, executable_sha256:executableAtLaunch, version:JSON.parse(fs.readFileSync(path.join(application,'package.json'),'utf8')).version, main_sha256:runtimeAtLaunch['main.cjs'], runtime_source_unchanged:driftedFiles.length===0&&hash(binary)===executableAtLaunch, drifted_runtime_files:driftedFiles,runtime_hashes:runtimeAtLaunch, provider_requests:requests.length, workspace_document_reached_provider:requests.some(x=>JSON.stringify(x.messages).includes('WIND-CEDAR-42')) };
     fs.writeFileSync(path.join(folder, 'test-run.json'), JSON.stringify(evidence, null, 2));
     console.log(JSON.stringify(evidence, null, 2));
-    if (code !== 0||!evidence.desktop_checks_completed) { console.error(output.slice(-6000)||'Desktop process exited before completing its checks.'); process.exitCode=1; }
+    if (code !== 0||!evidence.desktop_checks_completed||!evidence.runtime_source_unchanged) { console.error(output.slice(-6000)||'Desktop checks incomplete or runtime files changed during the test.'); process.exitCode=1; }
   });
 });
