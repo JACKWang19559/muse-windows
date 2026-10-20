@@ -22,6 +22,10 @@ const ttsRequests=[];
 function silentWav(seconds=8){const rate=24000,length=Math.round(rate*seconds)*2,bytes=Buffer.alloc(44+length);bytes.write('RIFF');bytes.writeUInt32LE(bytes.length-8,4);bytes.write('WAVEfmt ',8);bytes.writeUInt32LE(16,16);bytes.writeUInt16LE(1,20);bytes.writeUInt16LE(1,22);bytes.writeUInt32LE(rate,24);bytes.writeUInt32LE(rate*2,28);bytes.writeUInt16LE(2,32);bytes.writeUInt16LE(16,34);bytes.write('data',36);bytes.writeUInt32LE(length,40);return bytes;}
 fs.writeFileSync(path.join(folder,'reference.wav'),silentWav(12));
 const server = http.createServer(async (request, response) => {
+  if(request.url==='/__muse_test/cancel-admission-state'){
+    const summary=requests.map((entry,index)=>{const content=entry.messages.filter(message=>message.role==='user').at(-1)?.content||'';return{ordinal:index+1,markers:[...new Set(content.match(/CANCEL17_[A-Z0-9_]+/g)||[])]};});
+    response.writeHead(200,{'content-type':'application/json','cache-control':'no-store'});response.end(JSON.stringify({requests:summary}));return;
+  }
   if (request.url === '/v1/models') { response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify({ data:[{id:'desktop-test-model'}] })); return; }
   if(request.url==='/v1/audio/speech'){
     try{let data='';for await(const chunk of request){data+=chunk;if(data.length>40000)throw new Error('Oversized mock input');}const parsed=JSON.parse(data);
@@ -46,6 +50,12 @@ const server = http.createServer(async (request, response) => {
   const parsed = JSON.parse(body); requests.push(parsed);
   response.writeHead(200, { 'content-type':'text/event-stream' });
   const user = parsed.messages.filter(x => x.role === 'user').at(-1)?.content || '';
+  if(/CANCEL17_ACTIVE_[A-Z0-9_]+/.test(user)){
+    // A real loopback HTTP stream stays active until the production request is
+    // aborted. No host acceptance, cancellation receipt or renderer API is faked.
+    let count=0;const write=()=>response.write('data: '+JSON.stringify({choices:[{delta:{content:`CANCEL17_PARTIAL_${++count} `}}]})+'\n\n');
+    write();const timer=setInterval(write,150);response.on('close',()=>clearInterval(timer));return;
+  }
   if (parsed.tools?.length && /AGENT_(CREATE|SAVE|DENY|STOP|APP|SCHEDULE|MEMORY|ANNOTATION)_DEMO|SCHEDULE_WRITE_DEMO/.test(user)) {
     const emitTool = (name, args) => {
       const id = 'call-desktop-' + requests.length, data = JSON.stringify(args), cut = Math.floor(data.length / 2);
@@ -121,7 +131,7 @@ server.listen(0, '127.0.0.1', async () => {
     fs.writeFileSync(path.join(folder,'tts-requests.json'),JSON.stringify({playback:'synthetic silent WAV with webContents muted',requests:ttsRequests},null,2));
     let desktopChecks;try{desktopChecks=JSON.parse(fs.readFileSync(path.join(folder,'desktop-checks.json'),'utf8'));}catch{}
     const runtimeAtExit=manifest(),driftedFiles=[...new Set([...Object.keys(runtimeAtLaunch),...Object.keys(runtimeAtExit)])].filter(name=>runtimeAtLaunch[name]!==runtimeAtExit[name]);
-    const evidence = { exit_code:code, desktop_checks_completed:desktopChecks?.passed===true, desktop_check_count:desktopChecks?.check_count||0, folder, application, executable:binary, executable_sha256:executableAtLaunch, version:JSON.parse(fs.readFileSync(path.join(application,'package.json'),'utf8')).version, main_sha256:runtimeAtLaunch['main.cjs'], runtime_source_unchanged:driftedFiles.length===0&&hash(binary)===executableAtLaunch, drifted_runtime_files:driftedFiles,runtime_hashes:runtimeAtLaunch, provider_requests:requests.length, workspace_document_reached_provider:requests.some(x=>JSON.stringify(x.messages).includes('WIND-CEDAR-42')) };
+    const evidence = { exit_code:code, desktop_checks_completed:desktopChecks?.passed===true, desktop_check_count:desktopChecks?.check_count??desktopChecks?.checks?.length??0, folder, application, executable:binary, executable_sha256:executableAtLaunch, version:JSON.parse(fs.readFileSync(path.join(application,'package.json'),'utf8')).version, main_sha256:runtimeAtLaunch['main.cjs'], runtime_source_unchanged:driftedFiles.length===0&&hash(binary)===executableAtLaunch, drifted_runtime_files:driftedFiles,runtime_hashes:runtimeAtLaunch, provider_requests:requests.length, workspace_document_reached_provider:requests.some(x=>JSON.stringify(x.messages).includes('WIND-CEDAR-42')) };
     fs.writeFileSync(path.join(folder, 'test-run.json'), JSON.stringify(evidence, null, 2));
     console.log(JSON.stringify(evidence, null, 2));
     if (code !== 0||!evidence.desktop_checks_completed||!evidence.runtime_source_unchanged) { console.error(output.slice(-6000)||'Desktop checks incomplete or runtime files changed during the test.'); process.exitCode=1; }

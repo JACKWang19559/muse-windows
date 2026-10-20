@@ -289,12 +289,18 @@ function App() {
   const [snapshot, setSnapshot] = useState(null);
   const snapshotRef = useRef(null);
   const [bootError, setBootError] = useState('');
-  const [route, setRoute] = useState({ type: 'welcome', workspaceId: null });
+  const [route, writeRoute] = useState({ type: 'welcome', workspaceId: null });
+  const routeTarget = useRef(route); routeTarget.current=route;
+  const recoveryEpoch = useRef(0);
+  const setRoute = update => {const next=typeof update==='function'?update(routeTarget.current):update;if(next.type!==routeTarget.current.type||next.id!==routeTarget.current.id||next.workspaceId!==routeTarget.current.workspaceId)recoveryEpoch.current++;routeTarget.current=next;writeRoute(next);};
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(() => window.location.hash === '#settings');
   const [searchOpen, setSearchOpen] = useState(false);
-  const [artifactsOpen, setArtifactsOpen] = useState(false);
-  const [activeArtifactId, setActiveArtifactId] = useState(null);
+  const [artifactsOpen, writeArtifactsOpen] = useState(false);
+  const [activeArtifactId, writeActiveArtifactId] = useState(null);
+  const artifactTarget = useRef({open:artifactsOpen,id:activeArtifactId});artifactTarget.current={open:artifactsOpen,id:activeArtifactId};
+  const setArtifactsOpen = update => {const open=typeof update==='function'?update(artifactTarget.current.open):update;if(open!==artifactTarget.current.open)recoveryEpoch.current++;artifactTarget.current={...artifactTarget.current,open};writeArtifactsOpen(open);};
+  const setActiveArtifactId = update => {const id=typeof update==='function'?update(artifactTarget.current.id):update;if(id!==artifactTarget.current.id)recoveryEpoch.current++;artifactTarget.current={...artifactTarget.current,id};writeActiveArtifactId(id);};
   const artifactVisibility = useRef(false); artifactVisibility.current = artifactsOpen;
   const [schedulesOpen, setSchedulesOpen] = useState(false);
   const [knowledgeOpen,setKnowledgeOpen]=useState(false);
@@ -329,8 +335,11 @@ function App() {
   const modeRevisions = useRef(new Map());
   const [importing, setImporting] = useState(false);
   const [pendingChats, setPendingChats] = useState(new Set());
-  const [sending, setSending] = useState(false);
-  const sendLock = useRef(false);
+  const [admittingKeys, setAdmittingKeys] = useState(new Set());
+  const sendAdmissions = useRef(new Map());
+  const queuedAdmissions = useRef(new Map());
+  const restoredAdmissions = useRef(new Set());
+  const composerEnvironment = useRef(null);
   const annotationPromotion = useRef(null);
   const queueActions = useRef(new Map());
   const [toast, setToast] = useState(null);
@@ -426,6 +435,11 @@ function App() {
   const visibleArtifact = artifactsOpen && data.artifacts.find(item => item.id === activeArtifactId && (item.workspaceId ?? null) === workspaceId);
   const activePanel = panelDraftContexts[composerKey] || (visibleArtifact ? {kind:'artifact',artifactId:visibleArtifact.id,artifactName:visibleArtifact.name} : null);
   const configured = !!data.settings.baseUrl && !!data.settings.model;
+  const sending = admittingKeys.has(composerKey);
+  // The queue receipt can beat its snapshot to the renderer. Retain its client
+  // identity until a later snapshot either shows failure or its admitted row.
+  for(const [identity,queued]of queuedAdmissions.current){const target=data.chats.find(x=>x.id===queued.chatId),pending=data.pendingSends.find(x=>x.clientMessageId===identity);if(!target||pending&&pending.state!=='queued'||target.messages.some(x=>x.id===identity))queuedAdmissions.current.delete(identity);}
+  composerEnvironment.current = {key:composerKey,workspaceId,profileId:selectedProfileId||null,useTools:!!useTools,activePanel,modeRevision:modeRevisions.current.get(composerKey)||0};
   const busy = sending || !!chat && (pendingChats.has(chat.id) || chat.messages.some(message => message.status === 'streaming'));
   const sortedChats = useMemo(() => sortChats(data.chats), [data.chats]);
   const openRoute = useCallback(next => { setRoute(next.messageId ? { ...next, jumpToken: ++jumpSequence.current } : next); setMenu(null); if (window.innerWidth < 900 || artifactVisibility.current) setSidebarOpen(false); followBottom.current = !next.messageId; setShowScrollBottom(false); }, []);
@@ -465,15 +479,17 @@ function App() {
   };
   const send = async (inputText, annotation) => {
     const submittedText=typeof inputText==='string'?inputText:draft;
-    if (sendLock.current || !submittedText.trim() && !(annotation ? 0 : attachedIds.length)) return false;
+    if (sendAdmissions.current.has(composerKey) || !submittedText.trim() && !(annotation ? 0 : attachedIds.length)) return false;
     if (!configured) { setSettingsOpen(true); notify('连接你的模型后，就可以开始对话了', 'info'); return false; }
-    sendLock.current = true; setSending(true);
     if(annotation)annotationPromotion.current=null;
     const key = composerKey, text = submittedText, files = annotation ? [] : [...attachedIds], quotedId = quote?.id, clientMessageId = crypto.randomUUID();
     const artifactContext = annotation || artifactDraftContexts[key];
     // Capture the visible resource at admission. Later panel changes cannot
     // silently rebind queued messages or an interrupted draft.
     const panelContext = panelDraftContexts[key] || (!document.hidden ? activePanel : null);
+    const admission={id:clientMessageId,key,restoreKey:key,chatId:chat?.id||null,phase:chat?'submit':'create',cancelled:false,annotation:!!annotation,modeRevision:modeRevisions.current.get(key)||0,
+      intent:{id:clientMessageId,clientMessageId,chatId:chat?.id||null,draftKey:key,content:text,attachmentIds:files,useTools:!!useTools,workspaceId,profileId:selectedProfileId||null,...(quotedId?{replyToMessageId:quotedId}:{}),...(artifactContext?{artifactContext}:{}),...(panelContext?{activePanel:panelContext}:{}),localOnly:true,state:'failed',error:'已停止发送，可恢复为草稿。'}};
+    sendAdmissions.current.set(key,admission);setAdmittingKeys(previous=>new Set(previous).add(key));
     // Remove only this submitted draft now. New typing during admission stays
     // separate and cannot be erased by a later IPC response.
     if (!annotation) {
@@ -489,8 +505,12 @@ function App() {
       if (!target) {
         target = await api.createChat({ workspaceId,...(selectedProfileId?{profileId:selectedProfileId}:{}) }); const nextKey = `chat:${target.id}`;
         createdTarget = true;
+        admission.chatId=target.id;
+        if(admission.cancelled)return false;
         if(!annotation && composerIdentity.current===key){
         restoreKey=nextKey;
+        admission.restoreKey=nextKey;admission.intent.draftKey=nextKey;admission.intent.chatId=target.id;
+        sendAdmissions.current.set(nextKey,admission);setAdmittingKeys(previous=>new Set(previous).add(nextKey));
         setDrafts(previous => ({ ...previous, [nextKey]: previous[key] || '', [key]: '' }));
         setAttachments(previous => ({ ...previous, [nextKey]: previous[key] || [], [key]: [] }));
         setQuotes(previous => ({ ...previous, [nextKey]: previous[key] || null, [key]: null }));
@@ -500,13 +520,19 @@ function App() {
         setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, target) })); openRoute({ type: 'chat', id: target.id });
         }
       }
+      if(admission.cancelled)return false;
+      admission.phase='submit';admission.chatId=target.id;
       setPendingChats(previous => new Set(previous).add(target.id));
       followBottom.current = true;
-      await api.sendMessage({ chatId: target.id, content: text, attachmentIds: files, useTools, clientMessageId, ...(artifactContext ? { artifactContext } : {}), ...(panelContext ? {activePanel:panelContext} : {}), ...(quotedId ? { replyToMessageId: quotedId } : {}) });
+      const receipt=await api.sendMessage({ chatId: target.id, content: text, attachmentIds: files, useTools, clientMessageId, ...(artifactContext ? { artifactContext } : {}), ...(panelContext ? {activePanel:panelContext} : {}), ...(quotedId ? { replyToMessageId: quotedId } : {}) });
+      clearAdmissionPending(target.id,admission);
+      if(receipt?.queued)queuedAdmissions.current.set(clientMessageId,{chatId:target.id,queueId:receipt.queueId});
+      if(admission.cancelled){const outcome=await admission.cancelPromise;if(outcome?.state==='cancelled')return false;}
       if(annotation&&createdTarget)annotationPromotion.current={originKey:key,target};
       return true;
     } catch (error) {
-      if (target) setPendingChats(previous => { const next = new Set(previous); next.delete(target.id); return next; });
+      if (target) clearAdmissionPending(target.id,admission);
+      if(admission.cancelled){await admission.cancelPromise;return false;}
       let admitted = false;
       try { admitted = target && (await api.bootstrap()).chats.find(item => item.id === target.id)?.messages.some(message => message.id === clientMessageId); } catch { /* Preserve input if admission cannot be confirmed. */ }
       if (!admitted && !annotation) {
@@ -517,7 +543,7 @@ function App() {
       notify(error.message, 'error');
       if(admitted&&annotation&&createdTarget)annotationPromotion.current={originKey:key,target};
       return !!admitted;
-    } finally { sendLock.current = false; setSending(false); }
+    } finally { releaseAdmission(admission); }
   };
   const annotationSent=()=>{
     const promotion=annotationPromotion.current;annotationPromotion.current=null;
@@ -532,7 +558,51 @@ function App() {
       openRoute({type:'chat',id:promotion.target.id});
     }
   };
-  const stop = () => { if (chat) api.stopGeneration({ chatId: chat.id }).catch(error => notify(error.message, 'error')); };
+  const releaseAdmission = admission => {
+    const removed=[];for(const [key,value]of sendAdmissions.current)if(value===admission){sendAdmissions.current.delete(key);removed.push(key);}
+    if(removed.length)setAdmittingKeys(previous=>{const next=new Set(previous);for(const key of removed)if(!sendAdmissions.current.has(key))next.delete(key);return next;});
+  };
+  const clearAdmissionPending = (chatId,admission) => {const current=sendAdmissions.current.get(`chat:${chatId}`);if(current&&current!==admission)return;setPendingChats(previous=>{const next=new Set(previous);next.delete(chatId);return next;});};
+  const retainLocalRecovery = intent => setAdmissionRecoveries(previous=>previous.some(x=>(x.clientMessageId||x.id)===(intent.clientMessageId||intent.id))?previous:[...previous,intent]);
+  const recoverCancelled = async (intent,key,modeRevision,targetRevision) => {
+    const identity=intent.clientMessageId||intent.id,env=composerEnvironment.current;
+    if(restoredAdmissions.current.has(identity))return false;
+    const target=routeTarget.current,currentKey=target.type==='chat'?`chat:${target.id}`:`new:${(target.type==='workspace'?target.id:target.workspaceId)||'personal'}`;
+    const visible=artifactTarget.current.open&&(snapshotRef.current||data).artifacts.find(x=>x.id===artifactTarget.current.id&&(x.workspaceId??null)===(intent.workspaceId??null));
+    const panel=draftState.current.panelDraftContexts[key]||(visible?{artifactId:visible.id}:null);
+    const samePanel=(panel?.artifactId||null)===(intent.activePanel?.artifactId||null);
+    const empty=!(draftState.current.drafts[key]?.length||draftState.current.attachments[key]?.length||draftState.current.quotes[key]||draftState.current.artifactDraftContexts[key]||draftState.current.panelDraftContexts[key]);
+    if(!env||env.key!==key||currentKey!==key||targetRevision!==recoveryEpoch.current||!empty||!samePanel||env.workspaceId!==(intent.workspaceId??null)||env.profileId!==(intent.profileId??null)||env.useTools!==!!intent.useTools||(modeRevisions.current.get(key)||0)!==modeRevision){if(intent.localOnly)retainLocalRecovery({...intent,draftKey:key});return false;}
+    restoredAdmissions.current.add(identity);restoreIntent(intent,key);
+    setAdmissionRecoveries(previous=>previous.filter(x=>(x.clientMessageId||x.id)!==identity));
+    if(!intent.localOnly)try{await api.cancelQueuedMessage({id:intent.id});}catch{notify('已恢复到草稿；待发送记录仍保留，可手动移除。','info');}
+    window.dispatchEvent(new Event('muse-focus-composer'));return true;
+  };
+  const stop = () => {
+    const key=composerKey,admission=sendAdmissions.current.get(key),revision=modeRevisions.current.get(key)||0,targetRevision=recoveryEpoch.current,isRetry=admission?.phase==='retry';
+    const ids=new Set(data.pendingSends.filter(x=>x.chatId===chat?.id&&x.state==='queued').map(x=>x.clientMessageId).filter(Boolean));
+    for(const [identity,queued]of queuedAdmissions.current)if(queued.chatId===chat?.id)ids.add(identity);
+    if(chat?.messages.some(x=>x.status==='streaming')){const user=[...chat.messages].reverse().find(x=>x.role==='user'&&!x.isDeleted);if(user)ids.add(user.id);}
+    if(admission){admission.cancelled=true;if(!isRetry)ids.add(admission.id);}
+    const cancel=admission&&!isRetry?Promise.resolve().then(()=>api.cancelSendAdmission({clientMessageId:admission.id,...(admission.chatId?{chatId:admission.chatId}:{})})):Promise.resolve(null);
+    const requestId=data.activeRequests?.find(x=>x.chatId===chat?.id)?.requestId;
+    const stopping=chat?Promise.resolve().then(()=>api.stopGeneration({chatId:chat.id,clientMessageIds:[...ids],...(requestId?{requestId}:{})})):Promise.resolve(null);
+    // Before createChat returns, this UI has never called sendMessage. Restore
+    // locally now; the cancelled token fences its eventual continuation.
+    if(admission?.phase==='create'&&!admission.annotation)void recoverCancelled(admission.intent,admission.restoreKey,admission.modeRevision,targetRevision);
+    const pending=Promise.allSettled([cancel,stopping]).then(async results=>{
+      const first=results[0].status==='fulfilled'?results[0].value:null,global=results[1].status==='fulfilled'?results[1].value:null;
+      for(const result of results)if(result.status==='rejected')notify(result.reason?.message||'停止结果尚未确认，请查看消息记录。','error');
+      if(first?.state==='cancelled'&&admission?.chatId)clearAdmissionPending(admission.chatId,admission);
+      if(global?.state==='cancelled'&&chat)clearAdmissionPending(chat.id,admission);
+      const recovered=[...(first?.recoverable||[]),...(global?.recoverable||[])];
+      for(const identity of ids)queuedAdmissions.current.delete(identity);
+      for(const intent of recovered){const own=admission&&intent.clientMessageId===admission.id;if(own&&admission.annotation)continue;await recoverCancelled(intent,own?admission.restoreKey:`chat:${intent.chatId}`,own?admission.modeRevision:revision,targetRevision);}
+      if(admission&&first?.state==='cancelled'&&first.unseen&&!admission.annotation&&!isRetry)await recoverCancelled(admission.intent,admission.restoreKey,admission.modeRevision,targetRevision);
+      return first||global||{state:'uncertain'};
+    });
+    if(admission){admission.cancelPromise=pending;releaseAdmission(admission);}return pending;
+  };
   const draftOccupied = key => !!(draftState.current.drafts[key]?.trim() || draftState.current.attachments[key]?.length || draftState.current.artifactDraftContexts[key] || draftState.current.panelDraftContexts[key] || draftState.current.quotes[key]);
   const restoreIntent = (intent,key,prepend=false) => {
     const previous=draftState.current;
@@ -554,6 +624,7 @@ function App() {
         if(preserve&&draftOccupied(key))throw new Error('恢复期间草稿已有新内容，原消息仍保留在待发送列表。');
         const hasDraft = !!draftState.current.drafts[key]?.trim() || (draftState.current.attachments[key] || []).length > 0;
         restoreIntent(intent,key);
+        restoredAdmissions.current.add(intent.clientMessageId||intent.id);
         if (!hasDraft && (modeRevisions.current.get(key) || 0) === modeRevision) setAgentModes(previous => ({ ...previous, [key]: intent.useTools }));
         if(preserve&&!item.localOnly){try{await api.cancelQueuedMessage({id:item.id});}catch{notify('已恢复到草稿；待发送记录未移除，可以稍后手动移除。','info');return;}}
         notify('已恢复到草稿，可以修改后发送'); window.dispatchEvent(new Event('muse-focus-composer'));
@@ -562,7 +633,14 @@ function App() {
     } catch (error) { notify(error.message, 'error'); }
     finally{if(queueActions.current.get(item.id)===token)queueActions.current.delete(item.id);}
   };
-  const retry = async () => { if (!chat || busy) return; setPendingChats(previous => new Set(previous).add(chat.id)); try { await api.retryMessage({ chatId: chat.id }); } catch (error) { setPendingChats(previous => { const next = new Set(previous); next.delete(chat.id); return next; }); notify(error.message, 'error'); } };
+  const retry = async () => {
+    if(!chat||busy||sendAdmissions.current.has(composerKey))return;
+    const admission={id:crypto.randomUUID(),key:composerKey,restoreKey:composerKey,chatId:chat.id,phase:'retry',cancelled:false};
+    sendAdmissions.current.set(composerKey,admission);setAdmittingKeys(previous=>new Set(previous).add(composerKey));setPendingChats(previous=>new Set(previous).add(chat.id));
+    try{const receipt=await api.retryMessage({chatId:chat.id});if(admission.cancelled&&receipt?.requestId)await api.stopGeneration({chatId:chat.id,requestId:receipt.requestId,clientMessageIds:[]});}
+    catch(error){if(!admission.cancelled)notify(error.message,'error');}
+    finally{clearAdmissionPending(chat.id,admission);releaseAdmission(admission);}
+  };
   const saveEntity = async value => {
     if (value.kind === 'workspace') {
       const saved = value.id ? await api.updateWorkspace({ id: value.id, name: value.name, description: value.description, color: value.color }) : await api.createWorkspace({ name: value.name, description: value.description, color: value.color });

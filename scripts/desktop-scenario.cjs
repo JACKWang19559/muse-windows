@@ -44,6 +44,10 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await new Promise(r=>setTimeout(r,300));
     await window.webContents.capturePage().then(image=>fs.writeFileSync(path.join(folder,'settings.png'),image.toPNG()));
     await page(()=>Array.from(document.querySelectorAll('.settings-footer button')).find(x=>x.textContent==='关闭').click());
+    if(process.env.MUSE_E2E_SCENARIO==='cancel-admission'){
+      await require('./cancel-admission-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+      fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'cancel admission only',provider:'local deterministic HTTP test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
+    }
     if(process.env.MUSE_E2E_SCENARIO==='knowledge'){
       await require('./knowledge-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
       fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'knowledge only',provider:'local deterministic test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
@@ -230,6 +234,7 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     check('Stale approval cannot be replayed through the real isolated IPC',staleDenied);
     await require('./chat-lifecycle-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./queue-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+    await require('./cancel-admission-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./artifact-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./artifact-editing-scenario.cjs')({window,store,operations,folder,page,wait,check,fill});
     await require('./artifact-annotation-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
@@ -244,7 +249,7 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     app.exit(0);
   } catch(error) {
     try { await window.webContents.capturePage().then(image=>fs.writeFileSync(path.join(folder,'failure.png'),image.toPNG())); } catch {}
-    fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:false,checks,error:error.stack},null,2));
+    fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:false,checks,check_count:checks.length,error:error.stack},null,2));
     throw error;
   }
 };

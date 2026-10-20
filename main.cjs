@@ -46,6 +46,11 @@ const active = new Map();
 const pendingApprovals = new Map();
 const sendOutbox = new MessageOutbox();
 const pendingSends = new Map();
+// Cancellation identities outlive IPC responses. Never evict a cancelled ID:
+// a delayed send must remain rejected, even after the draft was restored.
+const sendAdmissions = new Map();
+const MAX_SEND_ADMISSIONS = 16384;
+let sendAdmissionSequence = 0;
 let shuttingDown = false;
 let quitRequested = false;
 let latestNotificationChatId=null;
@@ -65,7 +70,7 @@ function snapshot() {
     const job = active.get(chat.id), message = job && chat.messages.find(message => message.id === job.messageId);
     if (message?.status === 'streaming') message.content = job.content;
   }
-  return { ...value, approvals: [...pendingApprovals.values()].map(entry => entry.public), pendingSends: [...pendingSends.values()].map(entry => ({ ...entry.public, attachmentIds: [...entry.public.attachmentIds] })), app: { version: app.getVersion(), platform: process.platform, canLaunchAtLogin:!testMode&&!!app.isPackaged&&process.platform==='win32', launchAtLogin:!testMode&&!!app.getLoginItemSettings?.({path:process.execPath,args:['--background']})?.openAtLogin,backgroundTrayActive:!!tray&&!tray.isDestroyed() } };
+  return { ...value, activeRequests: [...active].map(([chatId, job]) => ({ chatId, requestId: job.requestId })), approvals: [...pendingApprovals.values()].map(entry => entry.public), pendingSends: [...pendingSends.values()].map(entry => ({ ...entry.public, attachmentIds: [...entry.public.attachmentIds] })), app: { version: app.getVersion(), platform: process.platform, canLaunchAtLogin:!testMode&&!!app.isPackaged&&process.platform==='win32', launchAtLogin:!testMode&&!!app.getLoginItemSettings?.({path:process.execPath,args:['--background']})?.openAtLogin,backgroundTrayActive:!!tray&&!tray.isDestroyed() } };
 }
 function emit(event) {
   if (window && !window.isDestroyed()) window.webContents.send('muse:event', event);
@@ -173,7 +178,7 @@ async function executeScheduled({schedule,run,signal,controller,markDispatched,o
   if(current.revision!==schedule.revision)throw Object.assign(new Error('计划范围已变化，本次没有发送。'),{pauseSchedule:true});
   const reservation=sendOutbox.reserve({bytes:Buffer.byteLength(schedule.prompt),laneKey:run.chatId,signal});
   if(!reservation||!reservation.beginAttempt()){reservation?.release();throw new Error('模型请求队列已满，本次没有发送。');}
-  const job={requestId:run.id,controller,reservation,workspaceId:schedule.workspaceId,messageId:run.messageId,content:'',toolTrace:[],agentMode:!!schedule.authorization.allowReadTools,scheduledRunId:run.id};
+  const job={requestId:run.id,controller,reservation,workspaceId:schedule.workspaceId,messageId:run.messageId,content:'',toolTrace:[],dispatched:false,agentMode:!!schedule.authorization.allowReadTools,scheduledRunId:run.id};
   active.set(run.chatId,job);refresh();
   const savePartial=()=>{if(active.get(run.chatId)!==job)return;try{if(findChat(run.chatId))store.updateMessage(run.chatId,job.messageId,{content:job.content,...(job.agentMode?{toolTrace:cancelToolTrace(job.toolTrace)}:{})});}catch{/* The durable run finalizer will also attempt to save its terminal state. */}};
   signal.addEventListener('abort',savePartial,{once:true});
@@ -185,7 +190,8 @@ async function executeScheduled({schedule,run,signal,controller,markDispatched,o
     const appRuntime=createArtifactRuntime({store,workspaceId:schedule.workspaceId,signal});
     const runtime=job.agentMode?readOnlyRuntime([fileRuntime,appRuntime]):null;
     markDispatched();
-    return await runAgentConversation({provider,settings,apiKey,messages,runtime,signal,onText:({delta,content})=>{
+    const scheduledProvider={...provider,streamCompletion:options=>{if(signal.aborted||active.get(run.chatId)!==job)throw Object.assign(new Error('已停止生成'),{name:'AbortError'});job.dispatched=true;return provider.streamCompletion(options);}};
+    return await runAgentConversation({provider:scheduledProvider,settings,apiKey,messages,runtime,signal,onText:({delta,content})=>{
       if(signal.aborted||active.get(run.chatId)!==job)return;job.content=content;emit({type:'chat-delta',chatId:run.chatId,messageId:run.messageId,delta,content});
     },onTrace:({trace,content})=>{if(job.agentMode)persistJobTrace(run.chatId,job,trace,content);else{job.content=content;if(active.get(run.chatId)===job&&findChat(run.chatId))store.updateMessage(run.chatId,job.messageId,{content});}}});
   }catch(error){
@@ -290,17 +296,95 @@ function contextMessages(chat, excludedId, settings, all) {
 function releaseSend(job) { job.reservation.release(); }
 function providerRevision() { const settings = store.settings(); return crypto.createHash('sha256').update(JSON.stringify([settings.baseUrl, settings.model, settings.systemPrompt, settings.temperature, store.secret()])).digest('hex'); }
 function hasQueuedSend(chatId) { return [...pendingSends.values()].some(entry => entry.public.chatId === chatId && entry.public.state === 'queued'); }
-function cancelQueuedSends(chatId, reason, remove = false) {
-  for (const [queueId, entry] of pendingSends) if (entry.public.chatId === chatId) {
-    entry.reservation.cancel(reason);
-    if (remove) pendingSends.delete(queueId);
-    else { entry.public.state = 'failed'; entry.public.error = reason === 'user_cancelled' ? '已停止等待发送，可恢复为草稿。' : '对话范围已变化，本条没有发送，可恢复为草稿。'; }
+function admissionError(message, code = 'send_admission_cancelled') { return Object.assign(new Error(message), { code }); }
+function admissionId(value) { const result = id(value); if (!result.trim()) throw new Error('发送身份无效。'); return result; }
+function copySendIntent(entry) { return JSON.parse(JSON.stringify(entry.public)); }
+function orderedRecoveries(items) {
+  return [...new Map(items.map(item => [item.id, item])).values()].sort((a, b) => (sendAdmissions.get(a.clientMessageId)?.ordinal ?? Number.MAX_SAFE_INTEGER) - (sendAdmissions.get(b.clientMessageId)?.ordinal ?? Number.MAX_SAFE_INTEGER));
+}
+function registerSendAdmission(clientMessageId, chatId) {
+  const previous = sendAdmissions.get(clientMessageId);
+  if (previous) {
+    if (previous.state === 'cancelled') throw admissionError('这次发送已取消，请使用恢复后的草稿重新发送。');
+    throw admissionError('这次发送已提交，请勿重复发送。', 'send_admission_duplicate');
   }
+  if (sendAdmissions.size >= MAX_SEND_ADMISSIONS) throw admissionError('本次运行的发送身份已达上限，请重新打开工作台后继续。', 'send_admission_capacity');
+  const record = { clientMessageId, chatId, ordinal: ++sendAdmissionSequence, state: 'preparing', unseen: false, job: null, recoveryId: null };
+  sendAdmissions.set(clientMessageId, record); return record;
+}
+function cancelQueuedEntry(entry, reason) {
+  if (entry.public.state !== 'queued') return false;
+  entry.reservation.cancel(reason);
+  entry.public.state = 'failed'; entry.public.error = reason === 'user_cancelled' ? '已停止等待发送，可恢复为草稿。' : '对话范围已变化，本条没有发送，可恢复为草稿。';
+  if (entry.admission && reason === 'user_cancelled') { entry.admission.state = 'cancelled'; entry.admission.recoveryId = entry.public.id; }
+  return true;
+}
+function cancelQueuedSends(chatId, reason, remove = false) {
+  const recoverable = [];
+  for (const [queueId, entry] of pendingSends) if (entry.public.chatId === chatId) {
+    if (remove) { entry.reservation.cancel(reason); pendingSends.delete(queueId); }
+    else if (cancelQueuedEntry(entry, reason) && reason === 'user_cancelled') recoverable.push(copySendIntent(entry));
+  }
+  return recoverable;
+}
+function cancelAdmissionJob(job) {
+  // Scheduled jobs and retries do not represent a new restorable user intent.
+  if (!job.admission || job.retry) { job.controller.abort(); return { state: job.dispatched ? 'dispatched' : 'uncertain', recoverable: [] }; }
+  const record = job.admission;
+  if (job.dispatched) { job.controller.abort(); return { state: 'dispatched', recoverable: [] }; }
+  job.cancelledBeforeDispatch = true; job.controller.abort();
+  let restored = false;
+  try {
+    store.rollbackUnsentMessages({ chatId: record.chatId, messageIds: job.admissionIds });
+    restored = true;
+  } catch {
+    // No proof of rollback means no second copy of this user intent is exposed.
+    if (job.messageId && findChat(record.chatId)) {
+      try { store.updateMessage(record.chatId, job.messageId, { content: job.content, status: 'cancelled', error: '' }); } catch {}
+    }
+  }
+  if (active.get(record.chatId) === job) active.delete(record.chatId);
+  releaseSend(job); record.job = null;
+  if (!restored) { record.state = 'uncertain'; return { state: 'uncertain', recoverable: [] }; }
+  const queueId = job.reservation.id;
+  const entry = { controller: job.controller, reservation: job.reservation, input: job.intent, workspaceId: job.workspaceId, selection: job.selection, admission: record,
+    public: { id: queueId, ...job.intent, workspaceId: job.workspaceId, profileId: job.selection.profileId, queuedAt: new Date().toISOString(), state: 'failed', error: '已取消本地提交，可恢复为草稿。' } };
+  pendingSends.set(queueId, entry); record.state = 'cancelled'; record.recoveryId = queueId;
+  return { state: 'cancelled', recoverable: [copySendIntent(entry)] };
+}
+function cancelSendAdmission(input) {
+  const clientMessageId = admissionId(input.clientMessageId), chatId = input.chatId == null ? null : id(input.chatId);
+  let record = sendAdmissions.get(clientMessageId);
+  if (!record) {
+    // Persisted identities from a previous process cannot be treated as unseen.
+    const prior = store.snapshot().chats.find(chat => chat.messages.some(message => message.id === clientMessageId));
+    if (prior) {
+      if (chatId != null && prior.id !== chatId) throw new Error('取消操作不属于这次发送的对话。');
+      return { clientMessageId, state: 'settled', unseen: false, recoverable: [] };
+    }
+    if (sendAdmissions.size >= MAX_SEND_ADMISSIONS) throw admissionError('本次运行的发送身份已达上限，请重新打开工作台后继续。', 'send_admission_capacity');
+    record = { clientMessageId, chatId, ordinal: ++sendAdmissionSequence, state: 'cancelled', unseen: true, job: null, recoveryId: null };
+    sendAdmissions.set(clientMessageId, record);
+    return { clientMessageId, state: 'cancelled', unseen: true, recoverable: [] };
+  }
+  if (chatId != null && record.chatId != null && record.chatId !== chatId) throw new Error('取消操作不属于这次发送的对话。');
+  let result;
+  const queued = record.recoveryId && pendingSends.get(record.recoveryId);
+  if (record.job && active.get(record.chatId) === record.job) result = cancelAdmissionJob(record.job);
+  else if (queued && queued.public.state === 'queued') {
+    cancelQueuedEntry(queued, 'user_cancelled'); result = { state: 'cancelled', recoverable: [copySendIntent(queued)] };
+  } else if (record.state === 'cancelled') result = { state: 'cancelled', recoverable: queued ? [copySendIntent(queued)] : [] };
+  else result = { state: record.state === 'dispatched' ? 'dispatched' : record.state === 'uncertain' ? 'uncertain' : 'settled', recoverable: [] };
+  refresh(); return { clientMessageId, unseen: record.unseen, ...result };
 }
 async function submitMessage(input) {
   const chatId = id(input.chatId);
   if (shuttingDown) throw new Error('程序正在关闭，请稍后重新打开。');
-  if (!active.has(chatId) && !hasQueuedSend(chatId)) return startGeneration(input);
+  const clientMessageId = input.clientMessageId == null ? crypto.randomUUID() : admissionId(input.clientMessageId);
+  const admission = registerSendAdmission(clientMessageId, chatId);
+  input = { ...input, clientMessageId };
+  if (pendingSends.size >= 32) throw new Error('待发送消息已达上限，请先处理现有消息。');
+  if (!active.has(chatId) && !hasQueuedSend(chatId)) return startGeneration(input, false, null, admission);
   endpointConfigured();
   const chat = store.getChat(chatId), content = text(input.content || '').trim();
   const attachmentIds = Array.isArray(input.attachmentIds) ? [...new Set(input.attachmentIds.map(id))].slice(0, 20) : [];
@@ -308,7 +392,6 @@ async function submitMessage(input) {
   if (input.useTools != null && typeof input.useTools !== 'boolean') throw new Error('工作区助手开关无效。');
   for (const fileId of attachmentIds) store.getFile(fileId);
   const replyToMessageId = input.replyToMessageId == null ? null : id(input.replyToMessageId);
-  const clientMessageId = input.clientMessageId == null ? null : id(input.clientMessageId);
   if (replyToMessageId && !chat.messages.some(message => message.id === replyToMessageId && !message.isDeleted && message.status !== 'streaming')) throw new Error('引用消息不存在或仍在生成。');
   if (pendingSends.size >= 32) throw new Error('待发送消息已达上限，请先处理现有消息。');
   const selection=selectedContext(chat,!!input.useTools);
@@ -319,7 +402,8 @@ async function submitMessage(input) {
   const reservation = sendOutbox.reserve({ bytes: Buffer.byteLength(JSON.stringify(payload)), laneKey: chatId, signal: controller.signal });
   if (!reservation) throw new Error('发送队列已满，请稍后重试。');
   const queueId = reservation.id;
-  const entry = { controller, reservation, input: payload, revision, selection, workspaceId: chat.workspaceId, public: { id: queueId, ...payload, queuedAt: new Date().toISOString(), state: 'queued' } };
+  const entry = { controller, reservation, input: payload, revision, selection, workspaceId: chat.workspaceId, admission, public: { id: queueId, ...payload, workspaceId: chat.workspaceId, profileId: selection.profileId, queuedAt: new Date().toISOString(), state: 'queued' } };
+  admission.state = 'queued'; admission.recoveryId = queueId;
   pendingSends.set(queueId, entry); refresh();
   // Chat Completions has no separate durable send ACK. Windows serializes full
   // generations within each chat; other chats use independent lanes. This is
@@ -333,7 +417,7 @@ async function submitMessage(input) {
       if (!current || current.workspaceId !== entry.workspaceId || providerRevision() !== revision) throw new Error('工作区或模型连接已变化，本条没有发送，请恢复草稿后确认。');
       checkSelectedContext(chatId,selection);
       pendingSends.delete(queueId);
-      await startGeneration(payload, false, { controller, reservation });
+      await startGeneration(payload, false, { controller, reservation }, admission);
     } catch (error) {
       if (!shuttingDown && findChat(chatId) && !error.admittedToChat) {
         entry.public.state = 'failed'; entry.public.error ||= cleanError(error);
@@ -344,7 +428,7 @@ async function submitMessage(input) {
   })().catch(error => console.error('Pending send state:', cleanError(error)));
   return { queued: true, queueId, chatId };
 }
-async function startGeneration(input, retry = false, lease = null) {
+async function startGeneration(input, retry = false, lease = null, admission = null) {
   const chatId = id(input.chatId);
   if (active.has(chatId)) throw new Error('这个会话正在生成回复，请先停止。');
   const settings = endpointConfigured();
@@ -358,7 +442,8 @@ async function startGeneration(input, retry = false, lease = null) {
   if (!reservation) throw new Error('发送队列已满，请稍后重试。');
   if (!reservation.beginAttempt()) { reservation.release(); throw new Error('这次发送已取消或仍在等待。'); }
   const requestId = crypto.randomUUID();
-  const job = { requestId, controller, reservation, content: '', messageId: null, admissionIds: [], workspaceId: chat.workspaceId, toolTrace: [], agentMode: retry ? !!chat.messages.at(-1)?.agentMode : !!input.useTools };
+  const job = { requestId, controller, reservation, content: '', messageId: null, admissionIds: [], workspaceId: chat.workspaceId, toolTrace: [], retry, admission, dispatched: false, cancelledBeforeDispatch: false, agentMode: retry ? !!chat.messages.at(-1)?.agentMode : !!input.useTools };
+  if (admission) { admission.job = job; admission.state = 'preparing'; }
   active.set(chatId, job);
   try {
     job.selection=selectedContext(chat,job.agentMode);
@@ -372,6 +457,7 @@ async function startGeneration(input, retry = false, lease = null) {
       if (!content && !attachmentIds.length) throw new Error('请写点内容或添加文件。');
       for (const fileId of attachmentIds) if (!store.getFile(fileId)) throw new Error('附件不存在，请重新选择。');
       const userMessageId = input.clientMessageId == null ? crypto.randomUUID() : id(input.clientMessageId);
+      job.intent = { chatId, clientMessageId: userMessageId, content, attachmentIds, useTools: job.agentMode, ...(artifactContext ? { artifactContext } : {}), ...(activePanel ? { activePanel } : {}), ...(input.replyToMessageId != null ? { replyToMessageId: id(input.replyToMessageId) } : {}) };
       store.appendMessage(chatId, { id: userMessageId, role: 'user', content: content || '请分析我提供的文件。', attachmentIds, createdAt: new Date().toISOString(), status: 'complete', ...(artifactContext ? { artifactContext } : {}), ...(activePanel ? { activePanel } : {}), ...(input.replyToMessageId != null ? { replyToMessageId: id(input.replyToMessageId) } : {}) });
       job.admissionIds.push(userMessageId);
       chat = store.getChat(chatId);
@@ -428,8 +514,14 @@ async function startGeneration(input, retry = false, lease = null) {
     if(runtime)messages[0].content+='\n知识工具只访问当前工作区或显式选择的记忆。memory_search 使用明确构建的本地关键词索引；missing/stale/failed 不表示没有结果。记忆写入和删除需逐次批准。技能内容仅为用户提供的参考说明，不授予工具或文件访问权限。';
     refresh();
     const run = async () => {
+      if (job.cancelledBeforeDispatch) return;
       try {
-        const guardedProvider={...provider,streamCompletion:options=>{checkSelectedContext(chatId,job.selection);return provider.streamCompletion(options);}};
+        const guardedProvider={...provider,streamCompletion:options=>{
+          if (job.cancelledBeforeDispatch || controller.signal.aborted) throw Object.assign(new Error('已停止生成'), { name: 'AbortError' });
+          checkSelectedContext(chatId,job.selection);
+          job.dispatched = true; if (admission) admission.state = 'dispatched';
+          return provider.streamCompletion(options);
+        }};
         const output = await runAgentConversation({ provider:guardedProvider, settings, apiKey, messages, runtime, signal: controller.signal,
           onText: ({ delta, content }) => {
             if (controller.signal.aborted || active.get(chatId) !== job) return;
@@ -448,13 +540,14 @@ async function startGeneration(input, retry = false, lease = null) {
           store.updateMessage(chatId, job.messageId, { content: job.content, status: cancelled ? 'cancelled' : 'error', error: message });
           emit({ type: cancelled ? 'chat-cancelled' : 'chat-error', chatId, messageId: job.messageId, error: message, chat: store.getChat(chatId) });
         }
-      } finally { if (active.get(chatId) === job) active.delete(chatId); releaseSend(job); refresh(); }
+      } finally { if (active.get(chatId) === job) active.delete(chatId); if (admission) { admission.job = null; if (!['cancelled','uncertain'].includes(admission.state)) admission.state = 'settled'; } releaseSend(job); refresh(); }
     };
     setImmediate(() => { run().catch(error => { if (active.get(chatId) === job) active.delete(chatId); console.error('Generation state could not be saved:', cleanError(error, [apiKey])); }); });
     return { requestId };
   } catch (error) {
     active.delete(chatId);
     releaseSend(job);
+    if (admission) { admission.job = null; admission.state = 'settled'; }
     let admittedToChat = job.admissionIds.length > 0;
     if (!retry && admittedToChat) {
       try { store.rollbackUnsentMessages({ chatId, messageIds: job.admissionIds }); admittedToChat = false; job.messageId = null; refresh(); }
@@ -602,14 +695,36 @@ const operations = {
   },
   sendMessage: input => submitMessage(input),
   retryMessage: input => { if (hasQueuedSend(id(input.chatId))) throw new Error('请先处理待发送消息，再重新生成。'); return startGeneration(input, true); },
-  stopGeneration: input => { const chatId = id(input.chatId); active.get(chatId)?.controller.abort(); cancelQueuedSends(chatId, 'user_cancelled'); refresh(); },
+  cancelSendAdmission: input => cancelSendAdmission(input),
+  stopGeneration: input => {
+    const chatId = id(input.chatId);
+    if (input.clientMessageIds != null || input.clientMessageId != null || input.requestId != null) {
+      if (input.clientMessageIds != null && (input.clientMessageId != null || !Array.isArray(input.clientMessageIds) || input.clientMessageIds.length > 64)) throw new Error('停止发送的身份集合无效。');
+      const identities = [...new Set((input.clientMessageIds ?? (input.clientMessageId == null ? [] : [input.clientMessageId])).map(admissionId))];
+      const requestId = input.requestId == null ? null : admissionId(input.requestId), capturedJob = active.get(chatId);
+      const restorable = new Set();
+      for (const identity of identities) {
+        const record = sendAdmissions.get(identity), owner = record?.chatId ?? store.snapshot().chats.find(chat => chat.messages.some(message => message.id === identity))?.id;
+        if (owner != null && owner !== chatId) throw new Error('取消操作不属于这次发送的对话。');
+        if (record?.state === 'queued' || record?.job && !record.job.dispatched && !record.job.cancelledBeforeDispatch) restorable.add(identity);
+      }
+      const results = identities.map(clientMessageId => cancelSendAdmission({ clientMessageId, chatId }));
+      if (requestId != null && capturedJob?.requestId === requestId && active.get(chatId) === capturedJob) results.push(cancelAdmissionJob(capturedJob));
+      const recoverable = orderedRecoveries(results.flatMap(x => x.clientMessageId == null || restorable.has(x.clientMessageId) ? x.recoverable : []));
+      refresh(); return { state: results.some(x => x.state === 'uncertain') ? 'uncertain' : results.some(x => x.state === 'dispatched') ? 'dispatched' : 'cancelled', dispatched: results.some(x => x.state === 'dispatched'), recoverable };
+    }
+    const job = active.get(chatId), result = job ? cancelAdmissionJob(job) : { state: 'cancelled', recoverable: [] };
+    const recoverable = orderedRecoveries([...result.recoverable, ...cancelQueuedSends(chatId, 'user_cancelled')]);
+    refresh(); return { state: result.state, dispatched: result.state === 'dispatched', recoverable };
+  },
   cancelQueuedMessage: input => {
     if(input.preserveForRestore!=null&&typeof input.preserveForRestore!=='boolean')throw new Error('恢复待发送消息的参数无效。');
     const queueId = id(input.id), entry = pendingSends.get(queueId);
     if (!entry) throw new Error('这条消息已发送或已移出队列。');
     if(input.preserveForRestore===true){entry.public.state='failed';entry.public.error='已停止等待发送，消息仍保留，可恢复或移除。';}
     else pendingSends.delete(queueId);
-    entry.reservation.cancel('user_cancelled'); refresh(); return entry.public;
+    if (entry.admission) { entry.admission.state = 'cancelled'; entry.admission.recoveryId = queueId; }
+    entry.reservation.cancel('user_cancelled'); refresh(); return copySendIntent(entry);
   },
   respondApproval: input => {
     const approval = pendingApprovals.get(id(input.id));

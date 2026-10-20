@@ -89,12 +89,10 @@ module.exports = async ({ app, window, store, operations, folder, page, wait, ch
     check('Restoring into an existing draft merges content while retaining its current mode', await draft() === 'QUEUE_EXISTING_DRAFT_61\n\nQUEUE_MERGE_INTENT_61' && await mode() === false);
     await fill('composer-input', ''); await send('QUEUE_STOP_PRESERVED_61'); const failed = await queued(controls.id, 'QUEUE_STOP_PRESERVED_61');
     await stop(controls.id);
-    await wait(id => [...document.querySelectorAll('[data-testid="pending-send"]')].some(element => element.dataset.queueId === id && element.classList.contains('failed')), failed.id);
-    check('Stop retains waiting intents as failed recoverable rows without appending them', (await page(async id => (await window.muse.bootstrap()).pendingSends.find(item => item.id === id)?.state, failed.id)) === 'failed' && !store.getChat(controls.id).messages.some(message => message.content === 'QUEUE_STOP_PRESERVED_61'));
+    await wait(() => document.querySelector('[data-testid="composer-input"]').value === 'QUEUE_STOP_PRESERVED_61');await noPending(controls.id);
+    check('Stop automatically restores one unsent intent into the unchanged empty draft without appending it', await draft() === 'QUEUE_STOP_PRESERVED_61' && !store.getChat(controls.id).messages.some(message => message.content === 'QUEUE_STOP_PRESERVED_61'));
     await window.webContents.capturePage().then(image => fs.writeFileSync(path.join(folder, 'queue.png'), image.toPNG()));
-    await rowClick(failed.id, 'queue-restore'); await noPending(controls.id);
-    await wait(() => document.querySelector('[data-testid="composer-input"]').value === 'QUEUE_STOP_PRESERVED_61');
-    check('A stopped failed intent remains explicitly recoverable without automatic resubmission', await draft() === 'QUEUE_STOP_PRESERVED_61' && store.getChat(controls.id).messages.filter(message => message.role === 'user').length === 1);
+    check('Automatic Stop recovery removes only its restored queue record and never resubmits it', !(await page(async id => (await window.muse.bootstrap()).pendingSends.some(item => item.id === id), failed.id)) && store.getChat(controls.id).messages.filter(message => message.role === 'user').length === 1);
     await fill('composer-input', '');
 
     const admission = await fresh('队列验收 · 发送响应竞态'); await setMode(false);
