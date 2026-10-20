@@ -741,8 +741,8 @@ const operations = {
   importDroppedPaths: input => { if (!Array.isArray(input.paths) || input.paths.some(p => typeof p !== 'string')) throw new Error('拖入的文件无效。'); return addFiles(input.paths, input.workspaceId); },
   removeFile: input => { const fileId=id(input.id),affected=(store.snapshot().schedules||[]).filter(task=>task.attachmentIds.includes(fileId));store.removeFile(fileId);for(const task of affected)scheduler?.cancel(task.id);return refresh(); },
   createTextFile: async input => { const result = await store.createTextFile(input || {}); refresh(); return result; },
-  saveTextFile: input => { const result = store.saveTextFile(input || {}); refresh(); return result; },
-  readFile: input => store.readFile(id(input.id)),
+  saveTextFile: input => { const result = store.saveTextFile(input || {}); if (/\.(csv|tsv)$/i.test(result.file.name)) result.preview = store.readFile(result.file.id, { preserveCsvSource: true }); refresh(); return result; },
+  readFile: input => store.readFile(id(input.id), { preserveCsvSource: true }),
   exportFile: input => exportManagedFile({ store, input, chooseDestination: name => dialog.showSaveDialog(window, { title: '下载文件副本', defaultPath: name }) }),
   openFile: async input => {
     const target = store.filePath(id(input.id));

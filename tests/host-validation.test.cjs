@@ -1462,6 +1462,24 @@ test('managed file creation and edits refresh public state and subsequent model 
   assert.equal(host.operations.readFile({ id: result.file.id }).text, 'AFTER-EDIT');
 });
 
+test('CSV editor host reads and saves raw BOM and quoted CRLF while model readers stay normalized', async t => {
+  const host=fixture(t), original='\ufeffname,note\r\n"汉字","two\r\nlines"\r\n';
+  const source=path.join(host.dir,'source.csv');fs.writeFileSync(source,original,'utf8');const file=await host.store.addFile({sourcePath:source});
+  assert.equal(host.store.readFile(file.id).text,'name,note\n"汉字","two\nlines"\n');
+  const editor=host.operations.readFile({id:file.id});assert.equal(editor.text,original);assert.equal(editor.editable,true);assert.equal(editor.truncated,false);
+  const draft='\ufeffname,note\r\n"updated","two\r\nlines"\r\n';
+  const result=host.operations.saveTextFile({id:file.id,content:draft,expectedSha256:editor.sha256});
+  assert.equal(result.preview.text,draft);assert.equal(fs.readFileSync(host.store.filePath(file.id),'utf8'),draft);
+  assert.equal(host.store.readFile(file.id).text,'name,note\n"updated","two\nlines"\n');
+});
+
+test('CSV source preservation respects the character cap after normalized CRLF expansion', async t => {
+  const host=fixture(t), source=path.join(host.dir,'expanded.tsv');
+  fs.writeFileSync(source,'h\r\n'+'a\r\n'.repeat(70000),'utf8');const file=await host.store.addFile({sourcePath:source});
+  assert.equal(host.store.readFile(file.id).truncated,false);
+  const result=host.operations.readFile({id:file.id});assert.equal(result.truncated,true);assert.equal(result.editable,false);assert.equal(result.text.length,200000);assert(result.text.includes('\r\n'));
+});
+
 test('external links reject file, script and embedded credentials', async t => {
   const host = fixture(t);
   for (const url of ['file:///C:/secret.txt', 'javascript:alert(1)', 'https://user:pass@example.com/']) await assert.rejects(host.operations.openExternal(url));

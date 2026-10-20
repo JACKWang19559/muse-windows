@@ -630,12 +630,12 @@ class Store {
   }
   getFile(id) { return copy(publicFile(this._file(id))); }
   filePath(id) { return this._managedPath(this._file(id)._storedName, true); }
-  readFile(id) {
+  readFile(id, options = {}) {
     const item = this._file(id);
     if (item.textStatus !== 'ready') fail(item.error || '此文件格式不支持文字预览。');
     const filename = this._managedPath(item._textName, true), stat = fs.statSync(filename);
     if (stat.size > 4 * MAX_TEXT_CHARS + 16) fail('文件预览缓存无效。');
-    const text = fs.readFileSync(filename, 'utf8'), truncated = item._textTruncated || text.length > MAX_TEXT_CHARS;
+    let text = fs.readFileSync(filename, 'utf8'), truncated = item._textTruncated || text.length > MAX_TEXT_CHARS;
     const source = this._managedPath(item._storedName, true), sourceStat = fs.statSync(source);
     if (sourceStat.size > MAX_FILE_BYTES) fail('文件副本超出大小限制。');
     const bytes = fs.readFileSync(source);
@@ -644,6 +644,12 @@ class Store {
     let editable = false;
     if (!truncated && bytes.length <= MAX_EDITABLE_FILE_BYTES && TEXT_EXTENSIONS.has(describeFile(item.name).ext) && (!item._sha256 || item._sha256 === digest)) {
       try { editable = decodeEditableText(bytes) === text; } catch { /* Binary/non-UTF8 text remains preview-only. */ }
+    }
+    // The editor's CSV parser needs the original BOM and quoted line endings.
+    // Model/context readers keep the normalized extraction cache by default.
+    if (options.preserveCsvSource === true && editable && /\.(csv|tsv)$/i.test(item.name)) {
+      text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+      if (text.length > MAX_TEXT_CHARS) { truncated = true; editable = false; }
     }
     return { name: item.name, text: text.slice(0, MAX_TEXT_CHARS), truncated, sha256: digest, editable };
   }
