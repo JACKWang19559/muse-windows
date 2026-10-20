@@ -1,0 +1,155 @@
+'use strict';
+const fs=require('node:fs'),path=require('node:path');
+module.exports=async({window,store,operations,folder,page,wait,check,fill})=>{
+  const entered=async predicate=>{const until=Date.now()+5000;while(Date.now()<until){if(predicate())return;await new Promise(resolve=>setTimeout(resolve,40));}throw Error('Synthetic deferred annotation boundary was not reached');};
+  const workspace=await page(()=>window.muse.createWorkspace({name:'页面选区验收'}));
+  const artifact=await page(workspaceId=>window.muse.createArtifact({workspaceId,name:'选区演示页面',runtime:'html'}),workspace.id);
+  const source='<html><head><style>body{margin:0;padding:30px;font-family:system-ui}button{padding:20px;white-space:pre-wrap}</style></head><body><main><h1>应用选区</h1><button id="selected-action" class="one two three four" onclick="window.authoredClicks=(window.authoredClicks||0)+1"><span>ELEMENT_CONTEXT_TOKEN</span></button><input value="PRIVATE_INPUT_VALUE_NOT_CONTEXT"></main></body></html>';
+  await page(input=>window.muse.writeArtifactFiles(input),{id:artifact.id,expectedRevision:artifact.sourceRevision,files:[{path:'index.html',text:source}]});
+  await page(input=>window.muse.buildArtifact(input),{id:artifact.id,expectedRevision:artifact.sourceRevision+1});
+  const chat=await page(workspaceId=>window.muse.createChat({workspaceId,title:'选区对话验收'}),workspace.id);
+  await wait(()=>Array.from(document.querySelectorAll('.sidebar-chat-main')).some(el=>el.title==='选区对话验收'));
+  await page(()=>Array.from(document.querySelectorAll('.sidebar-chat-main')).find(el=>el.title==='选区对话验收').click());
+  await fill('composer-input','KEEP_EXISTING_COMPOSER_DRAFT');
+  const frameFor=()=>window.webContents.mainFrame.frames.find(frame=>frame.url.startsWith('muse-preview:'));
+  const inFrame=async fn=>{const frame=frameFor();if(!frame)throw Error('Missing annotation preview frame');return frame.executeJavaScript(`(${fn.toString()})()`);};
+  const open=async()=>{
+    await page(()=>document.querySelector('[data-testid="artifacts-open"]').click());
+    await wait(()=>!!document.querySelector('[data-testid="artifact-panel"]'));
+    await page(id=>document.querySelector(`[data-artifact-id="${id}"]`).click(),artifact.id);
+    await wait(()=>document.querySelector('[data-testid="artifact-pick"]')?.disabled===false);
+  };
+  const pick=async()=>{
+    await page(()=>document.querySelector('[data-testid="artifact-pick"]').click());
+    window.show();window.restore();window.focus();window.webContents.focus();
+    await new Promise(resolve=>setTimeout(resolve,150));
+    const outer=await page(()=>{const e=document.querySelector('[data-testid="artifact-frame"]'),r=e.getBoundingClientRect();return {x:r.x+e.clientLeft,y:r.y+e.clientTop};});
+    const inner=await inFrame(()=>{const r=document.querySelector('#selected-action span').getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2};});
+    const point={x:Math.round(outer.x+inner.x),y:Math.round(outer.y+inner.y)};
+    // Chromium's input protocol routes into the offscreen cross-origin frame;
+    // DOM .click() above deliberately remains an untrusted negative control.
+    const debug=window.webContents.debugger,owned=!debug.isAttached();
+    if(owned)debug.attach('1.3');
+    try{
+      const targets=await debug.sendCommand('Target.getTargets'),target=targets.targetInfos.find(target=>target.type==='iframe'&&target.url===frameFor().url);
+      const session=target?(await debug.sendCommand('Target.attachToTarget',{targetId:target.targetId,flatten:true})).sessionId:undefined;
+      const coordinates=session?inner:point;
+      fs.writeFileSync(path.join(folder,'annotation-input-target.json'),JSON.stringify({childTarget:!!session,mainPoint:point,coordinates},null,2));
+      await debug.sendCommand('Input.dispatchMouseEvent',{type:'mouseMoved',...coordinates},session);
+      await debug.sendCommand('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',buttons:1,clickCount:1,...coordinates},session);
+      await debug.sendCommand('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',buttons:0,clickCount:1,...coordinates},session);
+    }finally{if(owned)debug.detach();}
+    try{await wait(()=>!!document.querySelector('[data-testid="artifact-annotation"]'));}catch(error){fs.writeFileSync(path.join(folder,'annotation-pointer-diagnostic.json'),JSON.stringify({point,outer,inner,windowFocused:window.isFocused(),visible:window.isVisible(),minimized:window.isMinimized(),frame:await inFrame(()=>({viewport:[innerWidth,innerHeight],focused:document.hasFocus(),clicks:window.authoredClicks||0}))},null,2));throw error;}
+  };
+  window.show();window.restore();await new Promise(resolve=>setTimeout(resolve,200));
+  await open();
+  await page(()=>document.querySelector('[data-testid="artifact-pick"]').click());
+  await inFrame(()=>document.querySelector('#selected-action').click());
+  await new Promise(resolve=>setTimeout(resolve,100));
+  check('Authored synthetic clicks cannot manufacture a trusted preview selection',!(await page(()=>!!document.querySelector('[data-testid="artifact-annotation"]'))));
+  // Exit the still-active picker before using the shared trusted pointer path.
+  await page(()=>document.querySelector('[data-testid="artifact-pick"]').click());
+  await pick();
+  check('Real pointer input captures a semantic ancestor through the opaque preview port',await page(()=>document.querySelector('[data-testid="artifact-annotation"]').textContent.includes('ELEMENT_CONTEXT_TOKEN')));
+  check('Selecting a preview element suppresses its authored click action',await inFrame(()=>(window.authoredClicks||0)===1));
+  await page(()=>document.querySelector('[data-testid="artifact-annotation-note"]').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})));
+  await wait(()=>!document.querySelector('[data-testid="artifact-annotation"]'));
+  check('Escape dismisses the page note without adding a chat message',store.getChat(chat.id).messages.length===0);
+  await pick();await page(()=>document.querySelector('[data-testid="artifact-code"]').focus());
+  await wait(()=>!document.querySelector('[data-testid="artifact-annotation"]'));
+  check('Focusing outside the annotation card clears its local selection',store.getChat(chat.id).messages.length===0);
+  await pick();
+  const note='ANNOTATION_DEMO adjust the selected button';
+  await fill('artifact-annotation-note',note);
+  const controlsVisible=await wait(()=>{const e=document.querySelector('[data-testid="artifact-annotation-send"]');if(!e)return false;const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&r.top>=0&&r.bottom<=innerHeight;});
+  check('Page annotation controls remain visible inside the preview workbench',controlsVisible);
+  await new Promise(resolve=>setTimeout(resolve,150));
+  await window.webContents.capturePage().then(image=>fs.writeFileSync(path.join(folder,'artifact-annotation.png'),image.toPNG()));
+  await page(()=>{const button=document.querySelector('[data-testid="artifact-annotation-send"]');button.click();button.click();});
+  await wait(()=>!document.querySelector('[data-testid="artifact-panel"]'));
+  const complete=await wait(async id=>{const c=(await window.muse.bootstrap()).chats.find(c=>c.id===id);return c?.messages.at(-1)?.status==='complete'?c:null;},chat.id);
+  const selected=complete.messages.find(message=>message.role==='user'&&message.content===note),context=selected?.artifactContext;
+  check('Annotation uses the current chat and stores the visible note separately from page context',!!selected&&context?.artifactId===artifact.id&&context.buildId&&selected.content===note&&complete.messages.filter(message=>message.role==='user').length===1);
+  check('Host-derived build context preserves element descriptors without reading form values',context.sourceRevision===artifact.sourceRevision+1&&context.pagePath==='index.html'&&context.element.tag==='button'&&context.element.id==='selected-action'&&context.element.classes.join(' ')==='one two three'&&context.element.path.includes('body > main > button')&&!JSON.stringify(context).includes('PRIVATE_INPUT_VALUE_NOT_CONTEXT'));
+  check('The configured local model receives the recovered hidden-context sections as user reference data',complete.messages.at(-1).content.includes('ANNOTATION_CONTEXT_RECEIVED'));
+  check('Annotation leaves the ordinary composer draft intact and displays a page-reference badge',await page(()=>document.querySelector('[data-testid="composer-input"]').value==='KEEP_EXISTING_COMPOSER_DRAFT'&&!!document.querySelector('[data-testid="message-artifact-context"]')));
+  await fill('composer-input','取消 ANNOTATION_QUEUE_HOLD');await page(()=>document.querySelector('[data-testid="send-message"]').click());
+  await wait(async id=>(await window.muse.bootstrap()).chats.find(c=>c.id===id).messages.at(-1)?.status==='streaming',chat.id);
+  await open();await pick();await fill('artifact-annotation-note','ANNOTATION_DEMO queued page feedback');
+  await page(()=>document.querySelector('[data-testid="artifact-annotation-send"]').click());
+  const queued=await wait(async id=>(await window.muse.bootstrap()).pendingSends.find(row=>row.chatId===id),chat.id);
+  check('Busy-chat admission retains the selected build and element in the normal pending send',queued.artifactContext?.artifactId===artifact.id&&queued.content==='ANNOTATION_DEMO queued page feedback');
+  await page(id=>window.muse.stopGeneration({chatId:id}),chat.id);
+  await wait(async id=>(await window.muse.bootstrap()).pendingSends.find(row=>row.id===id)?.state==='failed',queued.id);
+  await fill('composer-input','EXISTING_DRAFT_MUST_SURVIVE');
+  await page(id=>document.querySelector(`[data-queue-id="${id}"] [data-testid="queue-restore"]`).click(),queued.id);
+  await new Promise(resolve=>setTimeout(resolve,100));
+  check('Restoring annotated feedback refuses to overwrite an occupied composer',await page(async id=>(await window.muse.bootstrap()).pendingSends.some(row=>row.id===id)&&document.querySelector('[data-testid="composer-input"]').value==='EXISTING_DRAFT_MUST_SURVIVE',queued.id));
+  await fill('composer-input','');
+  const originalCancel=operations.cancelQueuedMessage;let restoreEntered=false,releaseRestore;const restoreGate=new Promise(resolve=>{releaseRestore=resolve;});
+  operations.cancelQueuedMessage=async input=>{const result=await originalCancel(input);if(input.preserveForRestore){restoreEntered=true;await restoreGate;}return result;};
+  try{
+    await page(id=>document.querySelector(`[data-queue-id="${id}"] [data-testid="queue-restore"]`).click(),queued.id);
+    await entered(()=>restoreEntered);await fill('composer-input','NEW_DRAFT_DURING_RESTORE');releaseRestore();
+    await wait(()=>Array.from(document.querySelectorAll('[role="status"]')).some(el=>el.textContent.includes('原消息仍保留')));
+    check('Deferred queue recovery preserves new typing and leaves the annotated intent recoverable',await page(async id=>document.querySelector('[data-testid="composer-input"]').value==='NEW_DRAFT_DURING_RESTORE'&&!document.querySelector('[data-testid="composer-artifact-context"]')&&(await window.muse.bootstrap()).pendingSends.some(row=>row.id===id&&row.artifactContext),queued.id));
+  }finally{releaseRestore();operations.cancelQueuedMessage=originalCancel;}
+  await fill('composer-input','');await page(id=>document.querySelector(`[data-queue-id="${id}"] [data-testid="queue-restore"]`).click(),queued.id);
+  await wait(()=>!!document.querySelector('[data-testid="composer-artifact-context"]'));
+  check('A recovered pending draft visibly retains its page selection after the preview closes',await page(()=>document.querySelector('[data-testid="composer-input"]').value==='ANNOTATION_DEMO queued page feedback'&&document.querySelector('[data-testid="composer-artifact-context"]').textContent.includes('ELEMENT_CONTEXT_TOKEN')));
+  await page(()=>document.querySelector('[data-testid="send-message"]').click());
+  await wait(async id=>{const c=(await window.muse.bootstrap()).chats.find(c=>c.id===id);return c.messages.at(-1)?.status==='complete'&&c.messages.at(-1).content.includes('ANNOTATION_CONTEXT_RECEIVED');},chat.id);
+  check('Restored feedback resends the immutable page context through normal chat admission',store.getChat(chat.id).messages.filter(message=>message.artifactContext).length===2);
+  await open();await pick();
+  const before=frameFor().url,current=store.getArtifact(artifact.id);
+  await page(input=>window.muse.writeArtifactFiles(input),{id:artifact.id,expectedRevision:current.sourceRevision,files:[{path:'index.html',text:source.replace('应用选区','新构建页面')}]});
+  await page(input=>window.muse.buildArtifact(input),{id:artifact.id,expectedRevision:current.sourceRevision+1});
+  await wait(()=>!document.querySelector('[data-testid="artifact-annotation"]')&&document.querySelector('[data-testid="artifact-pick"]')?.disabled===false);
+  check('Switching the rendered build discards the old local selection without sending it',frameFor().url!==before&&store.getChat(chat.id).messages.filter(message=>message.artifactContext).length===2);
+  await page(()=>document.querySelector('[aria-label="关闭本地应用"]').click());
+  await open();await pick();await fill('artifact-annotation-note','ANNOTATION_DEMO delayed old-route feedback');
+  const originalSend=operations.sendMessage;let sendEntered=false,releaseSend;const sendGate=new Promise(resolve=>{releaseSend=resolve;});
+  operations.sendMessage=async input=>{sendEntered=true;await sendGate;return originalSend(input);};
+  try{
+    await page(()=>document.querySelector('[data-testid="artifact-annotation-send"]').click());await entered(()=>sendEntered);
+    const other=await page(workspaceId=>window.muse.createChat({workspaceId,title:'保持新注释目标'}),workspace.id);
+    await wait(()=>Array.from(document.querySelectorAll('.sidebar-chat-main')).some(el=>el.title==='保持新注释目标'));
+    await page(()=>Array.from(document.querySelectorAll('.sidebar-chat-main')).find(el=>el.title==='保持新注释目标').click());
+    await wait(()=>!document.querySelector('[data-testid="artifact-annotation"]'));releaseSend();
+    await wait(async id=>(await window.muse.bootstrap()).chats.find(c=>c.id===id).messages.at(-1)?.status==='complete',chat.id);
+    check('Late annotation success stays in its original chat and cannot close another route preview',await page(()=>!!document.querySelector('[data-testid="artifact-panel"]'))&&store.getChat(other.id).messages.length===0&&store.getChat(chat.id).messages.some(message=>message.content==='ANNOTATION_DEMO delayed old-route feedback'));
+  }finally{releaseSend();operations.sendMessage=originalSend;}
+  await page(()=>document.querySelector('[aria-label="关闭本地应用"]').click());
+  await page(()=>Array.from(document.querySelectorAll('[data-testid="workspace-nav"]')).find(el=>el.textContent.includes('页面选区验收')).click());
+  await fill('composer-input','KEEP_UNSUBMITTED_WORKSPACE_DRAFT');await open();await pick();
+  const retryNote='ANNOTATION_DEMO retry after temporary admission failure';await fill('artifact-annotation-note',retryNote);
+  let failedEntered=false,releaseFailure;const failureGate=new Promise(resolve=>{releaseFailure=resolve;});
+  operations.sendMessage=async()=>{failedEntered=true;await failureGate;throw Error('SYNTHETIC_ANNOTATION_ADMISSION_FAILURE');};
+  try{
+    await page(()=>document.querySelector('[data-testid="artifact-annotation-send"]').click());await entered(()=>failedEntered);releaseFailure();
+    await wait(()=>document.querySelector('[data-testid="artifact-annotation-send"]')?.disabled===false);
+    check('First-chat admission failure retains the page note and untouched workspace composer',await page(expected=>document.querySelector('[data-testid="artifact-annotation-note"]').value===expected&&document.querySelector('[data-testid="composer-input"]').value==='KEEP_UNSUBMITTED_WORKSPACE_DRAFT',retryNote));
+  }finally{releaseFailure();operations.sendMessage=originalSend;}
+  await page(()=>document.querySelector('[data-testid="artifact-annotation-send"]').click());
+  await wait(()=>!document.querySelector('[data-testid="artifact-panel"]'));
+  const promoted=await wait(async note=>(await window.muse.bootstrap()).chats.find(c=>c.messages.some(message=>message.content===note)&&c.messages.at(-1)?.status==='complete'),retryNote);
+  check('Successful first-chat feedback promotes its route only after admission and preserves the ordinary draft',promoted.workspaceId===workspace.id&&promoted.messages.at(-1).content.includes('ANNOTATION_CONTEXT_RECEIVED')&&await page(()=>document.querySelector('[data-testid="composer-input"]').value==='KEEP_UNSUBMITTED_WORKSPACE_DRAFT'));
+  const beforeModel=store.getArtifact(artifact.id);
+  await open();await pick();await fill('artifact-annotation-note','AGENT_ANNOTATION_DEMO update the selected button');
+  await page(()=>{const toggle=document.querySelector('[data-testid="annotation-tools"]');if(!toggle.checked)toggle.click();});
+  await page(()=>document.querySelector('[data-testid="artifact-annotation-send"]').click());
+  const write=await wait(async()=>{const s=await window.muse.bootstrap();return s.approvals.find(row=>row.name==='muse_write_app');});
+  const writeArgs=typeof write.arguments==='string'?JSON.parse(write.arguments):write.arguments;
+  check('Annotated app iteration reads the selected source and requests a specific write approval',write.chatId===promoted.id&&writeArgs.id===artifact.id&&writeArgs.expectedRevision===beforeModel.sourceRevision&&store.getArtifact(artifact.id).sourceRevision===beforeModel.sourceRevision);
+  await page(()=>document.querySelector('[data-testid="approval-approve"]').click());
+  const build=await wait(async()=>{const s=await window.muse.bootstrap();return s.approvals.find(row=>row.name==='muse_build_app');});
+  const buildArgs=typeof build.arguments==='string'?JSON.parse(build.arguments):build.arguments;
+  check('Rebuilding the annotated app requires a separate approval for the committed revision',build.chatId===promoted.id&&buildArgs.id===artifact.id&&buildArgs.expectedRevision===beforeModel.sourceRevision+1);
+  await page(()=>document.querySelector('[data-testid="approval-approve"]').click());
+  const iterated=await wait(async id=>{const c=(await window.muse.bootstrap()).chats.find(c=>c.id===id);return c.messages.at(-1)?.status==='complete'?c:null;},promoted.id);
+  const latest=store.getArtifact(artifact.id),calls=iterated.messages.at(-1).toolTrace.flatMap(round=>round.calls);
+  check('Annotation feedback modifies and builds the existing app with paired execution receipts',latest.sourceRevision===beforeModel.sourceRevision+1&&store.readArtifactBuild({id:artifact.id}).pages[0].html.includes('ANNOTATED_APP_UPDATED_11')&&calls.filter(call=>call.status==='complete').map(call=>call.name).join(',')==='muse_read_app,muse_write_app,muse_build_app');
+  await open();
+  check('The actual isolated preview renders the approved annotated app update',await inFrame(()=>document.body.textContent.includes('ANNOTATED_APP_UPDATED_11')));
+  await page(()=>document.querySelector('[aria-label="关闭本地应用"]').click());
+};

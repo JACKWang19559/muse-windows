@@ -105,12 +105,13 @@ function messageShape(value) {
   if (value.agentMode != null) { if (value.role !== 'assistant' || typeof value.agentMode !== 'boolean') fail('文件助手模式无效。'); result.agentMode = value.agentMode; }
   if (value.toolTrace != null) { if (value.role !== 'assistant' || !value.agentMode) fail('工具记录只能属于文件助手回复。'); result.toolTrace = normalizeToolTrace(value.toolTrace); }
   if (value.replyTo != null) { if (value.role !== 'user') fail('只有用户消息可携带回复引用。'); result.replyTo = replyShape(value.replyTo); }
+  if (value.artifactContext != null) { if (value.role !== 'user') fail('只有用户消息可携带应用选区。'); result.artifactContext = require('./artifact-annotation.cjs').annotationShape(value.artifactContext); }
   if (value.isDeleted != null) { if (value.role !== 'user' || typeof value.isDeleted !== 'boolean') fail('消息删除状态无效。'); result.isDeleted = value.isDeleted; }
   if (value.attachmentIds != null) {
     if (!Array.isArray(value.attachmentIds) || value.attachmentIds.length > 100) fail('附件列表无效。');
     result.attachmentIds = [...new Set(value.attachmentIds.map(id => identifier(id, '附件标识符')))];
   }
-  if (result.isDeleted && (result.content !== '' || result.attachmentIds != null || result.replyTo != null || result.error || result.status != null && result.status !== 'complete')) fail('已删除消息不能保留正文、附件、引用或活动状态。');
+  if (result.isDeleted && (result.content !== '' || result.attachmentIds != null || result.replyTo != null || result.artifactContext != null || result.error || result.status != null && result.status !== 'complete')) fail('已删除消息不能保留正文、附件、引用、选区或活动状态。');
   return result;
 }
 function chatShape(value) {
@@ -487,7 +488,7 @@ class Store {
   deleteChat(id) { this._chat(id); this._commit(next => { next.chats = next.chats.filter(item => item.id !== id); removeKnowledgeSources(next, [{ kind: 'chat', id }]); for (const run of next.scheduleRuns) if (run.chatId === id) { run.chatId = null; run.messageId = null; } return null; }, { replaceBackup: true }); return this.snapshot(); }
   getChat(id) { return copy(this._chat(id)); }
   appendMessage(chatId, input) {
-    record(input, '消息'); onlyKeys(input, ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace', 'replyToMessageId'], '消息');
+    record(input, '消息'); onlyKeys(input, ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace', 'replyToMessageId', 'artifactContext'], '消息');
     const { replyToMessageId, ...fields } = input;
     const message = messageShape({ id: input.id || uid('msg'), createdAt: stamp(), status: 'complete', ...fields });
     for (const id of message.attachmentIds || []) this._file(id);
@@ -909,7 +910,7 @@ class Store {
     for (const item of data.chats) {
       onlyKeys(record(item, '对话'), ['id', 'title', 'workspaceId', 'createdAt', 'updatedAt', 'pinned', 'messages','profileId'], '备份对话');
       if (!Array.isArray(item.messages)) fail('备份消息列表无效。');
-      for (const message of item.messages) onlyKeys(record(message, '消息'), ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace', 'replyTo', 'isDeleted'], '备份消息');
+      for (const message of item.messages) onlyKeys(record(message, '消息'), ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace', 'replyTo', 'isDeleted', 'artifactContext'], '备份消息');
     }
     let total = 0;
     const buffers = new Map(), source = { workspaces: data.workspaces.map(workspaceShape), chats: data.chats.map(chatShape), files: data.files.map(file => {
@@ -937,6 +938,10 @@ class Store {
       for (const item of source.files) { const file = await this._prepareFile(buffers.get(item.id), item.name, item.workspaceId === null ? null : workspaceIds.get(item.workspaceId)); file.createdAt = item.createdAt; prepared.push(file); fileIds.set(item.id, file.id); }
       const workspaces = source.workspaces.map(item => ({ ...item, id: workspaceIds.get(item.id) }));
       const artifacts = source.artifacts.map(item => ({ ...item, id: artifactIds.get(item.id), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), builds: item.builds.slice(-1).map(build => ({ ...build, id: buildIds.get(build.id) })) }));
+      // Message annotations are historical references, not live app authority.
+      // Remap only identities actually restored by this import; a removed app
+      // or an older, unretained build keeps its descriptive historical ID.
+      const remapArtifactContext = context => ({ ...context, artifactId: artifactIds.has(context.artifactId) ? artifactIds.get(context.artifactId) : context.artifactId, buildId: buildIds.has(context.buildId) ? buildIds.get(context.buildId) : context.buildId });
       const remapSource = (kind, id) => ({ memory_document: memoryDocumentIds, memory: memoryIds, file: fileIds, chat: chatIds, artifact: artifactIds }[kind]).get(id), remapWorkspace = id => id === null ? null : workspaceIds.get(id);
       const remapSourceVersion = item => reusedGlobalDocument && item.kind === 'memory_document' && item.sourceId === importedGlobalDocument.id ? { sourceRevision: reusedGlobalDocument.revision, sourceDigest: reusedGlobalDocument.digest } : {};
       const memoryDocuments = source.memoryDocuments.filter(item => !(reusedGlobalDocument && item.id === importedGlobalDocument.id)).map(item => ({ ...item, id: memoryDocumentIds.get(item.id), workspaceId: remapWorkspace(item.workspaceId) }));
@@ -952,7 +957,7 @@ class Store {
       const scheduleRuns = source.scheduleRuns.map(item => ({ ...item, id: runIds.get(item.id), scheduleId: item.scheduleId === null ? null : scheduleIds.get(item.scheduleId), chatId: item.chatId === null ? null : chatIds.get(item.chatId), messageId: item.chatId === null ? null : messageIdsByChat.get(item.chatId).get(item.messageId), scopeSnapshot: { workspaceId: item.scopeSnapshot.workspaceId === null ? null : workspaceIds.get(item.scopeSnapshot.workspaceId), attachmentIds: item.scopeSnapshot.attachmentIds.map(id => fileIds.get(id)) }, ...(item.status === 'running' ? { status: 'interrupted', finishedAt: stamp(), error: '导入的计划执行已停止，不会自动重发。' } : {}) }));
       const chats = source.chats.map(item => {
         const messageIds = messageIdsByChat.get(item.id);
-        return { ...item, id: chatIds.get(item.id), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), ...(item.profileId ? { profileId: profileIds.get(item.profileId) } : {}), messages: item.messages.map(message => ({ ...message, id: messageIds.get(message.id), status: message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace) ? 'cancelled' : message.status, ...(message.replyTo ? { replyTo: { ...message.replyTo, messageId: messageIds.get(message.replyTo.messageId) } } : {}), ...(message.toolTrace ? { toolTrace: remapToolTrace(cancelToolTrace(message.toolTrace), { fileIds, workspaceIds, artifactIds, buildIds, scheduleIds, runIds, chatIds, messageIdsByChat, memoryIds }) } : {}), ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) };
+        return { ...item, id: chatIds.get(item.id), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), ...(item.profileId ? { profileId: profileIds.get(item.profileId) } : {}), messages: item.messages.map(message => ({ ...message, id: messageIds.get(message.id), status: message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace) ? 'cancelled' : message.status, ...(message.replyTo ? { replyTo: { ...message.replyTo, messageId: messageIds.get(message.replyTo.messageId) } } : {}), ...(message.artifactContext ? { artifactContext: remapArtifactContext(message.artifactContext) } : {}), ...(message.toolTrace ? { toolTrace: remapToolTrace(cancelToolTrace(message.toolTrace), { fileIds, workspaceIds, artifactIds, buildIds, scheduleIds, runIds, chatIds, messageIdsByChat, memoryIds }) } : {}), ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) };
       });
       this._commit(next => { if (next.workspaces.length + workspaces.length > 1000 || next.chats.length + chats.length > 5000 || next.files.length + prepared.length > 10000 || next.artifacts.length + artifacts.length > MAX_ARTIFACTS || next.schedules.length + schedules.length > scheduleModel.MAX_SCHEDULES) fail('合并后的数据数量超出限制。'); next.settings = settings; next.workspaces.push(...workspaces); next.chats.push(...chats); next.files.push(...prepared); next.artifacts.push(...artifacts); next.schedules.push(...schedules); next.scheduleRuns.push(...scheduleRuns); next.memoryDocuments.push(...memoryDocuments); next.memories.push(...memories); next.skills.push(...skills); next.agentProfiles.push(...agentProfiles); next.memoryIndexes.push(...memoryIndexes); scheduleModel.pruneRuns(next); return null; });
       return this.snapshot();

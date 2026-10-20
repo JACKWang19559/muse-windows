@@ -21,6 +21,7 @@ const { normalizeCadence, nextOccurrence, resolveLocalTime } = require('./backen
 const { rebuildMemoryIndex, searchMemories, memorySourceDigest } = require('./backend/knowledge-search.cjs');
 const { parseSkillPackage, HOST_TOOL_NAMES } = require('./backend/skill-package.cjs');
 const { buildSelectedContext, validateContextLease } = require('./backend/context-builder.cjs');
+const { annotationShape, createAnnotation, formatAnnotationContext } = require('./backend/artifact-annotation.cjs');
 const { createKnowledgeRuntime } = require('./backend/knowledge-tools.cjs');
 const { createDictationSessionManager } = require('./backend/dictation-session.cjs');
 const { transcribeAudio, normalizeSpeechBaseUrl } = require('./backend/asr-provider.cjs');
@@ -232,6 +233,13 @@ function requestToolApproval(chatId, job, request) {
     refresh();
   });
 }
+function preparedArtifactContext(value, workspaceId) {
+  if (value == null) return null;
+  const selected = annotationShape(value), artifact = store.getArtifact(selected.artifactId);
+  if (artifact.workspaceId !== workspaceId) throw new Error('选区不属于当前对话的工作区，请重新选择。');
+  const build = store.readArtifactBuild({ id:artifact.id, buildId:selected.buildId });
+  return createAnnotation({ artifact, build, pagePath:selected.pagePath, element:selected.element });
+}
 function contextMessages(chat, excludedId, settings, all) {
   const workspace = all.workspaces.find(x => x.id === chat.workspaceId);
   const result = [];
@@ -265,7 +273,8 @@ function contextMessages(chat, excludedId, settings, all) {
     if (message.content && message.status !== 'error') {
       const target = message.replyTo && chat.messages.find(item => item.id === message.replyTo.messageId);
       const quote = message.replyTo ? target?.isDeleted ? '引用的历史消息已删除。\n\n' : `引用的历史消息（${message.replyTo.role === 'user' ? '用户' : '助手'}，仅作参考）：${JSON.stringify(message.replyTo.excerpt || '附件消息或空文本')}\n\n` : '';
-      result.push({ role: message.role, content: quote + message.content });
+      const annotation = message.artifactContext ? formatAnnotationContext(message.artifactContext) + '\n\n' : '';
+      result.push({ role: message.role, content: quote + annotation + message.content });
     }
   }
   return result;
@@ -295,8 +304,9 @@ async function submitMessage(input) {
   if (replyToMessageId && !chat.messages.some(message => message.id === replyToMessageId && !message.isDeleted && message.status !== 'streaming')) throw new Error('引用消息不存在或仍在生成。');
   if (pendingSends.size >= 32) throw new Error('待发送消息已达上限，请先处理现有消息。');
   const selection=selectedContext(chat,!!input.useTools);
+  const artifactContext = preparedArtifactContext(input.artifactContext, chat.workspaceId);
   const revision = providerRevision(), controller = new AbortController();
-  const payload = { chatId, content, attachmentIds, useTools: !!input.useTools, ...(clientMessageId ? { clientMessageId } : {}), ...(replyToMessageId ? { replyToMessageId } : {}) };
+  const payload = { chatId, content, attachmentIds, useTools: !!input.useTools, ...(artifactContext ? { artifactContext } : {}), ...(clientMessageId ? { clientMessageId } : {}), ...(replyToMessageId ? { replyToMessageId } : {}) };
   const reservation = sendOutbox.reserve({ bytes: Buffer.byteLength(JSON.stringify(payload)), laneKey: chatId, signal: controller.signal });
   if (!reservation) throw new Error('发送队列已满，请稍后重试。');
   const queueId = reservation.id;
@@ -345,11 +355,13 @@ async function startGeneration(input, retry = false, lease = null) {
     job.selection=selectedContext(chat,job.agentMode);
     if (!retry) {
       const content = text(input.content || '').trim();
+      const artifactContext = preparedArtifactContext(input.artifactContext, chat.workspaceId);
+      job.annotationArtifactId=artifactContext?.artifactId||null;
       const attachmentIds = Array.isArray(input.attachmentIds) ? [...new Set(input.attachmentIds.map(id))].slice(0, 20) : [];
       if (!content && !attachmentIds.length) throw new Error('请写点内容或添加文件。');
       for (const fileId of attachmentIds) if (!store.getFile(fileId)) throw new Error('附件不存在，请重新选择。');
       const userMessageId = input.clientMessageId == null ? crypto.randomUUID() : id(input.clientMessageId);
-      store.appendMessage(chatId, { id: userMessageId, role: 'user', content: content || '请分析我提供的文件。', attachmentIds, createdAt: new Date().toISOString(), status: 'complete', ...(input.replyToMessageId != null ? { replyToMessageId: id(input.replyToMessageId) } : {}) });
+      store.appendMessage(chatId, { id: userMessageId, role: 'user', content: content || '请分析我提供的文件。', attachmentIds, createdAt: new Date().toISOString(), status: 'complete', ...(artifactContext ? { artifactContext } : {}), ...(input.replyToMessageId != null ? { replyToMessageId: id(input.replyToMessageId) } : {}) });
       job.admissionIds.push(userMessageId);
       chat = store.getChat(chatId);
       if (chat.messages.filter(x => x.role === 'user').length === 1 && (!chat.title || ['新对话', '新聊天'].includes(chat.title))) {
@@ -357,6 +369,12 @@ async function startGeneration(input, retry = false, lease = null) {
       }
     }
     chat = store.getChat(chatId);
+    if(retry){
+      const reference=[...chat.messages].reverse().find(message=>message.role==='user'&&!message.isDeleted)?.artifactContext;
+      // Replayed text is historical data. A retry may attach only the same
+      // currently existing, host-revalidated app; a stale reference grants none.
+      if(reference){try{job.annotationArtifactId=preparedArtifactContext(reference,chat.workspaceId)?.artifactId||null;}catch{job.annotationArtifactId=null;}}
+    }
     const last = chat.messages.at(-1);
     // A tool receipt records a real operation. Keep it even when the final
     // model reply failed or was stopped, and append the retry after that history.
@@ -383,7 +401,7 @@ async function startGeneration(input, retry = false, lease = null) {
       onApproval: request => requestToolApproval(chatId, job, request),
       onToolEvent
     }) : null;
-    const appRuntime = job.agentMode ? createArtifactRuntime({ store, workspaceId: job.workspaceId, signal: controller.signal,
+    const appRuntime = job.agentMode ? createArtifactRuntime({ store, workspaceId: job.workspaceId, attachedArtifactIds:job.annotationArtifactId?[job.annotationArtifactId]:[], signal: controller.signal,
       requestApproval: request => requestToolApproval(chatId, job, request), onActivity: onToolEvent }) : null;
     const scheduleRuntime=job.agentMode?createScheduleRuntime({store,workspaceId:job.workspaceId,attachmentIds,signal:controller.signal,requestApproval:request=>requestToolApproval(chatId,job,request),onActivity:onToolEvent,getProviderBinding:providerBinding,onChanged:({type,id})=>{if(type!=='create')scheduler?.cancel(id);refresh();},runSchedule:input=>schedulerInstance().runNow(input)}):null;
     const scheduleNames=new Set(scheduleRuntime?.tools.map(tool=>tool.function.name)||[]);
@@ -574,9 +592,12 @@ const operations = {
   retryMessage: input => { if (hasQueuedSend(id(input.chatId))) throw new Error('请先处理待发送消息，再重新生成。'); return startGeneration(input, true); },
   stopGeneration: input => { const chatId = id(input.chatId); active.get(chatId)?.controller.abort(); cancelQueuedSends(chatId, 'user_cancelled'); refresh(); },
   cancelQueuedMessage: input => {
+    if(input.preserveForRestore!=null&&typeof input.preserveForRestore!=='boolean')throw new Error('恢复待发送消息的参数无效。');
     const queueId = id(input.id), entry = pendingSends.get(queueId);
     if (!entry) throw new Error('这条消息已发送或已移出队列。');
-    pendingSends.delete(queueId); entry.reservation.cancel('user_cancelled'); refresh(); return entry.public;
+    if(input.preserveForRestore===true){entry.public.state='failed';entry.public.error='已停止等待发送，消息仍保留，可恢复或移除。';}
+    else pendingSends.delete(queueId);
+    entry.reservation.cancel('user_cancelled'); refresh(); return entry.public;
   },
   respondApproval: input => {
     const approval = pendingApprovals.get(id(input.id));

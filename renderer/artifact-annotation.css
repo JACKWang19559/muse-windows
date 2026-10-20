@@ -1,0 +1,9 @@
+.artifact-preview { position: relative; min-height: 0; }
+.artifact-pick-hint { padding: 9px 12px; color: var(--text-secondary); background: var(--panel); font-size: 12px; }
+.artifact-annotation { padding: 12px; border-top: 1px solid var(--line); background: var(--surface); display: grid; gap: 8px; }
+.artifact-annotation > div, .artifact-annotation footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.artifact-annotation strong { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-annotation textarea { resize: vertical; min-height: 54px; max-height: 150px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--bg); font: inherit; font-size: 13px; }
+.artifact-annotation footer span { color: var(--text-secondary); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-annotation-tools { display: flex; align-items: center; gap: 4px; white-space: nowrap; font-size: 11px; margin-left: auto; }
+.message-artifact-context { display: flex; align-items: center; gap: 5px; font-size: 11px; opacity: .75; margin-bottom: 6px; }

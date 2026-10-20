@@ -1,12 +1,13 @@
 'use strict';
 const crypto = require('node:crypto');
 const { types } = require('node:util');
+const { pickerBootstrap } = require('./artifact-picker.cjs');
 const CSP = "default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; worker-src 'none'";
 const plain = value => value !== null && typeof value === 'object' && !types.isProxy(value) && Object.getPrototypeOf(value) === Object.prototype;
 const fail = message => { throw new Error(message); };
-function sdkBootstrap(config) {
+function sdkBootstrap(config, startPicker) {
   'use strict';
-  let port, sequence = 0, resolveReady, announceTimer;
+  let port, picker, sequence = 0, resolveReady, announceTimer;
   const pending = new Map();
   const ready = new Promise(resolve => { resolveReady = resolve; });
   function request(action, payload) {
@@ -27,9 +28,11 @@ function sdkBootstrap(config) {
   function connect(event) {
     if (port || event.source !== parent || event.data?.type !== 'muse:connect' || event.data.sessionId !== config.sessionId || event.data.documentToken !== config.documentToken || event.ports.length !== 1) return;
     port = event.ports[0];
+    picker = startPicker(message => port.postMessage(message));
     clearInterval(announceTimer);
     port.onmessage = event => {
       const message = event.data;
+      if (message?.type === 'muse:pick') { picker.set(message); return; }
       if (message?.type !== 'muse:response' || typeof message.requestId !== 'string') return;
       const entry = pending.get(message.requestId);
       if (!entry) return;
@@ -39,7 +42,7 @@ function sdkBootstrap(config) {
     port.start(); window.removeEventListener('message', connect); resolveReady();
   }
   window.addEventListener('message', connect);
-  window.addEventListener('pagehide', () => { port?.close(); for (const entry of pending.values()) { clearTimeout(entry.timeout); entry.reject(new Error('预览已关闭。')); } pending.clear(); });
+  window.addEventListener('pagehide', () => { picker?.dispose(); port?.close(); for (const entry of pending.values()) { clearTimeout(entry.timeout); entry.reject(new Error('预览已关闭。')); } pending.clear(); });
   const announce = () => parent.postMessage({ type: 'muse:ready', sessionId: config.sessionId, documentToken: config.documentToken }, '*');
   announce(); announceTimer = setInterval(announce,250); setTimeout(()=>clearInterval(announceTimer),15000);
 }
@@ -58,7 +61,7 @@ async function decorate(html, config) {
   const head = document.childNodes.find(n => n.tagName === 'html').childNodes.find(n => n.tagName === 'head');
   const meta = adapter.createElement('meta', namespace, [{ name: 'http-equiv', value: 'Content-Security-Policy' }, { name: 'content', value: CSP }]);
   const script = adapter.createElement('script', namespace, []);
-  adapter.insertText(script, `(${sdkBootstrap.toString()})(${JSON.stringify(config).replace(/</g, '\\u003c')});`);
+  adapter.insertText(script, `(${sdkBootstrap.toString()})(${JSON.stringify(config).replace(/</g, '\\u003c')},${pickerBootstrap.toString()});`);
   if (head.childNodes.length) { adapter.insertBefore(head, meta, head.childNodes[0]); adapter.insertBefore(head, script, head.childNodes[1]); }
   else { adapter.appendChild(head, meta); adapter.appendChild(head, script); }
   return serialize(document);

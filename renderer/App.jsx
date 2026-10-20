@@ -123,7 +123,7 @@ function Markdown({ content, notify, highlight }) {
   }} />;
 }
 
-function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport, onDrop, onSend, onStop, busy, admitting, importing, welcome = false, placeholder, model, configured, useTools, onToolsChange, quote, onClearQuote, historyMessages = [], historyKey, knowledgeControl, dictationProps }) {
+function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport, onDrop, onSend, onStop, busy, admitting, importing, welcome = false, placeholder, model, configured, useTools, onToolsChange, quote, onClearQuote, artifactContext, onClearArtifactContext, historyMessages = [], historyKey, knowledgeControl, dictationProps }) {
   const dictation=useDictation({...dictationProps,value,onChange,onSend});
   const input = useRef(null);
   const composing = useRef(false);
@@ -138,6 +138,7 @@ function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport
   return <div className={`composer-shell ${welcome ? 'composer-welcome' : ''}`} data-testid="composer" onDragOver={event => { event.preventDefault(); event.stopPropagation(); }} onDrop={event => { event.preventDefault(); event.stopPropagation(); onDrop?.(Array.from(event.dataTransfer.files)); }}>
     {knowledgeControl}
     {dictation.banner}
+    {artifactContext && <div className="composer-quote" data-testid="composer-artifact-context"><Monitor size={15}/><div><strong>{artifactContext.artifactName} · 页面选区</strong><span>{artifactContext.element.text || artifactContext.element.tag}</span></div><IconButton icon={X} label="移除页面选区" onClick={onClearArtifactContext}/></div>}
     {quote && <div className="composer-quote" data-testid="composer-quote"><Reply size={15} /><div><strong>回复 {quote.role === 'user' ? '你' : 'Muse'}</strong><span>{excerpt(quote.content || '附件消息', 180)}</span></div><IconButton icon={X} label="取消引用" onClick={onClearQuote} /></div>}
     {attachedFiles.length > 0 && <div className="attachment-tray">{attachedFiles.map(file => <div className="attachment-pill" key={file.id} title={file.name}><FileText size={15} /><span>{file.name}</span><IconButton icon={X} label={`移除附件 ${file.name}`} onClick={() => onRemoveAttachment(file.id)} /></div>)}</div>}
     <textarea ref={input} value={value} disabled={dictation.finishing} onChange={event => { recall.current = null; onChange(event.target.value); }} data-testid="composer-input" rows={welcome ? 2 : 1}
@@ -309,13 +310,16 @@ function App() {
   const [attachments, setAttachments] = useState({});
   const [agentModes, setAgentModes] = useState({});
   const [quotes, setQuotes] = useState({});
-  const draftState = useRef({ drafts, attachments });
-  draftState.current = { drafts, attachments };
+  const [artifactDraftContexts, setArtifactDraftContexts] = useState({});
+  const draftState = useRef({ drafts, attachments, artifactDraftContexts });
+  draftState.current = { drafts, attachments, artifactDraftContexts };
   const modeRevisions = useRef(new Map());
   const [importing, setImporting] = useState(false);
   const [pendingChats, setPendingChats] = useState(new Set());
   const [sending, setSending] = useState(false);
   const sendLock = useRef(false);
+  const annotationPromotion = useRef(null);
+  const queueActions = useRef(new Map());
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
   const [themePreview, setThemePreview] = useState(null);
@@ -443,57 +447,94 @@ function App() {
       }
     } catch (error) { notify(error.message, 'error'); } finally { setImporting(false); }
   };
-  const send = async (inputText) => {
+  const send = async (inputText, annotation) => {
     const submittedText=typeof inputText==='string'?inputText:draft;
-    if (sendLock.current || !submittedText.trim() && !attachedIds.length) return;
-    if (!configured) { setSettingsOpen(true); notify('连接你的模型后，就可以开始对话了', 'info'); return; }
+    if (sendLock.current || !submittedText.trim() && !(annotation ? 0 : attachedIds.length)) return false;
+    if (!configured) { setSettingsOpen(true); notify('连接你的模型后，就可以开始对话了', 'info'); return false; }
     sendLock.current = true; setSending(true);
-    const key = composerKey, text = submittedText, files = [...attachedIds], quotedId = quote?.id, clientMessageId = crypto.randomUUID();
+    if(annotation)annotationPromotion.current=null;
+    const key = composerKey, text = submittedText, files = annotation ? [] : [...attachedIds], quotedId = quote?.id, clientMessageId = crypto.randomUUID();
+    const artifactContext = annotation || artifactDraftContexts[key];
     // Remove only this submitted draft now. New typing during admission stays
     // separate and cannot be erased by a later IPC response.
-    setDrafts(previous => ({ ...previous, [key]: previous[key] === text || previous[key] === draft ? '' : previous[key] }));
-    setAttachments(previous => ({ ...previous, [key]: (previous[key] || []).filter(id => !files.includes(id)) }));
-    setQuotes(previous => previous[key] === quotedId ? { ...previous, [key]: null } : previous);
-    let target = chat;
+    if (!annotation) {
+      setDrafts(previous => ({ ...previous, [key]: previous[key] === text || previous[key] === draft ? '' : previous[key] }));
+      setAttachments(previous => ({ ...previous, [key]: (previous[key] || []).filter(id => !files.includes(id)) }));
+      setQuotes(previous => previous[key] === quotedId ? { ...previous, [key]: null } : previous);
+      setArtifactDraftContexts(previous => previous[key] === artifactContext ? { ...previous, [key]: null } : previous);
+    }
+    let target = chat, createdTarget = false;
     try {
       if (!target) {
         target = await api.createChat({ workspaceId,...(selectedProfileId?{profileId:selectedProfileId}:{}) }); const nextKey = `chat:${target.id}`;
+        createdTarget = true;
+        if(!annotation){
         setDrafts(previous => ({ ...previous, [nextKey]: previous[key] || '', [key]: '' }));
         setAttachments(previous => ({ ...previous, [nextKey]: previous[key] || [], [key]: [] }));
         setQuotes(previous => ({ ...previous, [nextKey]: previous[key] || null, [key]: null }));
+        setArtifactDraftContexts(previous => ({ ...previous, [nextKey]: previous[key] || null, [key]: null }));
         setAgentModes(previous => ({ ...previous, [nextKey]: useTools }));
         setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, target) })); openRoute({ type: 'chat', id: target.id });
+        }
       }
       setPendingChats(previous => new Set(previous).add(target.id));
       followBottom.current = true;
-      await api.sendMessage({ chatId: target.id, content: text, attachmentIds: files, useTools, clientMessageId, ...(quotedId ? { replyToMessageId: quotedId } : {}) });
+      await api.sendMessage({ chatId: target.id, content: text, attachmentIds: files, useTools, clientMessageId, ...(artifactContext ? { artifactContext } : {}), ...(quotedId ? { replyToMessageId: quotedId } : {}) });
+      if(annotation&&createdTarget)annotationPromotion.current={originKey:key,target};
+      return true;
     } catch (error) {
       if (target) setPendingChats(previous => { const next = new Set(previous); next.delete(target.id); return next; });
       let admitted = false;
       try { admitted = target && (await api.bootstrap()).chats.find(item => item.id === target.id)?.messages.some(message => message.id === clientMessageId); } catch { /* Preserve input if admission cannot be confirmed. */ }
-      if (!admitted) {
+      if (!admitted && !annotation) {
         const restoreKey = target ? `chat:${target.id}` : key;
         setDrafts(previous => ({ ...previous, [restoreKey]: previous[restoreKey] ? `${text}\n\n${previous[restoreKey]}` : text }));
         setAttachments(previous => ({ ...previous, [restoreKey]: [...new Set([...files, ...(previous[restoreKey] || [])])] }));
         if (quotedId) setQuotes(previous => ({ ...previous, [restoreKey]: previous[restoreKey] || quotedId }));
+        if (artifactContext) setArtifactDraftContexts(previous => ({ ...previous, [restoreKey]: previous[restoreKey] || artifactContext }));
       }
       notify(error.message, 'error');
+      if(admitted&&annotation&&createdTarget)annotationPromotion.current={originKey:key,target};
+      return !!admitted;
     } finally { sendLock.current = false; setSending(false); }
+  };
+  const annotationSent=()=>{
+    const promotion=annotationPromotion.current;annotationPromotion.current=null;
+    if(promotion?.originKey===composerKey){
+      const key=promotion.originKey,nextKey=`chat:${promotion.target.id}`;
+      setDrafts(previous=>({...previous,[nextKey]:previous[key]||'',[key]:''}));
+      setAttachments(previous=>({...previous,[nextKey]:previous[key]||[],[key]:[]}));
+      setQuotes(previous=>({...previous,[nextKey]:previous[key]||null,[key]:null}));
+      setArtifactDraftContexts(previous=>({...previous,[nextKey]:previous[key]||null,[key]:null}));
+      setAgentModes(previous=>({...previous,[nextKey]:previous[key]??useTools}));
+      openRoute({type:'chat',id:promotion.target.id});
+    }
+    setArtifactsOpen(false);
   };
   const stop = () => { if (chat) api.stopGeneration({ chatId: chat.id }).catch(error => notify(error.message, 'error')); };
   const removeQueued = async (item, restore = false) => {
     const key = `chat:${item.chatId}`, modeRevision = modeRevisions.current.get(key) || 0;
+    if(restore&&queueActions.current.has(item.id))return;
+    const token={};queueActions.current.set(item.id,token);
     try {
-      const intent = await api.cancelQueuedMessage({ id: item.id });
+      if (restore && item.artifactContext && (draftState.current.drafts[key]?.trim() || draftState.current.attachments[key]?.length || draftState.current.artifactDraftContexts[key])) throw new Error('当前草稿已有内容，请先处理草稿，再恢复带页面选区的消息。');
+      const preserve=restore&&!!item.artifactContext;
+      const intent = await api.cancelQueuedMessage({ id: item.id,...(preserve?{preserveForRestore:true}:{}) });
+      if(queueActions.current.get(item.id)!==token)return;
       if (restore) {
+        if(preserve&&(draftState.current.drafts[key]?.trim()||draftState.current.attachments[key]?.length||draftState.current.artifactDraftContexts[key]))throw new Error('恢复期间草稿已有新内容，原消息仍保留在待发送列表。');
         const hasDraft = !!draftState.current.drafts[key]?.trim() || (draftState.current.attachments[key] || []).length > 0;
+        if(preserve)draftState.current={...draftState.current,drafts:{...draftState.current.drafts,[key]:intent.content},artifactDraftContexts:{...draftState.current.artifactDraftContexts,[key]:intent.artifactContext}};
         setDrafts(previous => ({ ...previous, [key]: previous[key] ? `${previous[key]}\n\n${intent.content}` : intent.content }));
         setAttachments(previous => ({ ...previous, [key]: [...new Set([...(previous[key] || []), ...intent.attachmentIds.filter(id => data.files.some(file => file.id === id))])] }));
         if (intent.replyToMessageId) setQuotes(previous => ({ ...previous, [key]: previous[key] || intent.replyToMessageId }));
+        if (intent.artifactContext) setArtifactDraftContexts(previous => ({ ...previous, [key]: intent.artifactContext }));
         if (!hasDraft && (modeRevisions.current.get(key) || 0) === modeRevision) setAgentModes(previous => ({ ...previous, [key]: intent.useTools }));
+        if(preserve){try{await api.cancelQueuedMessage({id:item.id});}catch{notify('已恢复到草稿；待发送记录未移除，可以稍后手动移除。','info');return;}}
         notify('已恢复到草稿，可以修改后发送'); window.dispatchEvent(new Event('muse-focus-composer'));
       }
     } catch (error) { notify(error.message, 'error'); }
+    finally{if(queueActions.current.get(item.id)===token)queueActions.current.delete(item.id);}
   };
   const retry = async () => { if (!chat || busy) return; setPendingChats(previous => new Set(previous).add(chat.id)); try { await api.retryMessage({ chatId: chat.id }); } catch (error) { setPendingChats(previous => { const next = new Set(previous); next.delete(chat.id); return next; }); notify(error.message, 'error'); } };
   const saveEntity = async value => {
@@ -509,7 +550,7 @@ function App() {
   const askRemoveFile = file => setConfirm({ title: '移除这份文件？', body: `“${file.name}”及其未保存修改将从工作台中移除。你电脑中的原始文件不会改变。`, action: '移除文件', run: async () => { replaceSnapshot(await api.removeFile({ id: file.id })); setAttachments(previous => Object.fromEntries(Object.entries(previous).map(([key, ids]) => [key, ids.filter(id => id !== file.id)]))); closeFilePreview(file.id); } });
   const quoteMessage = message => { setQuotes(previous => ({ ...previous, [composerKey]: message.id })); window.dispatchEvent(new Event('muse-focus-composer')); };
   const playAudioAttachment=(file,message)=>{if(chatAudio.view?.owner?.fileId===file.id){if(chatAudio.view.state==='playing')chatAudio.pause();else if(chatAudio.view.state==='paused')chatAudio.resume();return;}chatAudio.play({chatId:chat.id,messageId:message.id,fileId:file.id},{label:file.name});};
-  const askDeleteTurn = message => setConfirm({ title: '删除这条消息？', body: '这条用户消息的正文、附件关联和引用摘录将被清除，并保留删除占位。其他回复和已经完成的文件操作记录会保留。', action: '删除消息', run: async () => {
+  const askDeleteTurn = message => setConfirm({ title: '删除这条消息？', body: '这条用户消息的正文、附件关联、页面选区和引用摘录将被清除，并保留删除占位。其他回复和已经完成的文件操作记录会保留。', action: '删除消息', run: async () => {
     const result = await api.deleteTurn({ chatId: chat.id, messageId: message.id });
     setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, result.chat) }));
     setQuotes(previous => Object.fromEntries(Object.entries(previous).map(([key, value]) => [key, value === message.id ? null : value])));
@@ -518,8 +559,9 @@ function App() {
   const askDeleteWorkspace = item => { setMenu(null); setConfirm({ title: '删除这个工作区？', body: `“${item.name}”将被删除，其中的对话和文件会保留在个人工作台。`, action: '删除工作区', run: async () => { replaceSnapshot(await api.deleteWorkspace({ id: item.id })); newChat(); } }); };
   const exportChat = async format => { setMenu(null); try { const result = await api.exportChat({ chatId: chat.id, format }); if (!result.cancelled) notify('对话已导出'); } catch (error) { notify(error.message, 'error'); } };
   const composerProps = { value: draft, onChange: updateDraft, attachedFiles, onRemoveAttachment: id => setAttachments(previous => ({ ...previous, [composerKey]: attachedIds.filter(item => item !== id) })), onImport: () => addFiles(), onDrop: files => { dragCount.current = 0; setDragging(false); if (files.length) addFiles(files); }, onSend: send, onStop: stop, busy, admitting: sending, importing, model: data.settings.model, configured, useTools, onToolsChange: enabled => { modeRevisions.current.set(composerKey, (modeRevisions.current.get(composerKey) || 0) + 1); setAgentModes(previous => ({ ...previous, [composerKey]: enabled })); }, quote, onClearQuote: () => setQuotes(previous => ({ ...previous, [composerKey]: null })), historyMessages: chat?.messages, historyKey: composerKey };
+  composerProps.artifactContext=artifactDraftContexts[composerKey];composerProps.onClearArtifactContext=()=>setArtifactDraftContexts(previous=>({...previous,[composerKey]:null}));
   composerProps.knowledgeControl=<div className="knowledge-chatbar"><button className="text-button" data-testid="knowledge-open" onClick={()=>setKnowledgeOpen({workspaceId,workspaceName:workspace?.name})}><Database size={13}/>知识与技能</button><select aria-label="聊天知识配置" data-testid="chat-profile" value={selectedProfileId} disabled={busy||sending} onChange={async event=>{const profileId=event.target.value||null;try{if(chat)await api.updateChat({id:chat.id,profileId});else setDraftProfiles(previous=>({...previous,[workspaceId||'global']:profileId}));}catch(error){notify(error.message,'error');}}}><option value="">不附加知识配置</option>{data.agentProfiles.filter(item=>item.workspaceId===workspaceId).map(item=><option key={item.id} value={item.id} disabled={item.needsReview}>{item.name}{item.needsReview?'（待确认）':''}</option>)}</select>{chat&&selectedProfileId&&<button className="text-button" data-testid="context-preview" onClick={async()=>{try{setContextPreview(await api.previewSelectedContext({chatId:chat.id,useTools}));}catch(error){notify(error.message,'error');}}}>查看将发送的知识</button>}</div>;
-  composerProps.dictationProps={owner:{scopeKey:composerKey,workspaceId,chatId:chat?.id||null,profileId:selectedProfileId||null,useTools},contextKey:JSON.stringify([composerKey,workspaceId,selectedProfileId,data.agentProfiles.find(item=>item.id===selectedProfileId)?.revision,useTools,attachedIds,quote?.id,Object.fromEntries(Object.entries(data.settings).filter(([key])=>!['synthesisModel','synthesisVoice'].includes(key)))]),settings:data.settings,onConfigure:()=>setSettingsOpen(true),notify};
+  composerProps.dictationProps={owner:{scopeKey:composerKey,workspaceId,chatId:chat?.id||null,profileId:selectedProfileId||null,useTools},contextKey:JSON.stringify([composerKey,workspaceId,selectedProfileId,data.agentProfiles.find(item=>item.id===selectedProfileId)?.revision,useTools,attachedIds,quote?.id,artifactDraftContexts[composerKey],Object.fromEntries(Object.entries(data.settings).filter(([key])=>!['synthesisModel','synthesisVoice'].includes(key)))]),settings:data.settings,onConfigure:()=>setSettingsOpen(true),notify};
 
   if (!snapshot) return <div className="boot-screen"><Brand size={56} /><h1>Muse</h1>{bootError ? <><p className="boot-error">{bootError}</p><button className="button secondary" onClick={() => window.location.reload()}><RefreshCw size={15} />重新打开</button></> : <p><Spinner size={16} />正在打开你的工作台…</p>}</div>;
 
@@ -555,7 +597,7 @@ function App() {
             {chat.messages.length ? chat.messages.map((message, index) => <article className={`message message-${message.role} ${route.messageId === message.id ? 'message-search-target' : ''}`} key={message.id} tabIndex={-1} data-role={message.role} data-message-id={message.id} data-status={message.status || 'complete'}>
               {message.role === 'assistant' && <span className="assistant-avatar"><Brand size={23} /></span>}<div className="message-body">{message.role === 'user' ? message.isDeleted ? <p className="message-deleted" data-testid="deleted-message"><Trash2 size={13} />你删除了一条消息</p> : <>
                 {message.replyTo && <button className="message-quote" data-testid="message-quote" onClick={() => openRoute({ type: 'chat', id: chat.id, messageId: message.replyTo.messageId })}><Reply size={14} /><span><strong>{message.replyTo.role === 'user' ? '你' : 'Muse'}</strong>{chat.messages.find(item => item.id === message.replyTo.messageId)?.isDeleted ? '已删除的消息' : excerpt(message.replyTo.excerpt || '附件消息', 180)}</span></button>}
-                <div className="user-message-content"><HighlightText text={message.content} query={route.messageId === message.id ? route.query : null} /></div>{message.attachmentIds?.length > 0 && <div className="message-attachments">{message.attachmentIds.map(id => { const file = data.files.find(file => file.id === id); return file ? <button key={id} data-testid={isAudioFile(file)?'audio-attachment':undefined} onClick={() => isAudioFile(file)?playAudioAttachment(file,message):setFilePreviewId(id)}><FileText size={14} /><span>{file.name}{isAudioFile(file)?' · 播放音频':''}</span></button> : null; })}</div>}
+                {message.artifactContext && <div className="message-artifact-context" data-testid="message-artifact-context"><Monitor size={13}/>{message.artifactContext.artifactName} · 页面选区</div>}<div className="user-message-content"><HighlightText text={message.content} query={route.messageId === message.id ? route.query : null} /></div>{message.attachmentIds?.length > 0 && <div className="message-attachments">{message.attachmentIds.map(id => { const file = data.files.find(file => file.id === id); return file ? <button key={id} data-testid={isAudioFile(file)?'audio-attachment':undefined} onClick={() => isAudioFile(file)?playAudioAttachment(file,message):setFilePreviewId(id)}><FileText size={14} /><span>{file.name}{isAudioFile(file)?' · 播放音频':''}</span></button> : null; })}</div>}
                 <div className="message-actions user-message-actions"><CopyButton content={message.content} notify={notify} /><IconButton icon={Reply} label="引用回复" data-testid="quote-message" onClick={() => quoteMessage(message)} disabled={busy} /><IconButton icon={Trash2} label="删除消息" data-testid="delete-turn" onClick={() => askDeleteTurn(message)} disabled={busy} />{index === chat.messages.length - 1 && <IconButton icon={RefreshCw} label="继续回复" data-testid="retry-message" onClick={retry} disabled={busy} />}<span>{dateText(message.createdAt)}</span></div>
               </> : <>
                 {!!message.attachmentIds?.length&&<div className="message-attachments">{message.attachmentIds.map(id=>{const file=data.files.find(item=>item.id===id);return file&&isAudioFile(file)?<button key={id} data-testid="audio-attachment" disabled={message.status==='streaming'} onClick={()=>playAudioAttachment(file,message)}><FileText size={14}/>{file.name} · 播放音频</button>:null;})}</div>}
@@ -580,7 +622,7 @@ function App() {
     </div>
     <ApprovalQueue approvals={data.approvals} chats={data.chats} files={data.files} onRespond={input => api.respondApproval(input)} onOpenChat={id => openRoute({ type: 'chat', id })} notify={notify} />
     <AudioControls player={chatAudio}/>
-    {artifactsOpen && <ArtifactPanel artifacts={data.artifacts} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={()=>setArtifactsOpen(false)} notify={notify}/>}
+    {artifactsOpen && <ArtifactPanel artifacts={data.artifacts} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={()=>setArtifactsOpen(false)} notify={notify} annotationTarget={chat?.title || '新对话'} annotationTargetKey={composerKey} annotationUseTools={useTools} onAnnotationToolsChange={composerProps.onToolsChange} onAnnotate={(note,context)=>send(note,context)} onAnnotationSent={annotationSent}/>}
     {knowledgeOpen&&<KnowledgePanel data={data} workspaceId={knowledgeOpen.workspaceId} workspaceName={knowledgeOpen.workspaceName} onClose={()=>setKnowledgeOpen(false)} notify={notify}/>}
     {contextPreview&&<Modal title="将发送的知识上下文" subtitle="包含所选配置的资料；不包含密钥和其他未选择的知识。" onClose={()=>setContextPreview(null)} wide><div className="context-preview">{contextPreview.messages.map((message,index)=><pre key={index}>{message.content}</pre>)}<details><summary>来源与版本记录</summary><pre>{JSON.stringify(contextPreview.receipt,null,2)}</pre></details></div></Modal>}
     {schedulesOpen&&<SchedulePanel schedules={data.schedules} runs={data.scheduleRuns} workspaceId={workspaceId} workspaces={data.workspaces} files={data.files} settings={data.settings} app={data.app} notify={notify} onClose={()=>setSchedulesOpen(false)} onOpenChat={id=>{setSchedulesOpen(false);openRoute({type:'chat',id});}}/>}

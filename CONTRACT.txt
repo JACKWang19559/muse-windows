@@ -7,10 +7,13 @@ Data shape:
   Settings = {baseUrl, model, systemPrompt, temperature, hasApiKey, theme:'system'|'light'|'dark', language:'zh', speechBaseUrl, transcriptionModel, synthesisModel, synthesisVoice, hasSpeechApiKey, dictationAutoSend:boolean, backgroundTasks:boolean}
   Workspace = {id,name,description,color,createdAt,updatedAt}
   Chat = {id,title,workspaceId:null|string,createdAt,updatedAt,pinned:boolean,messages:Message[]}
-  Message = {id,role:'user'|'assistant',content,createdAt,status?:'complete'|'streaming'|'error'|'cancelled',attachmentIds?:string[],error?:string,agentMode?:boolean,toolTrace?:ToolRound[],replyTo?:{messageId,role,excerpt},isDeleted?:boolean}
+  Message = {id,role:'user'|'assistant',content,createdAt,status?:'complete'|'streaming'|'error'|'cancelled',attachmentIds?:string[],error?:string,agentMode?:boolean,toolTrace?:ToolRound[],replyTo?:{messageId,role,excerpt},artifactContext?:ArtifactContext,isDeleted?:boolean}
+  ArtifactContext = {kind:'artifact_element',artifactId,artifactName,buildId,sourceRevision,pagePath,element:{tag,id,classes:string[],text,path,viewport:{width,height},click:{x,y}}}
+    Captured through the current private preview port; host re-derives app/build metadata and validates scope before admission.
+    Stored history is untrusted reference data; replay alone grants no tool authority. A new selection or retry revalidates any selected app, and writes/builds need approval.
   ToolRound = {content,calls:[{id,name,arguments:string,status:'pending'|'running'|'awaiting_approval'|'complete'|'denied'|'error'|'cancelled',result?:string}]}
   File = {id,name,mime,size,workspaceId:null|string,createdAt,textStatus:'ready'|'unsupported'|'error',textPreview?,error?}
-  PendingSend = {id,chatId,content,attachmentIds,useTools,clientMessageId?,replyToMessageId?,queuedAt,state:'queued'|'failed',error?}
+  PendingSend = {id,chatId,content,attachmentIds,useTools,clientMessageId?,replyToMessageId?,artifactContext?:ArtifactContext,queuedAt,state:'queued'|'failed',error?}
   Snapshot = {settings,workspaces,chats,files,approvals:[{id,chatId,requestId,toolCallId,name,workspaceId,arguments,permissions,summary,createdAt}],pendingSends:PendingSend[],app:{version,platform,dataDirectory?}}
 
 window.muse methods:
@@ -40,8 +43,8 @@ window.muse methods:
   deleteChat({id}) -> Snapshot
   searchMessages({query,chatId?,workspaceId?,limit?:1..100,cursor?}) -> {hits:[{chatId,messageId,title,role,workspaceId,createdAt,snippet,matchStart,matchLength}],nextCursor:null|string}
   deleteTurn({chatId,messageId}) -> {chat:Chat,deletedMessageIds:string[]}  // user-only tombstone; active generation must be stopped first
-  sendMessage({chatId,content,attachmentIds?:string[],useTools?:boolean,replyToMessageId?:string,clientMessageId?:string}) -> {requestId:string}|{queued:true,queueId,chatId}
-  cancelQueuedMessage({id}) -> PendingSend  // remove waiting/failed intent; caller may restore it as a draft
+  sendMessage({chatId,content,attachmentIds?:string[],useTools?:boolean,replyToMessageId?:string,clientMessageId?:string,artifactContext?:ArtifactContext}) -> {requestId:string}|{queued:true,queueId,chatId}
+  cancelQueuedMessage({id,preserveForRestore?:boolean}) -> PendingSend  // true cancels dispatch but retains failed intent until renderer safely restores it; false/omitted removes it
   stopGeneration({chatId}) -> void
   respondApproval({id,decision:'approve'|'deny'}) -> Snapshot  // current live request only; never restores approval after restart
   retryMessage({chatId}) -> {requestId:string}

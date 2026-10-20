@@ -46,7 +46,7 @@ const server = http.createServer(async (request, response) => {
   const parsed = JSON.parse(body); requests.push(parsed);
   response.writeHead(200, { 'content-type':'text/event-stream' });
   const user = parsed.messages.filter(x => x.role === 'user').at(-1)?.content || '';
-  if (parsed.tools?.length && /AGENT_(CREATE|SAVE|DENY|STOP|APP|SCHEDULE|MEMORY)_DEMO|SCHEDULE_WRITE_DEMO/.test(user)) {
+  if (parsed.tools?.length && /AGENT_(CREATE|SAVE|DENY|STOP|APP|SCHEDULE|MEMORY|ANNOTATION)_DEMO|SCHEDULE_WRITE_DEMO/.test(user)) {
     const emitTool = (name, args) => {
       const id = 'call-desktop-' + requests.length, data = JSON.stringify(args), cut = Math.floor(data.length / 2);
       response.write('data: ' + JSON.stringify({ choices:[{delta:{tool_calls:[{index:0,id,type:'function',function:{name,arguments:data.slice(0,cut)}}]}}] }) + '\n\n');
@@ -55,6 +55,10 @@ const server = http.createServer(async (request, response) => {
     const last = parsed.messages.at(-1);
     if (last?.role === 'tool') {
       const receipt = JSON.parse(last.content), previous = parsed.messages.filter(message=>message.role==='assistant'&&message.tool_calls?.length).at(-1).tool_calls.at(-1);
+      if(user.includes('AGENT_ANNOTATION_DEMO')&&receipt.ok){
+        if(previous.function.name==='muse_read_app'){emitTool('muse_write_app',{id:receipt.result.app.id,expectedRevision:receipt.result.app.sourceRevision,files:[{path:'index.html',text:'<!doctype html><main><h1>ANNOTATED_APP_UPDATED_11</h1><button id="selected-action" class="one two three four">ELEMENT_CONTEXT_TOKEN</button></main>'}]});return;}
+        if(previous.function.name==='muse_write_app'){emitTool('muse_build_app',{id:receipt.result.app.id,expectedRevision:receipt.result.app.sourceRevision});return;}
+      }
       if(user.includes('AGENT_MEMORY_DEMO')&&receipt.ok&&previous.function.name==='memory_create'){emitTool('memory_read',{id:receipt.result.memory.id});return;}
       if (user.includes('AGENT_APP_DEMO') && receipt.ok) {
         if (previous.function.name === 'muse_create_app') { emitTool('muse_write_app',{id:receipt.result.app.id,expectedRevision:receipt.result.app.sourceRevision,files:[{path:'index.html',text:'<!doctype html><h1>MODEL-APP-42</h1><button onclick="this.textContent=\'READY\'">Run</button>'}]}); return; }
@@ -67,7 +71,8 @@ const server = http.createServer(async (request, response) => {
       const text = receipt.ok ? '文件操作已完成，结果已回传。' : '用户没有批准，本次没有写入。';
       response.end('data: '+JSON.stringify({choices:[{delta:{content:text},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n'); return;
     }
-    if(user.includes('AGENT_MEMORY_DEMO'))emitTool('memory_create',{name:'模型创建的知识',contentMarkdown:'KNOWLEDGE-MODEL-CREATED-42'});
+    if(user.includes('AGENT_ANNOTATION_DEMO')){const target=/\n应用: [^\n]* \(([A-Za-z0-9_-]+)\)\n构建:/.exec(user);emitTool('muse_read_app',{id:target?.[1]||'missing-annotation-target'});}
+    else if(user.includes('AGENT_MEMORY_DEMO'))emitTool('memory_create',{name:'模型创建的知识',contentMarkdown:'KNOWLEDGE-MODEL-CREATED-42'});
     else if (user.includes('AGENT_SCHEDULE_DEMO')) emitTool('muse_create_schedule',{name:'模型创建的计划',prompt:'SCHEDULE_MODEL_CREATED_RESULT',cadence:{kind:'daily',timeZone:'Asia/Shanghai',time:'09:00'},enabled:false,notification:'none'});
     else if(user.includes('SCHEDULE_WRITE_DEMO'))emitTool('workspace_create_text_file',{name:'scheduled-write-rejected.md',content:'must not commit'});
     else if (user.includes('AGENT_APP_DEMO')) emitTool('muse_create_app',{name:'模型创建的应用',runtime:'html'});
@@ -75,7 +80,8 @@ const server = http.createServer(async (request, response) => {
     else emitTool('workspace_create_text_file',{name:user.includes('AGENT_DENY_DEMO')?'denied-agent.md':user.includes('AGENT_STOP_DEMO')?'stopped-agent.md':'agent-created.md',content:'# AGENT-CREATED-42'});
     return;
   }
-  const chunks = user.includes('取消') ? Array(200).fill('进行中的回复。') : ['# 桌面验收通过\n\n','已收到你的问题。','参考资料代号：**WIND-CEDAR-42**。\n\n','- 流式中文回复\n- 本地文件上下文\n'];
+  const annotationOK=user.includes('[User annotated an element in their artifact]')&&user.includes('Element: button#selected-action.one.two.three')&&user.includes('DOM path: body > main > button')&&user.includes('Viewport: ')&&user.includes('Click position: ')&&user.includes('ELEMENT_CONTEXT_TOKEN')&&!user.includes('PRIVATE_INPUT_VALUE_NOT_CONTEXT');
+  const chunks = user.includes('ANNOTATION_DEMO') ? [annotationOK?'ANNOTATION_CONTEXT_RECEIVED':'ANNOTATION_CONTEXT_MISSING'] : user.includes('取消') ? Array(200).fill('进行中的回复。') : ['# 桌面验收通过\n\n','已收到你的问题。','参考资料代号：**WIND-CEDAR-42**。\n\n','- 流式中文回复\n- 本地文件上下文\n'];
   let index = 0;
   const timer = setInterval(() => {
     if (index >= chunks.length) { clearInterval(timer); response.end('data: [DONE]\n\n'); return; }

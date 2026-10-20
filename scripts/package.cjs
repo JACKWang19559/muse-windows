@@ -16,7 +16,7 @@ fs.cpSync(runtime, destination, { recursive: true });
 fs.renameSync(path.join(destination, 'electron.exe'), path.join(destination, 'Muse.exe'));
 const application = path.join(destination, 'resources', 'app');
 fs.mkdirSync(application, { recursive: true });
-for (const item of ['main.cjs','preload.cjs','backend','build','assets','scripts/desktop-scenario.cjs','scripts/chat-lifecycle-scenario.cjs','scripts/queue-scenario.cjs','scripts/artifact-scenario.cjs','scripts/artifact-editing-scenario.cjs','scripts/scheduler-scenario.cjs','scripts/knowledge-scenario.cjs','scripts/dictation-scenario.cjs','scripts/audio-scenario.cjs','scripts/quit-cancel-scenario.cjs','scripts/live-provider-scenario.cjs']) {
+for (const item of ['main.cjs','preload.cjs','backend','build','assets','scripts/desktop-scenario.cjs','scripts/chat-lifecycle-scenario.cjs','scripts/queue-scenario.cjs','scripts/artifact-scenario.cjs','scripts/artifact-editing-scenario.cjs','scripts/artifact-annotation-scenario.cjs','scripts/scheduler-scenario.cjs','scripts/knowledge-scenario.cjs','scripts/dictation-scenario.cjs','scripts/audio-scenario.cjs','scripts/quit-cancel-scenario.cjs','scripts/live-provider-scenario.cjs']) {
   const source = path.join(root, item);
   if (fs.existsSync(source)) { fs.mkdirSync(path.dirname(path.join(application,item)),{recursive:true}); fs.cpSync(source, path.join(application, item), { recursive: true }); }
 }
