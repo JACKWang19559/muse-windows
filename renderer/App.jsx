@@ -19,6 +19,7 @@ import ArtifactPanel from './ArtifactPanel.jsx';
 import SchedulePanel from './SchedulePanel.jsx';
 import KnowledgePanel from './KnowledgePanel.jsx';
 import { useDictation } from './DictationControl.jsx';
+import { useAudioPlayback, AudioControls, isAudioFile } from './AudioPlayback.jsx';
 
 const api = window.muse;
 const COLORS = ['#47766a', '#607eb3', '#a07cb5', '#c49456', '#bd7777', '#7c8992'];
@@ -211,29 +212,35 @@ function EntityDialog({ entity, onClose, onSave }) {
 }
 
 function SettingsDialog({ settings, app, onClose, onSaved, onImport, notify, onThemePreview }) {
+  const preview=useAudioPlayback('preview',notify);
+  const [sampleText,setSampleText]=useState('Hi, I’m Muse. Glad to be here!');
   const [tab, setTab] = useState('connection');
   const [draft, setDraft] = useState({ ...settings, apiKey: '', clearApiKey: false, speechApiKey:'', clearSpeechApiKey:false });
   const [models, setModels] = useState([]);
   const [busy, setBusy] = useState('');
+  const busyRef=useRef(false),editRevision=useRef(0),previewIntent=useRef(0);
   const [result, setResult] = useState(null);
   const [showKey, setShowKey] = useState(false);
-  const set = (name, value) => setDraft(previous => ({ ...previous, [name]: value }));
+  useEffect(()=>{if(tab!=='speech')preview.stop();},[tab]);
+  useEffect(()=>()=>{previewIntent.current++;},[]);
+  const set = (name, value) => {editRevision.current++;if(['speechBaseUrl','speechApiKey','clearSpeechApiKey','synthesisModel','synthesisVoice'].includes(name)){previewIntent.current++;preview.stop();}setDraft(previous => ({ ...previous, [name]: value }));};
   const save = async () => {
-    const input = { baseUrl: (draft.baseUrl || '').trim(), model: (draft.model || '').trim(), systemPrompt: draft.systemPrompt || '', temperature: Number(draft.temperature ?? .7), theme: draft.theme || 'system', speechBaseUrl:draft.speechBaseUrl||'', transcriptionModel: draft.transcriptionModel || '', dictationAutoSend:draft.dictationAutoSend===true };
+    const revision=editRevision.current,submitted=draft;
+    const input = { baseUrl: (draft.baseUrl || '').trim(), model: (draft.model || '').trim(), systemPrompt: draft.systemPrompt || '', temperature: Number(draft.temperature ?? .7), theme: draft.theme || 'system', speechBaseUrl:draft.speechBaseUrl||'', transcriptionModel: draft.transcriptionModel || '', synthesisModel:draft.synthesisModel||'',synthesisVoice:draft.synthesisVoice||'',dictationAutoSend:draft.dictationAutoSend===true };
     if (draft.apiKey.trim()) input.apiKey = draft.apiKey.trim();
     else if (draft.clearApiKey) input.clearApiKey = true;
     if(draft.speechApiKey.trim())input.speechApiKey=draft.speechApiKey.trim();else if(draft.clearSpeechApiKey)input.clearSpeechApiKey=true;
     const saved = await api.saveSettings(input);
     onSaved(saved);
-    setDraft(previous => ({ ...previous, ...saved, apiKey: '', clearApiKey: false, speechApiKey:'', clearSpeechApiKey:false }));
+    setDraft(previous => editRevision.current===revision?({ ...previous, ...saved, apiKey: '', clearApiKey: false, speechApiKey:'', clearSpeechApiKey:false }):({...previous,hasApiKey:saved.hasApiKey,hasSpeechApiKey:saved.hasSpeechApiKey,apiKey:previous.apiKey===submitted.apiKey?'':previous.apiKey,speechApiKey:previous.speechApiKey===submitted.speechApiKey?'':previous.speechApiKey,clearApiKey:previous.clearApiKey===submitted.clearApiKey?false:previous.clearApiKey,clearSpeechApiKey:previous.clearSpeechApiKey===submitted.clearSpeechApiKey?false:previous.clearSpeechApiKey}));
     return saved;
   };
-  const perform = async (kind, task) => { if (busy) return; setBusy(kind); setResult(null); try { await task(); } catch (error) { setResult({ ok: false, message: error.message }); } finally { setBusy(''); } };
-  const close = () => { if (!busy) { onThemePreview(null); onClose(); } };
+  const perform = async (kind, task) => { if (busyRef.current) return;busyRef.current=true; setBusy(kind); setResult(null); try { await task(); } catch (error) { setResult({ ok: false, message: error.message }); } finally { busyRef.current=false;setBusy(''); } };
+  const close = () => { if (!busyRef.current) {previewIntent.current++; onThemePreview(null); onClose(); } };
   return <Modal title="设置" subtitle="让 Muse 按你的方式工作。" onClose={close} className="settings-modal" testId="settings-dialog">
     <div className="settings-layout"><nav className="settings-nav" aria-label="设置分类">{[
-      ['connection', Server, '模型连接'], ['speech', MessageCircle, '语音输入'], ['preferences', SlidersHorizontal, '使用偏好'], ['data', Database, '数据管理'],
-    ].map(([id, Icon, label]) => <button type="button" key={id} className={tab === id ? 'active' : ''} onClick={() => { setTab(id); setResult(null); }}><Icon size={17} />{label}</button>)}<span className="settings-version">Muse Windows<br />版本 {app.version || '0.1.0'}</span></nav>
+      ['connection', Server, '模型连接'], ['speech', MessageCircle, '语音输入与声音'], ['preferences', SlidersHorizontal, '使用偏好'], ['data', Database, '数据管理'],
+    ].map(([id, Icon, label]) => <button type="button" key={id} className={tab === id ? 'active' : ''} onClick={() => {previewIntent.current++;preview.stop();setTab(id); setResult(null); }}><Icon size={17} />{label}</button>)}<span className="settings-version">Muse Windows<br />版本 {app.version || '0.1.0'}</span></nav>
       <div className="settings-pane">{tab === 'connection' && <>
         <div className="section-heading"><span className="section-icon"><Server size={20} /></span><div><h3>连接你的模型</h3><p>支持 OpenAI 兼容的模型 API。</p></div></div>
         <label className="field"><span>API 地址</span><input data-testid="settings-base-url" value={draft.baseUrl || ''} onChange={event => set('baseUrl', event.target.value)} placeholder="https://api.openai.com/v1" spellCheck={false} /><small>填写服务地址，也可以填写完整的 /chat/completions 地址。</small></label>
@@ -251,6 +258,12 @@ function SettingsDialog({ settings, app, onClose, onSaved, onImport, notify, onT
         {(draft.hasSpeechApiKey||draft.clearSpeechApiKey)&&<button className="text-button danger-text" onClick={()=>{set('clearSpeechApiKey',!draft.clearSpeechApiKey);set('speechApiKey','');}}>{draft.clearSpeechApiKey?'撤销清除语音密钥':'清除语音密钥'}</button>}
         <label className="speech-auto-send"><input type="checkbox" data-testid="settings-dictation-auto-send" checked={draft.dictationAutoSend===true} onChange={event=>set('dictationAutoSend',event.target.checked)}/>停止录音后自动发送识别文字</label>
         <p className="field-hint">默认先放回草稿审阅，也可在录音时点“识别后发送”。每段最多两分钟；识别请求只发送这段录音，音频不保存到聊天或备份。转写后发送聊天会使用当前资料和模型设置。</p>
+        <div className="section-heading voice-preview-heading"><div><h3>声音试听</h3><p>使用上方语音服务和密钥，试听指定声音。</p></div></div>
+        <label className="field"><span>声音合成模型</span><input data-testid="settings-synthesis-model" value={draft.synthesisModel||''} onChange={event=>set('synthesisModel',event.target.value)} placeholder="服务商提供的声音合成模型名"/></label>
+        <label className="field"><span>声音 ID</span><input data-testid="settings-synthesis-voice" value={draft.synthesisVoice||''} onChange={event=>set('synthesisVoice',event.target.value)} placeholder="服务商提供的声音 ID"/></label>
+        <label className="field"><span>试听文字</span><textarea data-testid="settings-sample-text" rows={2} value={sampleText} maxLength={8192} onChange={event=>{previewIntent.current++;preview.stop();setSampleText(event.target.value);}}/><small>仅这段样句发送到语音服务，不附带聊天和文件。合成音频只用于本次试听。</small></label>
+        <button type="button" className="button secondary" data-testid="voice-preview-start" disabled={!!busy||!draft.synthesisModel?.trim()||!draft.synthesisVoice?.trim()||!draft.speechBaseUrl?.trim()} onClick={()=>perform('preview',async()=>{const intent=++previewIntent.current;await save();if(intent!==previewIntent.current)return;await preview.play({text:sampleText.trim()?sampleText:'Hi, I’m Muse. Glad to be here!'},{label:'声音试听'});})}>保存并试听</button>
+        <AudioControls player={preview} compact/>
       </>}
       {tab === 'preferences' && <>
         <div className="section-heading"><span className="section-icon"><SlidersHorizontal size={20} /></span><div><h3>为你的想法，留一点空间</h3><p>调整助手的回应方式和工作台外观。</p></div></div>
@@ -314,6 +327,7 @@ function App() {
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const deferredDeltas = useRef(new Map());
   const notify = useCallback((message, kind = 'success') => { clearTimeout(toastTimer.current); setToast({ message: String(message || '操作完成'), kind }); toastTimer.current = setTimeout(() => setToast(null), kind === 'error' ? 6500 : 3200); }, []);
+  const chatAudio=useAudioPlayback('chat',notify);
 
   const replaceSnapshot = useCallback(incoming => {
     if (!incoming) return;
@@ -494,6 +508,7 @@ function App() {
   const updateChat = async input => { try { const saved = await api.updateChat(input); setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, saved) })); } catch (error) { notify(error.message, 'error'); } setMenu(null); };
   const askRemoveFile = file => setConfirm({ title: '移除这份文件？', body: `“${file.name}”及其未保存修改将从工作台中移除。你电脑中的原始文件不会改变。`, action: '移除文件', run: async () => { replaceSnapshot(await api.removeFile({ id: file.id })); setAttachments(previous => Object.fromEntries(Object.entries(previous).map(([key, ids]) => [key, ids.filter(id => id !== file.id)]))); closeFilePreview(file.id); } });
   const quoteMessage = message => { setQuotes(previous => ({ ...previous, [composerKey]: message.id })); window.dispatchEvent(new Event('muse-focus-composer')); };
+  const playAudioAttachment=(file,message)=>{if(chatAudio.view?.owner?.fileId===file.id){if(chatAudio.view.state==='playing')chatAudio.pause();else if(chatAudio.view.state==='paused')chatAudio.resume();return;}chatAudio.play({chatId:chat.id,messageId:message.id,fileId:file.id},{label:file.name});};
   const askDeleteTurn = message => setConfirm({ title: '删除这条消息？', body: '这条用户消息的正文、附件关联和引用摘录将被清除，并保留删除占位。其他回复和已经完成的文件操作记录会保留。', action: '删除消息', run: async () => {
     const result = await api.deleteTurn({ chatId: chat.id, messageId: message.id });
     setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, result.chat) }));
@@ -504,7 +519,7 @@ function App() {
   const exportChat = async format => { setMenu(null); try { const result = await api.exportChat({ chatId: chat.id, format }); if (!result.cancelled) notify('对话已导出'); } catch (error) { notify(error.message, 'error'); } };
   const composerProps = { value: draft, onChange: updateDraft, attachedFiles, onRemoveAttachment: id => setAttachments(previous => ({ ...previous, [composerKey]: attachedIds.filter(item => item !== id) })), onImport: () => addFiles(), onDrop: files => { dragCount.current = 0; setDragging(false); if (files.length) addFiles(files); }, onSend: send, onStop: stop, busy, admitting: sending, importing, model: data.settings.model, configured, useTools, onToolsChange: enabled => { modeRevisions.current.set(composerKey, (modeRevisions.current.get(composerKey) || 0) + 1); setAgentModes(previous => ({ ...previous, [composerKey]: enabled })); }, quote, onClearQuote: () => setQuotes(previous => ({ ...previous, [composerKey]: null })), historyMessages: chat?.messages, historyKey: composerKey };
   composerProps.knowledgeControl=<div className="knowledge-chatbar"><button className="text-button" data-testid="knowledge-open" onClick={()=>setKnowledgeOpen({workspaceId,workspaceName:workspace?.name})}><Database size={13}/>知识与技能</button><select aria-label="聊天知识配置" data-testid="chat-profile" value={selectedProfileId} disabled={busy||sending} onChange={async event=>{const profileId=event.target.value||null;try{if(chat)await api.updateChat({id:chat.id,profileId});else setDraftProfiles(previous=>({...previous,[workspaceId||'global']:profileId}));}catch(error){notify(error.message,'error');}}}><option value="">不附加知识配置</option>{data.agentProfiles.filter(item=>item.workspaceId===workspaceId).map(item=><option key={item.id} value={item.id} disabled={item.needsReview}>{item.name}{item.needsReview?'（待确认）':''}</option>)}</select>{chat&&selectedProfileId&&<button className="text-button" data-testid="context-preview" onClick={async()=>{try{setContextPreview(await api.previewSelectedContext({chatId:chat.id,useTools}));}catch(error){notify(error.message,'error');}}}>查看将发送的知识</button>}</div>;
-  composerProps.dictationProps={owner:{scopeKey:composerKey,workspaceId,chatId:chat?.id||null,profileId:selectedProfileId||null,useTools},contextKey:JSON.stringify([composerKey,workspaceId,selectedProfileId,data.agentProfiles.find(item=>item.id===selectedProfileId)?.revision,useTools,attachedIds,quote?.id,data.settings]),settings:data.settings,onConfigure:()=>setSettingsOpen(true),notify};
+  composerProps.dictationProps={owner:{scopeKey:composerKey,workspaceId,chatId:chat?.id||null,profileId:selectedProfileId||null,useTools},contextKey:JSON.stringify([composerKey,workspaceId,selectedProfileId,data.agentProfiles.find(item=>item.id===selectedProfileId)?.revision,useTools,attachedIds,quote?.id,Object.fromEntries(Object.entries(data.settings).filter(([key])=>!['synthesisModel','synthesisVoice'].includes(key)))]),settings:data.settings,onConfigure:()=>setSettingsOpen(true),notify};
 
   if (!snapshot) return <div className="boot-screen"><Brand size={56} /><h1>Muse</h1>{bootError ? <><p className="boot-error">{bootError}</p><button className="button secondary" onClick={() => window.location.reload()}><RefreshCw size={15} />重新打开</button></> : <p><Spinner size={16} />正在打开你的工作台…</p>}</div>;
 
@@ -540,9 +555,10 @@ function App() {
             {chat.messages.length ? chat.messages.map((message, index) => <article className={`message message-${message.role} ${route.messageId === message.id ? 'message-search-target' : ''}`} key={message.id} tabIndex={-1} data-role={message.role} data-message-id={message.id} data-status={message.status || 'complete'}>
               {message.role === 'assistant' && <span className="assistant-avatar"><Brand size={23} /></span>}<div className="message-body">{message.role === 'user' ? message.isDeleted ? <p className="message-deleted" data-testid="deleted-message"><Trash2 size={13} />你删除了一条消息</p> : <>
                 {message.replyTo && <button className="message-quote" data-testid="message-quote" onClick={() => openRoute({ type: 'chat', id: chat.id, messageId: message.replyTo.messageId })}><Reply size={14} /><span><strong>{message.replyTo.role === 'user' ? '你' : 'Muse'}</strong>{chat.messages.find(item => item.id === message.replyTo.messageId)?.isDeleted ? '已删除的消息' : excerpt(message.replyTo.excerpt || '附件消息', 180)}</span></button>}
-                <div className="user-message-content"><HighlightText text={message.content} query={route.messageId === message.id ? route.query : null} /></div>{message.attachmentIds?.length > 0 && <div className="message-attachments">{message.attachmentIds.map(id => { const file = data.files.find(file => file.id === id); return file ? <button key={id} onClick={() => setFilePreviewId(id)}><FileText size={14} /><span>{file.name}</span></button> : null; })}</div>}
+                <div className="user-message-content"><HighlightText text={message.content} query={route.messageId === message.id ? route.query : null} /></div>{message.attachmentIds?.length > 0 && <div className="message-attachments">{message.attachmentIds.map(id => { const file = data.files.find(file => file.id === id); return file ? <button key={id} data-testid={isAudioFile(file)?'audio-attachment':undefined} onClick={() => isAudioFile(file)?playAudioAttachment(file,message):setFilePreviewId(id)}><FileText size={14} /><span>{file.name}{isAudioFile(file)?' · 播放音频':''}</span></button> : null; })}</div>}
                 <div className="message-actions user-message-actions"><CopyButton content={message.content} notify={notify} /><IconButton icon={Reply} label="引用回复" data-testid="quote-message" onClick={() => quoteMessage(message)} disabled={busy} /><IconButton icon={Trash2} label="删除消息" data-testid="delete-turn" onClick={() => askDeleteTurn(message)} disabled={busy} />{index === chat.messages.length - 1 && <IconButton icon={RefreshCw} label="继续回复" data-testid="retry-message" onClick={retry} disabled={busy} />}<span>{dateText(message.createdAt)}</span></div>
               </> : <>
+                {!!message.attachmentIds?.length&&<div className="message-attachments">{message.attachmentIds.map(id=>{const file=data.files.find(item=>item.id===id);return file&&isAudioFile(file)?<button key={id} data-testid="audio-attachment" disabled={message.status==='streaming'} onClick={()=>playAudioAttachment(file,message)}><FileText size={14}/>{file.name} · 播放音频</button>:null;})}</div>}
                 <AgentActivity trace={message.toolTrace} files={data.files} onOpenFile={setFilePreviewId} />
                 {!message.content && message.status === 'streaming' ? <div className="thinking"><span /><span /><span /><small>{data.approvals.some(approval => approval.chatId === chat.id) ? '等待你确认文件操作' : '正在思考'}</small></div> : <Markdown content={message.content} notify={notify} highlight={route.messageId === message.id ? route.query : null} />}
                 {message.status === 'streaming' && message.content && <span className="stream-caret" aria-label="正在生成" />}
@@ -563,6 +579,7 @@ function App() {
       {filePreviewIds.length > 0 && <FileEditor ids={filePreviewIds} activeId={filePreviewId} files={data.files} onSelect={setFilePreviewId} onCloseTab={closeFilePreview} onClose={() => { setFilePreviewIds([]); selectFilePreview(null); }} onRemove={askRemoveFile} notify={notify} Modal={Modal} renderMarkdown={content => <Markdown content={content} notify={notify} />} />}
     </div>
     <ApprovalQueue approvals={data.approvals} chats={data.chats} files={data.files} onRespond={input => api.respondApproval(input)} onOpenChat={id => openRoute({ type: 'chat', id })} notify={notify} />
+    <AudioControls player={chatAudio}/>
     {artifactsOpen && <ArtifactPanel artifacts={data.artifacts} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={()=>setArtifactsOpen(false)} notify={notify}/>}
     {knowledgeOpen&&<KnowledgePanel data={data} workspaceId={knowledgeOpen.workspaceId} workspaceName={knowledgeOpen.workspaceName} onClose={()=>setKnowledgeOpen(false)} notify={notify}/>}
     {contextPreview&&<Modal title="将发送的知识上下文" subtitle="包含所选配置的资料；不包含密钥和其他未选择的知识。" onClose={()=>setContextPreview(null)} wide><div className="context-preview">{contextPreview.messages.map((message,index)=><pre key={index}>{message.content}</pre>)}<details><summary>来源与版本记录</summary><pre>{JSON.stringify(contextPreview.receipt,null,2)}</pre></details></div></Modal>}

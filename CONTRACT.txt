@@ -4,7 +4,7 @@ Renderer accesses only window.muse. Keys and filesystem paths stay in the main p
 All public methods below return Promises except subscribe (which returns an unsubscribe function).
 
 Data shape:
-  Settings = {baseUrl, model, systemPrompt, temperature, hasApiKey, theme:'system'|'light'|'dark', language:'zh', speechBaseUrl, transcriptionModel, hasSpeechApiKey, dictationAutoSend:boolean, backgroundTasks:boolean}
+  Settings = {baseUrl, model, systemPrompt, temperature, hasApiKey, theme:'system'|'light'|'dark', language:'zh', speechBaseUrl, transcriptionModel, synthesisModel, synthesisVoice, hasSpeechApiKey, dictationAutoSend:boolean, backgroundTasks:boolean}
   Workspace = {id,name,description,color,createdAt,updatedAt}
   Chat = {id,title,workspaceId:null|string,createdAt,updatedAt,pinned:boolean,messages:Message[]}
   Message = {id,role:'user'|'assistant',content,createdAt,status?:'complete'|'streaming'|'error'|'cancelled',attachmentIds?:string[],error?:string,agentMode?:boolean,toolTrace?:ToolRound[],replyTo?:{messageId,role,excerpt},isDeleted?:boolean}
@@ -15,12 +15,18 @@ Data shape:
 
 window.muse methods:
   bootstrap() -> Snapshot
-  saveSettings({baseUrl,model,apiKey?:string,clearApiKey?:boolean,systemPrompt,temperature,theme,speechBaseUrl?,transcriptionModel?,speechApiKey?:string,clearSpeechApiKey?:boolean,dictationAutoSend?:boolean}) -> Settings
+  saveSettings({baseUrl,model,apiKey?:string,clearApiKey?:boolean,systemPrompt,temperature,theme,speechBaseUrl?,transcriptionModel?,synthesisModel?,synthesisVoice?,speechApiKey?:string,clearSpeechApiKey?:boolean,dictationAutoSend?:boolean}) -> Settings
   startDictation({scopeKey,workspaceId:null|string,chatId:null|string,profileId?:null|string,useTools?:boolean}) -> DictationSession
   dictationCaptureReady({id}) -> DictationSession
   finishDictation({id,audio:ArrayBuffer}) -> DictationSession & {text?:string}
   cancelDictation({id,reason?:string}) -> DictationSession|null
   getDictationState() -> DictationSession|null
+  prepareAudio({channel:'preview',requestId?:string,text:string}|{channel:'chat',requestId?:string,chatId,messageId,fileId}) -> AudioSession & {audio?:ArrayBuffer,mimeType?:string}
+  updateAudioState({channel:'preview'|'chat',id,state:'playing'|'paused'|'ended'|'error'}) -> AudioSession
+  stopAudio({channel:'preview'|'chat',id?:string,requestId?:string}) -> AudioSession|null
+  getAudioState({channel:'preview'|'chat'}) -> AudioSession|null
+    AudioSession = {id,owner:{channel,requestId,chatId?,messageId?,fileId?},state:'loading'|'ready'|'playing'|'paused'|'ended'|'stopped'|'error',createdAt,updatedAt,reason?}
+    Preview and attachment channels are independent. Only prepareAudio returns owned binary, never a file path or secret.
     DictationSession = {id,owner:{scopeKey,workspaceId,chatId},state:'preparing'|'recording'|'finishing'|'complete'|'cancelled'|'error',createdAt,updatedAt,endedAt?,errorCode?}
     Only successful finish returns text. Snapshots/events/history contain metadata, never audio, provider bindings, keys or transcript.
     Start accepts profile/tool selection separately; manager owner is projected to exactly three identity fields.
@@ -55,6 +61,7 @@ window.muse methods:
   subscribe(callback) -> unsubscribe
 
 Events:
+  {type:'audio-state',channel:'preview'|'chat',session:AudioSession}
   {type:'dictation-state',session:DictationSession}
   {type:'snapshot',snapshot:Snapshot}
   {type:'chat-delta',chatId,messageId,delta,content}
@@ -94,6 +101,9 @@ Backend module boundaries (main process):
     Memory-only FIFO reservations; optional per-chat lanes are a Windows adaptation, not original Muse server behavior.
 
 Important invariants:
+  Preview synthesis uses speechBaseUrl/synthesisModel/synthesisVoice and the independently encrypted speech credential. No chat text is automatically converted to TTS.
+  A chat audio source must be attached to the selected saved message at start. The chosen track then survives ordinary route/message/chat removal; deleting/changing the managed source revokes it.
+  Per-channel request IDs prevent old stop/late load operations from replacing a newer session. Both metadata histories exclude binary audio and provider bindings.
   Dictation requires a visible, restored main window and explicit start. Audio-only media permission is restricted to that exact main frame during preparing/recording.
   A single dictation captures provider/settings/key digests, owner and selected knowledge lease. Changes, hide/minimize, navigation, renderer loss and close invalidate it.
   Capture uses bounded mono 16kHz PCM16 WAV (120 seconds, 3,840,044 total bytes). ASR uses a separate endpoint/model/secret; it never borrows the chat key or retries uncertain requests.

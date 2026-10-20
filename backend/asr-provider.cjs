@@ -54,6 +54,7 @@ function normalizeSpeechBaseUrl(value) {
     }
   }
   let pathname = url.pathname.replace(/\/+$/, '');
+  if(pathname.endsWith('/audio/speech'))pathname=pathname.slice(0,-'/audio/speech'.length)+'/audio/transcriptions';
   if (/\/(?:chat\/completions|models)$/.test(pathname)) throw configuration('请填写语音识别服务地址，不能使用聊天或模型列表接口。');
   if (!pathname) pathname = '/v1';
   if (!pathname.endsWith('/audio/transcriptions')) pathname += '/audio/transcriptions';

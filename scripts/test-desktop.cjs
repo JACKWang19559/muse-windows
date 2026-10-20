@@ -18,8 +18,18 @@ fs.writeFileSync(path.join(folder,'reference.docx'),zipSync({'word/document.xml'
 }
 const requests = [];
 const speechRequests=[];
+const ttsRequests=[];
+function silentWav(seconds=8){const rate=24000,length=Math.round(rate*seconds)*2,bytes=Buffer.alloc(44+length);bytes.write('RIFF');bytes.writeUInt32LE(bytes.length-8,4);bytes.write('WAVEfmt ',8);bytes.writeUInt32LE(16,16);bytes.writeUInt16LE(1,20);bytes.writeUInt16LE(1,22);bytes.writeUInt32LE(rate,24);bytes.writeUInt32LE(rate*2,28);bytes.writeUInt16LE(2,32);bytes.writeUInt16LE(16,34);bytes.write('data',36);bytes.writeUInt32LE(length,40);return bytes;}
+fs.writeFileSync(path.join(folder,'reference.wav'),silentWav(12));
 const server = http.createServer(async (request, response) => {
   if (request.url === '/v1/models') { response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify({ data:[{id:'desktop-test-model'}] })); return; }
+  if(request.url==='/v1/audio/speech'){
+    try{let data='';for await(const chunk of request){data+=chunk;if(data.length>40000)throw new Error('Oversized mock input');}const parsed=JSON.parse(data);
+      if(request.headers.authorization!=='Bearer desktop-speech-secret'||parsed.response_format!=='wav'||parsed.stream_format!=='audio'||!['desktop-tts','desktop-tts-slow','desktop-tts-error'].includes(parsed.model))throw new Error('Invalid mock TTS request');
+      ttsRequests.push({model:parsed.model,voice:parsed.voice,input:parsed.input,format:parsed.response_format});
+      setTimeout(()=>{if(response.destroyed)return;if(parsed.model==='desktop-tts-error'){response.writeHead(503,{'content-type':'application/json'});response.end(JSON.stringify({error:{message:'synthetic provider failure'}}));}else{response.writeHead(200,{'content-type':'audio/wav'});response.end(silentWav());}},parsed.model==='desktop-tts-slow'?900:30);
+    }catch{response.writeHead(400);response.end('Invalid mock TTS request');}return;
+  }
   if(request.url==='/v1/audio/transcriptions'){
     try{
       const chunks=[];let size=0;for await(const chunk of request){size+=chunk.length;if(size>3900000)throw new Error('Synthetic audio upload too large');chunks.push(chunk);}
@@ -101,6 +111,7 @@ server.listen(0, '127.0.0.1', async () => {
     fs.writeFileSync(path.join(folder, 'electron.log'), output);
     fs.writeFileSync(path.join(folder, 'provider-requests.json'), JSON.stringify(requests, null, 2));
     fs.writeFileSync(path.join(folder,'speech-requests.json'),JSON.stringify({capture:'Chromium fake device only',requests:speechRequests},null,2));
+    fs.writeFileSync(path.join(folder,'tts-requests.json'),JSON.stringify({playback:'synthetic silent WAV with webContents muted',requests:ttsRequests},null,2));
     let desktopChecks;try{desktopChecks=JSON.parse(fs.readFileSync(path.join(folder,'desktop-checks.json'),'utf8'));}catch{}
     const runtimeAtExit=manifest(),driftedFiles=[...new Set([...Object.keys(runtimeAtLaunch),...Object.keys(runtimeAtExit)])].filter(name=>runtimeAtLaunch[name]!==runtimeAtExit[name]);
     const evidence = { exit_code:code, desktop_checks_completed:desktopChecks?.passed===true, desktop_check_count:desktopChecks?.check_count||0, folder, application, executable:binary, executable_sha256:executableAtLaunch, version:JSON.parse(fs.readFileSync(path.join(application,'package.json'),'utf8')).version, main_sha256:runtimeAtLaunch['main.cjs'], runtime_source_unchanged:driftedFiles.length===0&&hash(binary)===executableAtLaunch, drifted_runtime_files:driftedFiles,runtime_hashes:runtimeAtLaunch, provider_requests:requests.length, workspace_document_reached_provider:requests.some(x=>JSON.stringify(x.messages).includes('WIND-CEDAR-42')) };

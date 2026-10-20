@@ -20,7 +20,7 @@ const MAX_EDITABLE_FILE_BYTES = 1024 * 1024;
 const MAX_REPLY_EXCERPT_CHARS = 2000;
 const FILE_EDIT_DIRECTORY = /^\.file-edit-[0-9a-f-]{36}$/;
 const ID = /^[A-Za-z0-9_-]{1,100}$/;
-const DEFAULTS = { baseUrl: 'https://api.openai.com/v1', model: '', systemPrompt: '你是一位认真、清晰、乐于协作的 AI 助手。请优先使用中文回答，并明确区分事实与推测。', temperature: 0.7, theme: 'system', language: 'zh', speechBaseUrl: '', transcriptionModel: '', dictationAutoSend: false, backgroundTasks: false };
+const DEFAULTS = { baseUrl: 'https://api.openai.com/v1', model: '', systemPrompt: '你是一位认真、清晰、乐于协作的 AI 助手。请优先使用中文回答，并明确区分事实与推测。', temperature: 0.7, theme: 'system', language: 'zh', speechBaseUrl: '', transcriptionModel: '', synthesisModel:'', synthesisVoice:'', dictationAutoSend: false, backgroundTasks: false };
 const SETTINGS_KEYS = Object.keys(DEFAULTS);
 const stamp = () => new Date().toISOString();
 const uid = kind => `${kind}_${crypto.randomUUID()}`;
@@ -69,7 +69,7 @@ function validateSettings(value, current = DEFAULTS, patch = false) {
     else if (key === 'temperature') { if (typeof value[key] !== 'number' || !Number.isFinite(value[key]) || value[key] < 0 || value[key] > 2) fail('温度必须在 0 到 2 之间。'); result[key] = value[key]; }
     else if (key === 'theme') { if (!['light', 'dark', 'system'].includes(value[key])) fail('主题设置无效。'); result[key] = value[key]; }
     else if (key === 'language') { if (value[key] !== 'zh') fail('语言设置无效。'); result[key] = 'zh'; }
-    else result[key] = string(value[key], '设置字段', key === 'systemPrompt' ? 50000 : ['baseUrl','speechBaseUrl'].includes(key) ? 2048 : 500).trim();
+    else result[key] = string(value[key], '设置字段', key === 'systemPrompt' ? 50000 : ['baseUrl','speechBaseUrl'].includes(key) ? 2048 : ['transcriptionModel','synthesisModel'].includes(key)?600:key==='synthesisVoice'?200:500).trim();
   }
   if (!patch) onlyKeys(value, SETTINGS_KEYS, '设置');
   if (result.baseUrl) {
@@ -78,6 +78,7 @@ function validateSettings(value, current = DEFAULTS, patch = false) {
   }
   if (result.speechBaseUrl) require('./asr-provider.cjs').normalizeSpeechBaseUrl(result.speechBaseUrl);
   if ([...result.transcriptionModel].length>300 || /[\u0000-\u001f\u007f]/.test(result.transcriptionModel)) fail('语音模型名称无效。');
+  if ([...result.synthesisModel].length>300 || /[\p{Cc}\p{Cf}]/u.test(result.synthesisModel) || Buffer.from(result.synthesisModel).toString('utf8')!==result.synthesisModel || [...result.synthesisVoice].length>100 || /[\p{Cc}\p{Cf}]/u.test(result.synthesisVoice)||Buffer.from(result.synthesisVoice).toString('utf8')!==result.synthesisVoice) fail('声音试听模型或声音 ID 无效。');
   return result;
 }
 function workspaceShape(value) {
@@ -902,6 +903,7 @@ class Store {
     date(data.exportedAt);
     const settings = validateSettings(data.settings); settings.backgroundTasks = this.state.settings.backgroundTasks;
     settings.speechBaseUrl=this.state.settings.speechBaseUrl;settings.transcriptionModel=this.state.settings.transcriptionModel;settings.dictationAutoSend=false;
+    settings.synthesisModel=this.state.settings.synthesisModel;settings.synthesisVoice=this.state.settings.synthesisVoice;
     if (!Array.isArray(data.workspaces) || data.workspaces.length > 1000 || !Array.isArray(data.chats) || data.chats.length > 5000 || !Array.isArray(data.files) || data.files.length > 10000) fail('备份内容超出限制或格式无效。');
     for (const item of data.workspaces) onlyKeys(record(item, '工作区'), ['id', 'name', 'description', 'color', 'createdAt', 'updatedAt'], '备份工作区');
     for (const item of data.chats) {

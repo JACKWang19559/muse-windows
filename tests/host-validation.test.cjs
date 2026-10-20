@@ -17,7 +17,7 @@ const appRoot = path.resolve(__dirname, '..');
 const mainFile = path.join(appRoot, 'main.cjs');
 const mainRequire = createRequire(mainFile);
 const rendererURL = pathToFileURL(path.join(appRoot, 'build', 'index.html')).href;
-const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact previewSchedule createSchedule updateSchedule pauseSchedule deleteSchedule runScheduleNow stopSchedule saveBackgroundSettings getMemoryDocument saveMemoryDocument deleteMemoryDocument createMemory getMemory updateMemory deleteMemory rebuildMemoryIndex searchMemories getSkill importSkillPackage replaceSkillPackage updateSkill deleteSkill setSkillConsent getAgentProfile createAgentProfile updateAgentProfile captureProfileKnowledge refreshProfileKnowledge removeProfileKnowledge reviewAgentProfile deleteAgentProfile previewSelectedContext startDictation dictationCaptureReady finishDictation cancelDictation getDictationState'.split(' ');
+const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact previewSchedule createSchedule updateSchedule pauseSchedule deleteSchedule runScheduleNow stopSchedule saveBackgroundSettings getMemoryDocument saveMemoryDocument deleteMemoryDocument createMemory getMemory updateMemory deleteMemory rebuildMemoryIndex searchMemories getSkill importSkillPackage replaceSkillPackage updateSkill deleteSkill setSkillConsent getAgentProfile createAgentProfile updateAgentProfile captureProfileKnowledge refreshProfileKnowledge removeProfileKnowledge reviewAgentProfile deleteAgentProfile previewSelectedContext startDictation dictationCaptureReady finishDictation cancelDictation getDictationState prepareAudio updateAudioState stopAudio getAudioState'.split(' ');
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
@@ -43,7 +43,7 @@ function fixture(t, overrides = {}) {
     decrypt: bytes => Buffer.from(bytes).toString().slice('test-encrypted:'.length)
   });
   store.saveSettings({ baseUrl: 'https://provider-a.example/v1', model: 'model-a', apiKey: 'review-key-original-12345', systemPrompt: 'PROMPT_AT_SEND' });
-  const scheduled = [], events = [], errors = [], external = [], speechRequests = [], permissions = {}, handlers = new Map(), appEvents=new Map(), windowEvents=new Map(),webEvents=new Map();
+  const scheduled = [], events = [], errors = [], external = [], speechRequests = [], synthesisRequests = [], permissions = {}, handlers = new Map(), appEvents=new Map(), windowEvents=new Map(),webEvents=new Map();
   const provider = {
     configuredUrl: mainRequire('./backend/provider.cjs').configuredUrl,
     streamCompletion: async options => { options.onDelta('answer'); return { content: 'answer' }; },
@@ -51,6 +51,7 @@ function fixture(t, overrides = {}) {
     ...overrides
   };
   const asrProvider = { ...mainRequire('./backend/asr-provider.cjs'), transcribeAudio: async input => { speechRequests.push(input); return overrides.transcribeAudio ? overrides.transcribeAudio(input) : { text: 'HOST_SYNTHETIC_TRANSCRIPT' }; } };
+  const ttsProvider = { ...mainRequire('./backend/tts-provider.cjs'), synthesizeSpeech: async input => { synthesisRequests.push(input); return overrides.synthesizeSpeech ? overrides.synthesizeSpeech(input) : { audio: speechAudio(), mimeType: 'audio/wav', format: 'wav' }; } };
   const webContents = { mainFrame: { url: rendererURL }, send: (_channel, event) => events.push(structuredClone(event)),on:(name,fn)=>webEvents.set(name,fn),setWindowOpenHandler(){},session:{on(){},setPermissionCheckHandler:fn=>{permissions.check=fn;},setPermissionRequestHandler:fn=>{permissions.request=fn;}} };
   const window = { webContents, isDestroyed: () => false, isVisible: () => true, minimize() {}, maximize() {}, unmaximize() {}, isMaximized: () => false, close() {},on:(name,fn)=>windowEvents.set(name,fn),loadFile(){},show(){},focus(){},hide(){},isMinimized:()=>false };
   const app = { setName() {}, getVersion: () => 'test', getPath: () => dir, on:(name,fn)=>appEvents.set(name,fn), requestSingleInstanceLock: () => true, quit() {}, whenReady: () => ({ then: () => ({ catch() {} }) }) };
@@ -61,7 +62,14 @@ function fixture(t, overrides = {}) {
     clipboard: { writeText() {} }, nativeTheme: {}, Menu: { setApplicationMenu() {},buildFromTemplate:entries=>entries }, protocol: {registerSchemesAsPrivileged(){},handle(){}},Tray:class{setToolTip(){}setContextMenu(){}on(){}isDestroyed(){return false;}destroy(){}}
   };
   const sandbox = {
-    require: name => name === 'electron' ? electron : name === './backend/provider.cjs' ? provider : name === './backend/asr-provider.cjs' ? asrProvider : name === './backend/dictation-session.cjs' ? {
+    require: name => name === 'electron' ? electron : name === './backend/provider.cjs' ? provider : name === './backend/asr-provider.cjs' ? asrProvider : name === './backend/tts-provider.cjs' ? ttsProvider : name === './backend/audio-session.cjs' ? {
+      ...mainRequire(name), AudioSession: class extends mainRequire(name).AudioSession {
+        // Only host-created JSON authority is re-created in the module realm.
+        // load() and returned audio retain the real cancellation/binary path.
+        constructor(options) { super({ ...options, getBinding: owner => { const value = options.getBinding(owner); return value == null ? value : JSON.parse(JSON.stringify(value)); } }); }
+        prepare({ owner, load }) { return super.prepare({ owner: JSON.parse(JSON.stringify(owner)), load }); }
+      }
+    } : name === './backend/dictation-session.cjs' ? {
       ...mainRequire(name), createDictationSessionManager: options => {
         // IPC envelopes and main-created provider bindings share the module's
         // realm in production. Recreate that boundary without weakening its
@@ -90,14 +98,14 @@ function fixture(t, overrides = {}) {
     Buffer, URL, AbortController, AbortSignal, setTimeout, clearTimeout,
     setImmediate: callback => { scheduled.push(callback); }
   };
-  const expose = '\n;globalThis.hostUnderTest={operations,active,assertSender,contextMessages,cleanError,createWindow,disposeDictation:()=>dictation?.dispose(),setState:(s,w)=>{store=s;window=w;previewRuntime={closeAll(){},document(){throw new Error("not a preview");}};}};';
+  const expose = '\n;globalThis.hostUnderTest={operations,active,assertSender,contextMessages,cleanError,createWindow,disposeAudio,disposeDictation:()=>dictation?.dispose(),setState:(s,w)=>{store=s;window=w;previewRuntime={closeAll(){},document(){throw new Error("not a preview");}};}};';
   vm.runInNewContext(fs.readFileSync(mainFile, 'utf8') + expose, sandbox, { filename: mainFile });
   // Production main and Store share a realm; the VM fixture serializes its
   // host-owned data at this test boundary without relaxing JSON validators.
   const mainStore = new Proxy(store, { get(target, key) { const value = Reflect.get(target, key); return typeof value === 'function' ? (...args) => value.apply(target, args.map(arg => arg && typeof arg === 'object' ? JSON.parse(JSON.stringify(arg)) : arg)) : value; } });
   sandbox.hostUnderTest.setState(mainStore, window);
-  t.after(() => sandbox.hostUnderTest.disposeDictation());
-  return { ...sandbox.hostUnderTest, store, dir, window, webContents, provider, speechRequests, permissions, scheduled, events, errors, external, appEvents,windowEvents,webEvents };
+  t.after(() => { sandbox.hostUnderTest.disposeDictation(); sandbox.hostUnderTest.disposeAudio(); });
+  return { ...sandbox.hostUnderTest, store, dir, window, webContents, provider, speechRequests, synthesisRequests, permissions, scheduled, events, errors, external, appEvents,windowEvents,webEvents };
 }
 
 async function waitFor(predicate, label) {
@@ -127,6 +135,189 @@ function speechSetup(host, chat = host.store.createChat()) {
   host.store.saveSettings({ speechBaseUrl: 'https://speech.example/v1', transcriptionModel: 'speech-model', speechApiKey: 'synthetic-speech-key-independent-12345' });
   return { scopeKey: `chat:${chat.id}`, workspaceId: chat.workspaceId, chatId: chat.id };
 }
+
+function previewSetup(host) {
+  host.store.saveSettings({ speechBaseUrl: 'https://speech.example/v1', synthesisModel: 'preview-model', synthesisVoice: 'preview-voice', speechApiKey: 'synthetic-preview-only-key' });
+}
+async function audioAttachment(host, name = 'first', chat = null) {
+  const source = path.join(host.dir, `synthetic-${name}.wav`); fs.writeFileSync(source, Buffer.from(speechAudio()));
+  const file = await host.store.addFile({ sourcePath: source });
+  chat ||= host.store.createChat({ title: name });
+  const message = host.store.appendMessage(chat.id, { role: 'user', content: 'MESSAGE-BODY-MUST-NOT-BECOME-TTS', attachmentIds: [file.id] });
+  return { file, chat, message, input: { channel: 'chat', chatId: chat.id, messageId: message.id, fileId: file.id } };
+}
+
+test('preview audio uses only its explicit sample and independent speech configuration; public audio state contains no sample, bytes or credentials', async t => {
+  const host = fixture(t); previewSetup(host);
+  const result = await host.operations.prepareAudio({ channel: 'preview', text: 'EXPLICIT-SYNTHETIC-PREVIEW-SAMPLE' });
+  assert.equal(result.state, 'ready'); assert.equal(result.mimeType, 'audio/wav'); assert.ok(result.audio instanceof ArrayBuffer);
+  assert.equal(host.synthesisRequests.length, 1);
+  assert.equal(host.synthesisRequests[0].text, 'EXPLICIT-SYNTHETIC-PREVIEW-SAMPLE'); assert.equal(host.synthesisRequests[0].apiKey, 'synthetic-preview-only-key');
+  assert.equal(host.synthesisRequests[0].settings.synthesisModel, 'preview-model'); assert.equal(host.synthesisRequests[0].settings.synthesisVoice, 'preview-voice');
+  assert.equal(result.audio.byteLength, speechAudio().byteLength);
+  const publicState = JSON.stringify({ state: host.operations.getAudioState({ channel: 'preview' }), events: host.events, result, snapshot: host.operations.bootstrap() });
+  for (const hidden of ['EXPLICIT-SYNTHETIC-PREVIEW-SAMPLE', 'synthetic-preview-only-key', 'review-key-original-12345', 'encryptedSpeechApiKey']) assert.equal(publicState.includes(hidden), false);
+  assert.equal(host.operations.getAudioState({ channel: 'preview' }).audio, undefined);
+  host.operations.stopAudio({ channel: 'preview', id: result.id });
+  host.operations.saveSettings({ clearSpeechApiKey: true });
+  await host.operations.prepareAudio({ channel: 'preview', text: 'keyless explicit sample' });
+  assert.equal(host.synthesisRequests[1].apiKey, ''); assert.ok(host.store.secret());
+});
+
+test('chat audio requires an actual attachment on the starting message and cannot accept paths, unrelated files or body-text synthesis', async t => {
+  const host = fixture(t), selected = await audioAttachment(host), other = await audioAttachment(host, 'other');
+  const plain = host.store.appendMessage(selected.chat.id, { role: 'user', content: 'TEXT-ONLY-NOT-SPEECH' });
+  const streaming = host.store.appendMessage(selected.chat.id, { role: 'assistant', content: 'still writing', status: 'streaming', attachmentIds: [selected.file.id] });
+  const deleted = host.store.appendMessage(selected.chat.id, { role: 'user', content: 'deleted source message', attachmentIds: [selected.file.id] });
+  host.store.deleteTurn({ chatId: selected.chat.id, messageId: deleted.id });
+  const inputs = [
+    { ...selected.input, path: host.store.filePath(selected.file.id) }, { ...selected.input, fileId: other.file.id },
+    { ...selected.input, chatId: other.chat.id }, { ...selected.input, messageId: plain.id }, { ...selected.input, messageId: streaming.id },
+    { ...selected.input, messageId: deleted.id }, { ...selected.input, fileId: '../outside.wav' },
+    { channel: 'chat', chatId: selected.chat.id, messageId: plain.id, text: plain.content },
+    { channel: 'preview', text: plain.content, chatId: selected.chat.id, messageId: plain.id }
+  ];
+  for (const input of inputs) await assert.rejects(async () => host.operations.prepareAudio(input));
+  assert.equal(host.synthesisRequests.length, 0); assert.equal(host.operations.getAudioState({ channel: 'chat' }), null);
+  const result = await host.operations.prepareAudio(selected.input);
+  assert.equal(result.state, 'ready'); assert.equal(result.mimeType, 'audio/wav'); assert.deepEqual(Buffer.from(result.audio), Buffer.from(speechAudio()));
+  assert.equal(host.synthesisRequests.length, 0);
+});
+
+test('chat audio does not turn text or a disguised non-audio attachment into playable audio', async t => {
+  const host = fixture(t), chat = host.store.createChat(), source = path.join(host.dir, 'not-an-audio-file.txt');
+  fs.writeFileSync(source, 'PRIVATE-TEXT-IS-NOT-AUDIO');
+  const file = await host.store.addFile({ sourcePath: source }), message = host.store.appendMessage(chat.id, { role: 'user', content: 'attached text', attachmentIds: [file.id] });
+  const result = await host.operations.prepareAudio({ channel: 'chat', chatId: chat.id, messageId: message.id, fileId: file.id });
+  assert.equal(result.state, 'error'); assert.equal(result.audio, undefined); assert.equal(host.synthesisRequests.length, 0);
+  assert.equal(JSON.stringify(host.events).includes('PRIVATE-TEXT-IS-NOT-AUDIO'), false);
+});
+
+test('preview and chat channels pause/resume independently and neither starting audio nor stopping a channel cancels dictation', async t => {
+  const host = fixture(t), owner = speechSetup(host); previewSetup(host);
+  const selected = await audioAttachment(host), chatAudio = await host.operations.prepareAudio(selected.input);
+  const preview = await host.operations.prepareAudio({ channel: 'preview', text: 'independent preview' });
+  assert.equal(host.operations.updateAudioState({ channel: 'chat', id: chatAudio.id, state: 'playing' }).state, 'playing');
+  assert.equal(host.operations.updateAudioState({ channel: 'preview', id: preview.id, state: 'playing' }).state, 'playing');
+  assert.equal(host.operations.updateAudioState({ channel: 'preview', id: preview.id, state: 'paused' }).state, 'paused');
+  assert.equal(host.operations.getAudioState({ channel: 'chat' }).state, 'playing');
+  assert.equal(host.operations.updateAudioState({ channel: 'preview', id: preview.id, state: 'playing' }).state, 'playing');
+  const dictation = host.operations.startDictation(owner);
+  assert.equal(host.operations.getAudioState({ channel: 'chat' }).state, 'playing'); assert.equal(host.operations.getAudioState({ channel: 'preview' }).state, 'playing');
+  host.operations.stopAudio({ channel: 'preview', id: preview.id });
+  assert.equal(host.operations.getAudioState({ channel: 'chat' }).state, 'playing'); assert.equal(host.operations.getDictationState().id, dictation.id);
+  assert.equal(host.operations.getDictationState().state, 'preparing');
+  assert.throws(() => host.operations.updateAudioState({ channel: 'preview', id: chatAudio.id, state: 'paused' }), /失效/);
+  host.operations.cancelDictation({ id: dictation.id }); assert.equal(host.operations.getAudioState({ channel: 'chat' }).state, 'playing');
+  host.operations.updateAudioState({ channel: 'chat', id: chatAudio.id, state: 'ended' });
+  assert.equal(host.operations.updateAudioState({ channel: 'chat', id: chatAudio.id, state: 'playing' }).state, 'ended');
+});
+
+test('selected chat audio survives route changes, message deletion and chat deletion, and stops when its managed source is removed', async t => {
+  const host = fixture(t), selected = await audioAttachment(host);
+  const result = await host.operations.prepareAudio(selected.input);
+  host.operations.updateAudioState({ channel: 'chat', id: result.id, state: 'playing' });
+  host.webContents.mainFrame.url = `${rendererURL}#another-chat`;
+  host.operations.createChat({ title: 'route elsewhere' });
+  assert.equal(host.operations.getAudioState({ channel: 'chat' }).state, 'playing');
+  host.operations.deleteTurn({ chatId: selected.chat.id, messageId: selected.message.id });
+  assert.equal(host.operations.getAudioState({ channel: 'chat' }).state, 'playing');
+  host.operations.deleteChat({ id: selected.chat.id });
+  assert.equal(host.operations.getAudioState({ channel: 'chat' }).state, 'playing');
+  host.operations.removeFile({ id: selected.file.id });
+  assert.equal(host.operations.getAudioState({ channel: 'chat' }).state, 'stopped');
+  assert.equal(host.operations.updateAudioState({ channel: 'chat', id: result.id, state: 'playing' }).state, 'stopped');
+});
+
+test('new sources stop only the previous session in their channel and stale playback updates cannot change the new source', async t => {
+  const host = fixture(t), first = await audioAttachment(host), second = await audioAttachment(host, 'second'); previewSetup(host);
+  const old = await host.operations.prepareAudio(first.input), preview = await host.operations.prepareAudio({ channel: 'preview', text: 'keep preview' });
+  host.operations.updateAudioState({ channel: 'chat', id: old.id, state: 'playing' });
+  host.operations.updateAudioState({ channel: 'preview', id: preview.id, state: 'playing' });
+  const next = await host.operations.prepareAudio(second.input);
+  assert.notEqual(next.id, old.id); assert.equal(host.operations.getAudioState({ channel: 'chat' }).id, next.id);
+  assert.equal(host.operations.updateAudioState({ channel: 'chat', id: old.id, state: 'error' }).state, 'stopped');
+  host.operations.stopAudio({ channel: 'chat', id: old.id });
+  assert.equal(host.operations.getAudioState({ channel: 'chat' }).state, 'ready');
+  assert.equal(host.operations.getAudioState({ channel: 'preview' }).state, 'playing');
+});
+
+test('cancelled loading preview settles promptly and wipes an uncooperative late audio response without publishing bytes', async t => {
+  const entered = deferred(), done = deferred(), host = fixture(t, { synthesizeSpeech: async () => { entered.resolve(); return done.promise; } }); previewSetup(host);
+  const pending = host.operations.prepareAudio({ channel: 'preview', text: 'late preview' }); await entered.promise;
+  const state = host.operations.getAudioState({ channel: 'preview' }); assert.equal(state.state, 'loading');
+  host.operations.stopAudio({ channel: 'preview', id: state.id });
+  const result = await pending; assert.equal(result.state, 'stopped'); assert.equal(result.audio, undefined); assert.equal(host.synthesisRequests[0].signal.aborted, true);
+  const audio = speechAudio(); done.resolve({ audio, mimeType: 'audio/wav' }); await new Promise(resolve => setImmediate(resolve));
+  assert.ok(new Uint8Array(audio).every(value => value === 0)); assert.equal(host.operations.getAudioState({ channel: 'preview' }).state, 'stopped');
+  assert.equal(host.events.some(event => event.type === 'audio-state' && event.session.audio), false);
+});
+
+test('audio request nonces permit cancellation before session delivery and stale stops cannot cancel a newer request or another channel', async t => {
+  const host = fixture(t); previewSetup(host);
+  const cancelledRequest = 'preview_cancelled_before_prepare';
+  assert.equal(host.operations.stopAudio({ channel: 'preview', requestId: cancelledRequest }), null);
+  await assert.rejects(async () => host.operations.prepareAudio({ channel: 'preview', requestId: cancelledRequest, text: 'must never synthesize' }), /取消|使用/);
+  assert.equal(host.synthesisRequests.length, 0);
+  const selected = await audioAttachment(host);
+  const chatAudio = await host.operations.prepareAudio({ ...selected.input, requestId: cancelledRequest });
+  assert.equal(chatAudio.state, 'ready', 'cancellation nonces belong to one channel');
+  const first = await host.operations.prepareAudio({ channel: 'preview', requestId: 'preview_first_used', text: 'first preview' });
+  assert.equal(first.owner.requestId, 'preview_first_used');
+  await assert.rejects(async () => host.operations.prepareAudio({ channel: 'preview', requestId: 'preview_first_used', text: 'duplicate must not synthesize' }), /取消|使用/);
+  assert.equal(host.synthesisRequests.length, 1); assert.equal(host.operations.getAudioState({ channel: 'preview' }).id, first.id);
+  const next = await host.operations.prepareAudio({ channel: 'preview', requestId: 'preview_newer_request', text: 'newer preview' });
+  host.operations.updateAudioState({ channel: 'preview', id: next.id, state: 'playing' });
+  host.operations.stopAudio({ channel: 'preview', requestId: cancelledRequest });
+  host.operations.stopAudio({ channel: 'preview', id: first.id, requestId: 'preview_first_used' });
+  assert.equal(host.operations.getAudioState({ channel: 'preview' }).id, next.id); assert.equal(host.operations.getAudioState({ channel: 'preview' }).state, 'playing');
+  assert.equal(host.operations.getAudioState({ channel: 'chat' }).id, chatAudio.id); assert.equal(host.synthesisRequests.length, 2);
+  assert.equal(host.operations.stopAudio({ channel: 'preview', requestId: 'preview_newer_request' }).state, 'stopped');
+  for (const requestId of ['bad request', 'x'.repeat(101), 42]) await assert.rejects(async () => host.operations.prepareAudio({ channel: 'preview', requestId, text: 'invalid nonce' }), /请求/);
+  assert.equal(host.synthesisRequests.length, 2);
+});
+
+test('preview configuration changes revoke loading leases while chat audio and unrelated chat/theme settings remain independent', async t => {
+  for (const change of [{ speechBaseUrl: 'https://new-speech.example/v1' }, { synthesisModel: 'new-synthesis-model' }, { synthesisVoice: 'new-voice' }, { speechApiKey: 'synthetic-new-preview-key' }, { clearSpeechApiKey: true }]) {
+    const entered = deferred(), done = deferred(), host = fixture(t, { synthesizeSpeech: async () => { entered.resolve(); return done.promise; } }); previewSetup(host);
+    const selected = await audioAttachment(host), chatAudio = await host.operations.prepareAudio(selected.input);
+    host.operations.updateAudioState({ channel: 'chat', id: chatAudio.id, state: 'playing' });
+    const pending = host.operations.prepareAudio({ channel: 'preview', text: 'configuration lease' }); await entered.promise;
+    host.operations.saveSettings({ theme: 'dark', model: 'unrelated-chat-model', transcriptionModel: 'unrelated-asr-model' });
+    assert.equal(host.operations.getAudioState({ channel: 'preview' }).state, 'loading');
+    host.operations.saveSettings(change);
+    assert.equal((await pending).state, 'stopped'); assert.equal(host.operations.getAudioState({ channel: 'chat' }).state, 'playing');
+    assert.equal(host.synthesisRequests[0].signal.aborted, true);
+    const audio = speechAudio(); done.resolve({ audio, mimeType: 'audio/wav' }); await new Promise(resolve => setImmediate(resolve));
+    assert.ok(new Uint8Array(audio).every(value => value === 0));
+  }
+});
+
+test('hidden/minimized windows reject late audio preparation and IPC remains restricted to the exact trusted main frame', async t => {
+  const host = fixture(t), selected = await audioAttachment(host); previewSetup(host);
+  for (const kind of ['hidden', 'minimized']) {
+    host.window.isVisible = () => kind !== 'hidden'; host.window.isMinimized = () => kind === 'minimized';
+    for (const input of [selected.input, { channel: 'preview', text: 'must not start hidden' }]) await assert.rejects(async () => host.operations.prepareAudio(input), /窗口|还原/);
+  }
+  assert.equal(host.synthesisRequests.length, 0); assert.equal(host.operations.getAudioState({ channel: 'chat' }), null);
+  for (const event of [{ sender: {}, senderFrame: host.webContents.mainFrame }, { sender: host.webContents, senderFrame: { url: rendererURL } }]) assert.throws(() => host.assertSender(event));
+  host.webContents.mainFrame.url = 'https://remote.example/'; assert.throws(() => host.assertSender({ sender: host.webContents, senderFrame: host.webContents.mainFrame }));
+});
+
+test('main document navigation, renderer crash and window destruction settle loading preview and stop both channels', async t => {
+  for (const trigger of ['navigation', 'crash', 'closed']) {
+    const entered = deferred(), done = deferred(), host = fixture(t, { synthesizeSpeech: async () => { entered.resolve(); return done.promise; } }); host.createWindow(); previewSetup(host);
+    const selected = await audioAttachment(host), chatAudio = await host.operations.prepareAudio(selected.input);
+    host.operations.updateAudioState({ channel: 'chat', id: chatAudio.id, state: 'playing' });
+    const pending = host.operations.prepareAudio({ channel: 'preview', text: 'navigation late preview' }); await entered.promise;
+    if (trigger === 'navigation') host.webEvents.get('did-start-navigation')({ isMainFrame: true, isSameDocument: false });
+    else if (trigger === 'crash') host.webEvents.get('render-process-gone')(); else host.windowEvents.get('closed')();
+    const result = await pending; assert.equal(result.state, 'stopped', trigger); assert.equal(result.audio, undefined);
+    const audio = speechAudio(); done.resolve({ audio, mimeType: 'audio/wav' }); await new Promise(resolve => setImmediate(resolve));
+    assert.ok(new Uint8Array(audio).every(value => value === 0), trigger);
+    assert.equal(host.events.some(event => event.type === 'audio-state' && event.channel === 'chat' && event.session.id === chatAudio.id && event.session.state === 'stopped'), true, trigger);
+  }
+});
 
 test('host dictation uses the independent speech endpoint/key and returns one final transcript without sending chat or persisting audio', async t => {
   let chatRequests = 0;

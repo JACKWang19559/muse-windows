@@ -52,6 +52,10 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
       await require('./dictation-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
       fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'dictation only',provider:'local deterministic test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
     }
+    if(process.env.MUSE_E2E_SCENARIO==='audio'){
+      await require('./audio-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+      fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'audio only',provider:'local deterministic test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
+    }
     await page(()=>document.querySelector('[data-testid="workspace-new"]').click());
     await wait(()=>!!document.querySelector('[data-testid="workspace-name"]'));
     await fill('workspace-name','桌面验收工作区');
@@ -224,6 +228,7 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await require('./quit-cancel-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./knowledge-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./dictation-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+    await require('./audio-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     const report={passed:true,checks,check_count:checks.length,provider:'local deterministic test server only',target_mac_app_executed:false};
     fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify(report,null,2));
     app.exit(0);

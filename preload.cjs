@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 const call = operation => payload => ipcRenderer.invoke('muse:invoke', operation, payload);
 const api = {};
 for(const name of ['startDictation','dictationCaptureReady','finishDictation','cancelDictation','getDictationState'])api[name]=call(name);
+for(const name of ['prepareAudio','updateAudioState','stopAudio','getAudioState'])api[name]=call(name);
 for (const name of ['bootstrap','saveSettings','testConnection','listModels','createWorkspace','updateWorkspace','deleteWorkspace','createChat','updateChat','deleteChat','searchMessages','deleteTurn','sendMessage','cancelQueuedMessage','stopGeneration','respondApproval','retryMessage','importFiles','removeFile','createTextFile','saveTextFile','readFile','openFile','exportChat','exportData','importData','copyText','openExternal','windowControl','createArtifact','writeArtifactFiles','readArtifactFile','buildArtifact','deleteArtifact','openArtifactPreview','activateArtifactPreview','closeArtifactPreview','artifactRequest','exportArtifact']) api[name] = call(name);
 api.importDroppedFiles = (files, workspaceId) => {
   const paths = Array.from(files || [], file => webUtils.getPathForFile(file));

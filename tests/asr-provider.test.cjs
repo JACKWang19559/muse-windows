@@ -117,6 +117,11 @@ test('local ASR works without a key and accepts an empty transcript for silence'
   assert.deepEqual(await transcribeAudio(options(baseUrl)), { text: '' });
   assert.equal(requests[0].headers.authorization, undefined); assert.equal(requests[0].path, '/v1/audio/transcriptions');
 });
+test('shared speech service full synthesis endpoint maps to the same prefix transcription endpoint',async t=>{
+  const {baseUrl,requests}=await fixture(t,(_request,response)=>json(response,{text:'shared speech service'}));
+  for(const prefix of ['/v1','/custom',''])await transcribeAudio(options(`${baseUrl}${prefix}/audio/speech?api-version=fixture`));
+  assert.deepEqual(requests.map(item=>item.path),['/v1/audio/transcriptions?api-version=fixture','/custom/audio/transcriptions?api-version=fixture','/audio/transcriptions?api-version=fixture']);
+});
 
 test('configuration and invalid audio fail before any fetch; chat settings never substitute for speech settings', async t => {
   let fetched = 0;

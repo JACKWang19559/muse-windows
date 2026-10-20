@@ -1,0 +1,68 @@
+'use strict';
+const fs=require('node:fs'),path=require('node:path');
+module.exports=async({window,store,operations,folder,page,wait,check,fill})=>{
+ window.webContents.setAudioMuted(true);window.show();if(window.isMinimized())window.restore();
+ check('Audio playback acceptance is explicitly muted and uses synthetic silent fixtures',window.webContents.isAudioMuted());
+ const space=await operations.createWorkspace({name:'音频验收工作区'}),file=await store.addFile({sourcePath:path.join(folder,'reference.wav'),workspaceId:space.id}),chat=await operations.createChat({workspaceId:space.id,title:'音频验收对话'});
+ await operations.sendMessage({chatId:chat.id,content:'音频附件验收',attachmentIds:[file.id]});
+ await wait(async id=>(await window.muse.bootstrap()).chats.find(chat=>chat.id===id)?.messages.at(-1)?.status==='complete',chat.id);
+ await wait(()=>[...document.querySelectorAll('.sidebar-chat-main')].some(el=>el.title==='音频验收对话'));
+ await page(()=>[...document.querySelectorAll('.sidebar-chat-main')].find(el=>el.title==='音频验收对话').click());
+ await wait(()=>!!document.querySelector('[data-testid="audio-attachment"]'));
+ window.show();window.restore();await new Promise(resolve=>setTimeout(resolve,200));
+ check('Audio playback starts from a visible restored application window',window.isVisible()&&!window.isMinimized());
+ await page(()=>document.querySelector('[data-testid="audio-attachment"]').click());
+ await wait(()=>document.querySelector('[data-testid="chat-audio-player"]')?.dataset.state==='playing');
+ check('A saved audio attachment reaches the actual browser decoder and playback event',operations.getAudioState({channel:'chat'}).state==='playing'&&await page(()=>document.querySelector('[data-testid="chat-audio-player"]').textContent.includes('reference.wav')));
+ await page(()=>document.querySelector('[data-testid="audio-toggle"]').click());
+ await wait(()=>document.querySelector('[data-testid="chat-audio-player"]')?.dataset.state==='paused');
+ check('Pause retains the selected track in both renderer and host',operations.getAudioState({channel:'chat'}).state==='paused');
+ await fill('audio-seek','3');
+ check('Seeking updates the actual audio clock',await page(()=>Number(document.querySelector('[data-testid="audio-seek"]').value)>=2.9));
+ await page(()=>document.querySelector('[data-testid="audio-toggle"]').click());await wait(()=>document.querySelector('[data-testid="chat-audio-player"]')?.dataset.state==='playing');
+ await page(()=>document.querySelector('[data-testid="new-chat"]').click());
+ check('Chat audio remains globally controllable across route changes',await page(()=>document.querySelector('[data-testid="chat-audio-player"]')?.dataset.state==='playing'));
+ const message=store.getChat(chat.id).messages[0];operations.deleteTurn({chatId:chat.id,messageId:message.id});
+ check('Removing message text preserves the already selected independent audio track',operations.getAudioState({channel:'chat'}).state==='playing');
+ await page(()=>document.querySelector('[data-testid="audio-toggle"]').click());await wait(()=>document.querySelector('[data-testid="chat-audio-player"]')?.dataset.state==='paused');
+ await page(()=>document.querySelector('[data-testid="settings-open"]').click());await wait(()=>!!document.querySelector('[data-testid="settings-dialog"]'));
+ await page(()=>[...document.querySelectorAll('.settings-nav button')].find(el=>el.textContent.includes('语音输入')).click());
+ await fill('settings-speech-url',process.env.MUSE_E2E_BASE_URL);await fill('settings-speech-key','desktop-speech-secret');await fill('settings-synthesis-model','desktop-tts');await fill('settings-synthesis-voice','fixture-voice');await fill('settings-sample-text','  VOICE-PREVIEW-ONLY-42  ');
+ await page(()=>document.querySelector('[data-testid="voice-preview-start"]').click());await wait(()=>document.querySelector('[data-testid="voice-preview-player"]')?.dataset.state==='playing');
+ check('Voice settings save and preview synthesize and decode a separate binary WAV',operations.getAudioState({channel:'preview'}).state==='playing'&&store.settings().synthesisVoice==='fixture-voice');
+ check('Preview playback does not replace or resume the paused chat track',operations.getAudioState({channel:'chat'}).state==='paused'&&await page(()=>!!document.querySelector('[data-testid="chat-audio-player"]')));
+ await window.webContents.capturePage().then(image=>fs.writeFileSync(path.join(folder,'audio-preview.png'),image.toPNG()));
+ await fill('settings-sample-text','CHANGED-PREVIEW-SAMPLE');await wait(()=>!document.querySelector('[data-testid="voice-preview-player"]'));
+ check('Changing the preview sample stops and releases the old preview generation',operations.getAudioState({channel:'preview'}).state==='stopped');
+ await fill('settings-synthesis-model','desktop-tts-slow');await page(()=>document.querySelector('[data-testid="voice-preview-start"]').click());
+ await wait(()=>!!document.querySelector('[data-testid="preview-stop"]'));await page(()=>document.querySelector('[data-testid="preview-stop"]').click());
+ await new Promise(resolve=>setTimeout(resolve,1100));
+ check('Stopping an in-flight preview rejects its late audio response',await page(()=>!document.querySelector('[data-testid="voice-preview-player"]'))&&operations.getAudioState({channel:'preview'}).state==='stopped');
+ await fill('settings-synthesis-model','desktop-tts-error');await page(()=>document.querySelector('[data-testid="voice-preview-start"]').click());
+ await wait(async()=>(await window.muse.getAudioState({channel:'preview'}))?.state==='error');
+ check('Speech service failure ends without replaying or exposing raw provider details',await page(()=>!document.querySelector('[data-testid="voice-preview-player"]'))&&operations.getAudioState({channel:'chat'}).state==='paused');
+ const heldSave=()=>{const original=operations.saveSettings;let release,entered=false;const gate=new Promise(resolve=>release=resolve);operations.saveSettings=async input=>{entered=true;await gate;return original(input);};return{release,restore:()=>{release();operations.saveSettings=original;},wait:async()=>{for(let count=0;count<100&&!entered;count++)await new Promise(resolve=>setTimeout(resolve,10));if(!entered)throw new Error('Delayed save was not entered');}};};
+ await fill('settings-synthesis-model','desktop-tts');await fill('settings-sample-text','OLD-PREVIEW-INTENT');
+ const beforeRace=operations.getAudioState({channel:'preview'}).id,firstSave=heldSave();
+ try{await page(()=>document.querySelector('[data-testid="voice-preview-start"]').click());await firstSave.wait();await fill('settings-sample-text','PRESERVED-NEW-SAMPLE');await fill('settings-synthesis-voice','race-new-voice');firstSave.release();await wait(()=>!document.querySelector('[data-testid="voice-preview-start"]').disabled);}
+ finally{firstSave.restore();}
+ check('Editing voice or sample during delayed save preserves new drafts and cancels the old preview intent',operations.getAudioState({channel:'preview'}).id===beforeRace&&await page(()=>document.querySelector('[data-testid="settings-synthesis-voice"]').value==='race-new-voice'&&document.querySelector('[data-testid="settings-sample-text"]').value==='PRESERVED-NEW-SAMPLE'&&!document.querySelector('[data-testid="voice-preview-player"]')));
+ const secondSave=heldSave();
+ try{await page(()=>document.querySelector('[data-testid="voice-preview-start"]').click());await secondSave.wait();await page(()=>[...document.querySelectorAll('.settings-nav button')].find(el=>el.textContent.includes('使用偏好')).click());secondSave.release();await wait(()=>!document.querySelector('[data-testid="settings-save"]').disabled);}
+ finally{secondSave.restore();}
+ check('Leaving the voice pane during delayed save cannot start a hidden stale preview',operations.getAudioState({channel:'preview'}).id===beforeRace&&await page(()=>!document.querySelector('[data-testid="voice-preview-player"]')));
+ await page(()=>[...document.querySelectorAll('.settings-nav button')].find(el=>el.textContent.includes('语音输入')).click());
+ await fill('settings-synthesis-model','desktop-tts');await page(()=>document.querySelector('[data-testid="voice-preview-start"]').click());await wait(()=>document.querySelector('[data-testid="voice-preview-player"]')?.dataset.state==='playing');
+ await page(()=>[...document.querySelectorAll('.settings-nav button')].find(el=>el.textContent.includes('使用偏好')).click());
+ await wait(async()=>(await window.muse.getAudioState({channel:'preview'}))?.state==='stopped');
+ check('Leaving the voice settings pane disposes preview playback',true);
+ await page(()=>[...document.querySelectorAll('.settings-nav button')].find(el=>el.textContent.includes('语音输入')).click());
+ await page(()=>document.querySelector('[data-testid="voice-preview-start"]').click());await wait(()=>document.querySelector('[data-testid="voice-preview-player"]')?.dataset.state==='playing');
+ await page(()=>[...document.querySelectorAll('.settings-footer button')].find(el=>el.textContent==='关闭').click());
+ await wait(async()=>(await window.muse.getAudioState({channel:'preview'}))?.state==='stopped');
+ check('Closing voice settings disposes its preview while chat audio remains selected',operations.getAudioState({channel:'chat'}).state==='paused');
+ operations.removeFile({id:file.id});await wait(()=>!document.querySelector('[data-testid="chat-audio-player"]'));
+ check('Deleting the managed audio source releases the active chat playback',operations.getAudioState({channel:'chat'}).state==='stopped');
+ const persisted=fs.readFileSync(store.statePath,'utf8'),backup=JSON.stringify(store.exportData());
+ check('Synthesized preview text and audio are not persisted in state or backup',!persisted.includes('VOICE-PREVIEW-ONLY-42')&&!backup.includes('VOICE-PREVIEW-ONLY-42')&&!persisted.includes('blob:'));
+};

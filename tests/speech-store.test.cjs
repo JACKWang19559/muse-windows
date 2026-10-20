@@ -32,7 +32,7 @@ function fixture(t) {
 
 const initial = {
   baseUrl: 'https://chat.example/v1', model: 'chat-model', apiKey: 'synthetic-independent-chat-secret',
-  speechBaseUrl: 'https://speech.example/v1', transcriptionModel: 'speech-model', speechApiKey: 'synthetic-independent-speech-secret', dictationAutoSend: true
+  speechBaseUrl: 'https://speech.example/v1', transcriptionModel: 'speech-model', synthesisModel: 'source-synthesis-model', synthesisVoice: 'source-voice', speechApiKey: 'synthetic-independent-speech-secret', dictationAutoSend: true
 };
 
 test('speech credentials are encrypted independently and never included in public settings, snapshots or backups', t => {
@@ -50,6 +50,37 @@ test('speech credentials are encrypted independently and never included in publi
   const restarted = new Store(dataDir, options);
   assert.equal(restarted.secret(), initial.apiKey); assert.equal(restarted.speechSecret(), initial.speechApiKey);
   assert.equal(restarted.settings().speechBaseUrl, initial.speechBaseUrl); assert.equal(restarted.settings().transcriptionModel, initial.transcriptionModel);
+  assert.equal(restarted.settings().synthesisModel, initial.synthesisModel); assert.equal(restarted.settings().synthesisVoice, initial.synthesisVoice);
+});
+
+test('synthesis defaults stay disabled until configured and model/voice length limits are atomic', t => {
+  const { store } = fixture(t);
+  assert.equal(store.settings().synthesisModel, ''); assert.equal(store.settings().synthesisVoice, '');
+  assert.equal(store.settings().hasSpeechApiKey, false);
+  store.saveSettings({ synthesisModel: 'm'.repeat(300), synthesisVoice: 'v'.repeat(100) });
+  assert.equal(store.settings().synthesisModel.length, 300); assert.equal(store.settings().synthesisVoice.length, 100);
+  const baseline = structuredClone(store.state);
+  for (const input of [{ synthesisModel: 'm'.repeat(301) }, { synthesisVoice: 'v'.repeat(101) }, { synthesisModel: 'line\nbreak' }, { synthesisVoice: 'bad\0voice' }, { synthesisModel: 123 }, { synthesisVoice: null }]) {
+    assert.throws(() => store.saveSettings(input)); assert.deepEqual(store.state, baseline);
+  }
+  assert.equal(store.secret(), ''); assert.equal(store.speechSecret(), '');
+});
+
+test('synthesis setting boundaries count Unicode code points rather than UTF-16 units and survive restart', t => {
+  const { store, dataDir, options } = fixture(t), model = '🎙'.repeat(300), voice = '🔉'.repeat(100);
+  store.saveSettings({ synthesisModel: model, synthesisVoice: voice });
+  assert.equal(store.settings().synthesisModel, model); assert.equal(store.settings().synthesisVoice, voice);
+  const restarted = new Store(dataDir, options);
+  assert.equal(restarted.settings().synthesisModel, model); assert.equal(restarted.settings().synthesisVoice, voice);
+  assert.throws(() => restarted.saveSettings({ synthesisModel: model + 'x' }));
+  assert.throws(() => restarted.saveSettings({ synthesisVoice: voice + 'x' }));
+});
+
+test('synthesis settings reject malformed Unicode and invisible controls before changing saved configuration', t => {
+  const { store } = fixture(t); store.saveSettings(initial); const baseline = structuredClone(store.state);
+  for (const input of [{ synthesisModel: '\ud800' }, { synthesisVoice: '\udfff' }, { synthesisModel: 'a\u202eb' }, { synthesisVoice: 'a\u200bb' }]) {
+    assert.throws(() => store.saveSettings(input)); assert.deepEqual(store.state, baseline);
+  }
 });
 
 test('saving, retaining and clearing speech credentials cannot overwrite or borrow the chat credential', t => {
@@ -92,14 +123,16 @@ test('a failed speech decryption never returns the chat key, clears saved state 
 test('backup import preserves destination speech address, model and independent keys and disables auto-send', async t => {
   const { store, root, options } = fixture(t); store.saveSettings(initial); store.createChat({ title: 'source speech backup' });
   const backup = store.exportData(), destination = new Store(path.join(root, 'destination'), options);
-  destination.saveSettings({ apiKey: 'synthetic-destination-chat-key', speechBaseUrl: 'http://127.0.0.1:9900/custom/v1', transcriptionModel: 'destination-asr', speechApiKey: 'synthetic-destination-speech-key', dictationAutoSend: true });
+  destination.saveSettings({ apiKey: 'synthetic-destination-chat-key', speechBaseUrl: 'http://127.0.0.1:9900/custom/v1', transcriptionModel: 'destination-asr', synthesisModel: 'destination-synthesis-model', synthesisVoice: 'destination-voice', speechApiKey: 'synthetic-destination-speech-key', dictationAutoSend: true });
   const result = await destination.importData(backup);
   assert.equal(result.chats.length, 1); assert.equal(destination.settings().speechBaseUrl, 'http://127.0.0.1:9900/custom/v1');
   assert.equal(destination.settings().transcriptionModel, 'destination-asr'); assert.equal(destination.settings().dictationAutoSend, false);
+  assert.equal(destination.settings().synthesisModel, 'destination-synthesis-model'); assert.equal(destination.settings().synthesisVoice, 'destination-voice');
   assert.equal(destination.secret(), 'synthetic-destination-chat-key'); assert.equal(destination.speechSecret(), 'synthetic-destination-speech-key');
   const blankDestination = new Store(path.join(root, 'blank-destination'), options);
   await blankDestination.importData(backup);
   assert.equal(blankDestination.settings().speechBaseUrl, ''); assert.equal(blankDestination.settings().transcriptionModel, '');
+  assert.equal(blankDestination.settings().synthesisModel, ''); assert.equal(blankDestination.settings().synthesisVoice, '');
   assert.equal(blankDestination.settings().dictationAutoSend, false); assert.equal(blankDestination.speechSecret(), '');
 });
 
@@ -107,10 +140,12 @@ test('old state without speech fields migrates with explicit ASR disabled and no
   const { store, dataDir, options } = fixture(t); store.saveSettings({ baseUrl: initial.baseUrl, model: initial.model, apiKey: initial.apiKey });
   const chat = store.createChat({ title: 'legacy chat' }), oldState = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
   delete oldState.settings.speechBaseUrl; delete oldState.settings.dictationAutoSend; delete oldState.encryptedSpeechApiKey;
+  delete oldState.settings.synthesisModel; delete oldState.settings.synthesisVoice;
   oldState.settings.transcriptionModel = 'legacy-transcription-hint';
   fs.writeFileSync(path.join(dataDir, 'state.json'), JSON.stringify(oldState));
   const migrated = new Store(dataDir, options);
   assert.equal(migrated.settings().speechBaseUrl, ''); assert.equal(migrated.settings().transcriptionModel, 'legacy-transcription-hint');
+  assert.equal(migrated.settings().synthesisModel, ''); assert.equal(migrated.settings().synthesisVoice, '');
   assert.equal(migrated.settings().dictationAutoSend, false); assert.equal(migrated.settings().hasSpeechApiKey, false); assert.equal(migrated.speechSecret(), '');
   assert.equal(migrated.secret(), initial.apiKey); assert.equal(migrated.getChat(chat.id).title, 'legacy chat');
   assert.equal(migrated.recoveryNotice, null);
@@ -127,7 +162,9 @@ test('untrusted backups cannot import raw/encrypted speech secrets or invalid sp
     value => { value.settings.speechApiKey = 'synthetic-injected-secret'; },
     value => { value.settings.encryptedSpeechApiKey = 'c3ludGhldGlj'; },
     value => { value.settings.speechBaseUrl = 'https://shortwave.meta.ai'; },
-    value => { value.settings.dictationAutoSend = 'true'; }
+    value => { value.settings.dictationAutoSend = 'true'; },
+    value => { value.settings.synthesisModel = 'm'.repeat(301); },
+    value => { value.settings.synthesisVoice = 'v'.repeat(101); }
   ]) {
     const changed = structuredClone(backup); mutate(changed);
     await assert.rejects(store.importData(changed));
