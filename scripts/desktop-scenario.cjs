@@ -44,6 +44,10 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await new Promise(r=>setTimeout(r,300));
     await window.webContents.capturePage().then(image=>fs.writeFileSync(path.join(folder,'settings.png'),image.toPNG()));
     await page(()=>Array.from(document.querySelectorAll('.settings-footer button')).find(x=>x.textContent==='关闭').click());
+    if(process.env.MUSE_E2E_SCENARIO==='image-preview'){
+      await require('./image-preview-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+      fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'image-preview only',provider:'local deterministic test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
+    }
     if(process.env.MUSE_E2E_SCENARIO==='file-rename'){
       await require('./file-rename-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
       fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'file-rename only',provider:'local deterministic test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
@@ -252,6 +256,7 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await require('./file-export-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./csv-file-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./file-rename-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+    await require('./image-preview-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./chat-lifecycle-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./queue-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./cancel-admission-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});

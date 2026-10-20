@@ -20,6 +20,7 @@ const rendererURL = pathToFileURL(path.join(appRoot, 'build', 'index.html')).hre
 const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage cancelSendAdmission stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact previewSchedule createSchedule updateSchedule pauseSchedule deleteSchedule runScheduleNow stopSchedule saveBackgroundSettings getMemoryDocument saveMemoryDocument deleteMemoryDocument createMemory getMemory updateMemory deleteMemory rebuildMemoryIndex searchMemories getSkill importSkillPackage replaceSkillPackage updateSkill deleteSkill setSkillConsent getAgentProfile createAgentProfile updateAgentProfile captureProfileKnowledge refreshProfileKnowledge removeProfileKnowledge reviewAgentProfile deleteAgentProfile previewSelectedContext startDictation dictationCaptureReady finishDictation cancelDictation getDictationState prepareAudio updateAudioState stopAudio getAudioState'.split(' ');
 
 API_METHODS.push('renameFile');
+API_METHODS.push('readImageFile');
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
@@ -1438,6 +1439,27 @@ test('file download cancel and rejected renderer paths never change host files',
   const result=await host.operations.exportFile({id:created.file.id,content:'draft'});assert.equal(result.cancelled,true);assert.equal(prompted,1);
   await assert.rejects(host.operations.exportFile({id:created.file.id,path:path.join(host.dir,'forged.txt')}),/不支持/);
   assert.equal(prompted,1);assert.equal(host.store.readFile(created.file.id).text,'saved');assert(!fs.existsSync(path.join(host.dir,'forged.txt')));
+});
+
+test('main image read returns the selected managed SVG bytes without text extraction, paths or snapshot payloads',async t=>{
+ const host=fixture(t),source=path.join(host.dir,'source.svg'),bytes=Buffer.from('\ufeff<svg xmlns="http://www.w3.org/2000/svg">\r\n<text>汉字</text></svg>');fs.writeFileSync(source,bytes);
+ const file=await host.store.addFile({sourcePath:source}),result=host.operations.readImageFile({id:file.id,expectedName:file.name,expectedSha256:file.sha256});
+ assert.equal(result.mimeType,'image/svg+xml');assert.deepEqual(Buffer.from(result.image),bytes);assert.equal(result.sha256,file.sha256);assert.equal(result.size,bytes.length);
+ assert.deepEqual(Object.keys(result).sort(),['id','name','mimeType','size','sha256','image'].sort());assert(!JSON.stringify(result).includes(host.dir));
+ assert.equal(host.operations.bootstrap().files[0].image,undefined);assert.equal(host.operations.bootstrap().chats.length,0);
+});
+
+test('main image read rejects renderer paths, unknown resources and old names after a real rename',async t=>{
+ const host=fixture(t),source=path.join(host.dir,'source.png');fs.writeFileSync(source,Buffer.from([137,80,78,71,13,10,26,10]));const file=await host.store.addFile({sourcePath:source});
+ for(const input of [{id:source,expectedName:file.name},{id:file.id,expectedName:file.name,path:source},{id:'missing_image',expectedName:'missing.png'}])assert.throws(()=>host.operations.readImageFile(input));
+ const renamed=await host.operations.renameFile({id:file.id,expectedName:file.name,name:'renamed.PNG'});assert.throws(()=>host.operations.readImageFile({id:file.id,expectedName:file.name}),/文件名已变化/);
+ assert.deepEqual(Buffer.from(host.operations.readImageFile({id:file.id,expectedName:renamed.name,expectedSha256:renamed.sha256}).image),fs.readFileSync(source));
+});
+
+test('main image read enforces digest integrity and missing-copy errors without leaking the managed path',async t=>{
+ const host=fixture(t),source=path.join(host.dir,'source.webp'),bytes=Buffer.from('synthetic image bytes');fs.writeFileSync(source,bytes);const file=await host.store.addFile({sourcePath:source}),input={id:file.id,expectedName:file.name,expectedSha256:file.sha256};
+ assert.throws(()=>host.operations.readImageFile({...input,expectedSha256:'0'.repeat(64)}),/已变化/);const managed=host.store.filePath(file.id);bytes[0]^=1;fs.writeFileSync(managed,bytes);
+ assert.throws(()=>host.operations.readImageFile(input),/已变化/);fs.unlinkSync(managed);assert.throws(()=>host.operations.readImageFile(input),error=>!error.message.includes(host.dir)&&!error.message.includes(managed));
 });
 
 test('preload never exposes the host API inside a child frame',()=>{

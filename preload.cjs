@@ -3,6 +3,7 @@ const call = operation => payload => ipcRenderer.invoke('muse:invoke', operation
 const api = {};
 api.exportFile = call('exportFile');
 api.renameFile = call('renameFile');
+api.readImageFile = call('readImageFile');
 api.cancelSendAdmission = call('cancelSendAdmission');
 for(const name of ['startDictation','dictationCaptureReady','finishDictation','cancelDictation','getDictationState'])api[name]=call(name);
 for(const name of ['prepareAudio','updateAudioState','stopAudio','getAudioState'])api[name]=call(name);
