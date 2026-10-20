@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const esbuild = require('esbuild');
+const crypto = require('node:crypto');
 const root = path.resolve(__dirname, '..');
 (async () => {
   const out = path.join(root, 'build');
@@ -8,6 +9,13 @@ const root = path.resolve(__dirname, '..');
   await esbuild.build({ entryPoints: [path.join(root, 'renderer', 'App.jsx')], bundle: true, outfile: path.join(out, 'app.js'), platform: 'browser', target: 'chrome130', jsx: 'automatic', sourcemap: true, minify: true, define: { 'process.env.NODE_ENV': '"production"' }, loader: { '.svg': 'dataurl', '.png': 'file', '.woff2': 'file', '.ttf': 'file' } });
   fs.copyFileSync(path.join(root, 'renderer', 'index.html'), path.join(out, 'index.html'));
   fs.copyFileSync(require.resolve('pdfjs-dist/build/pdf.worker.min.mjs'), path.join(out, 'pdf.worker.mjs'));
+  const docx=await esbuild.build({entryPoints:[path.join(root,'renderer','docx-sandbox.js')],bundle:true,write:false,platform:'browser',format:'iife',target:'chrome130',minify:true,legalComments:'eof',metafile:true});
+  const script=docx.outputFiles[0].text.replace(/<\/script/gi,'<\\/script');
+  const scriptHash='sha256-'+crypto.createHash('sha256').update(script).digest('base64');
+  const csp=`default-src 'none'; script-src '${scriptHash}'; script-src-attr 'none'; style-src 'unsafe-inline'; img-src data: blob:; font-src data: blob:; connect-src 'none'; media-src 'none'; worker-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts`;
+  const html=Buffer.from(`<!doctype html><html lang="zh-CN"><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{margin:0;min-height:100%;background:#e9e9e9;color:#111}#document{padding:8px;box-sizing:border-box}.docx-wrapper{padding:8px!important;background:transparent!important}section.docx{flex-shrink:0}a[role=link]{cursor:pointer;text-decoration:underline}a[role=link]:focus-visible{outline:2px solid #1670d2}</style><body><div id="document"></div><script>${script}</script></body></html>`);
+  fs.writeFileSync(path.join(out,'docx-preview.html'),html);
+  fs.writeFileSync(path.join(out,'docx-preview.json'),JSON.stringify({schema:'muse-owned-docx-preview-v1',bytes:html.length,sha256:crypto.createHash('sha256').update(html).digest('hex'),scriptHash,csp,sourceInputs:Object.fromEntries(Object.keys(docx.metafile.inputs).map(file=>[file.replace(/\\/g,'/'),crypto.createHash('sha256').update(fs.readFileSync(path.resolve(root,file))).digest('hex')]))},null,2));
   if (fs.existsSync(path.join(root, 'renderer', 'assets'))) fs.cpSync(path.join(root, 'renderer', 'assets'), path.join(out, 'assets'), { recursive: true });
   console.log('Desktop UI built.');
 })().catch(error => { console.error(error.message); process.exit(1); });

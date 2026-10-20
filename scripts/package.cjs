@@ -16,7 +16,7 @@ fs.cpSync(runtime, destination, { recursive: true });
 fs.renameSync(path.join(destination, 'electron.exe'), path.join(destination, 'Muse.exe'));
 const application = path.join(destination, 'resources', 'app');
 fs.mkdirSync(application, { recursive: true });
-for (const item of ['main.cjs','preload.cjs','backend','build','assets','scripts/desktop-scenario.cjs','scripts/json-file-scenario.cjs','scripts/file-export-scenario.cjs','scripts/csv-file-scenario.cjs','scripts/file-rename-scenario.cjs','scripts/image-preview-scenario.cjs','scripts/video-preview-scenario.cjs','scripts/video-fixtures.cjs','scripts/pdf-preview-scenario.cjs','scripts/pdf-fixtures.cjs','scripts/chat-lifecycle-scenario.cjs','scripts/queue-scenario.cjs','scripts/cancel-admission-scenario.cjs','scripts/artifact-scenario.cjs','scripts/artifact-editing-scenario.cjs','scripts/artifact-annotation-scenario.cjs','scripts/active-panel-scenario.cjs','scripts/scheduler-scenario.cjs','scripts/knowledge-scenario.cjs','scripts/dictation-scenario.cjs','scripts/audio-scenario.cjs','scripts/quit-cancel-scenario.cjs','scripts/live-provider-scenario.cjs']) {
+for (const item of ['main.cjs','preload.cjs','backend','build','assets','scripts/desktop-scenario.cjs','scripts/json-file-scenario.cjs','scripts/file-export-scenario.cjs','scripts/csv-file-scenario.cjs','scripts/file-rename-scenario.cjs','scripts/image-preview-scenario.cjs','scripts/video-preview-scenario.cjs','scripts/video-fixtures.cjs','scripts/pdf-preview-scenario.cjs','scripts/pdf-fixtures.cjs','scripts/docx-fixtures.cjs','scripts/docx-zip.cjs','scripts/docx-preview-scenario.cjs','scripts/chat-lifecycle-scenario.cjs','scripts/queue-scenario.cjs','scripts/cancel-admission-scenario.cjs','scripts/artifact-scenario.cjs','scripts/artifact-editing-scenario.cjs','scripts/artifact-annotation-scenario.cjs','scripts/active-panel-scenario.cjs','scripts/scheduler-scenario.cjs','scripts/knowledge-scenario.cjs','scripts/dictation-scenario.cjs','scripts/audio-scenario.cjs','scripts/quit-cancel-scenario.cjs','scripts/live-provider-scenario.cjs']) {
   const source = path.join(root, item);
   if (fs.existsSync(source)) { fs.mkdirSync(path.dirname(path.join(application,item)),{recursive:true}); fs.cpSync(source, path.join(application, item), { recursive: true }); }
 }
@@ -49,7 +49,7 @@ const instructions = `Muse Windows ${pkg.version}\r\n\r\n双击 Muse.exe 启动�
 // Windows tar writes legacy-codepage ZIP names for non-ASCII filenames.
 // Keep the portable package's instruction filename independent of that locale.
 fs.writeFileSync(path.join(destination, 'README-Windows.txt'), instructions, 'utf8');
-for (const name of ['LICENSE', 'README.md']) {
+for (const name of ['LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md']) {
   const source = path.join(root, name);
   if (fs.existsSync(source)) fs.copyFileSync(source, path.join(destination, name));
 }

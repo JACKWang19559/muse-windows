@@ -101,7 +101,7 @@ const server = http.createServer(async (request, response) => {
   response.on('close', () => clearInterval(timer));
 });
 server.listen(0, '127.0.0.1', async () => {
-  const env = { ...process.env, MUSE_E2E_BASE_URL:`http://127.0.0.1:${server.address().port}/v1`, MUSE_E2E_FOLDER:folder };
+  const env = { ...process.env, MUSE_E2E_BASE_URL:`http://127.0.0.1:${server.address().port}/v1`, MUSE_E2E_FOLDER:folder, MUSE_E2E_DOCX_TRUSTED_INPUT:'1' };
   delete env.ELECTRON_RUN_AS_NODE;
   const binary = process.env.MUSE_PACKAGED_EXE || require('electron');
   const crypto=require('node:crypto');
@@ -113,6 +113,8 @@ server.listen(0, '127.0.0.1', async () => {
     for(const name of fs.readdirSync(path.join(application,'scripts')).filter(name=>/scenario\.cjs$/.test(name)).sort())visit('scripts/'+name);
     visit('scripts/video-fixtures.cjs');
     visit('scripts/pdf-fixtures.cjs');
+    visit('scripts/docx-fixtures.cjs');
+    visit('scripts/docx-zip.cjs');
     return result;
   };
   const runtimeAtLaunch=manifest(),executableAtLaunch=hash(binary);

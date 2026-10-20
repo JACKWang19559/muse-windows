@@ -6,6 +6,7 @@ api.renameFile = call('renameFile');
 api.readImageFile = call('readImageFile');
 api.readVideoFile = call('readVideoFile');
 api.readPdfFile = call('readPdfFile');
+api.readDocxFile = call('readDocxFile');
 api.readPdfAsset = call('readPdfAsset');
 api.cancelSendAdmission = call('cancelSendAdmission');
 for(const name of ['startDictation','dictationCaptureReady','finishDictation','cancelDictation','getDictationState'])api[name]=call(name);

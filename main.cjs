@@ -33,7 +33,7 @@ const { exportManagedFile } = require('./backend/file-export.cjs');
 
 app.setName('Muse Windows');
 if(process.platform==='win32')app.setAppUserModelId?.('com.jackwang19559.musewindows');
-protocol.registerSchemesAsPrivileged([{ scheme:'muse-preview', privileges:{ standard:true, secure:true } }]);
+protocol.registerSchemesAsPrivileged([{ scheme:'muse-preview', privileges:{ standard:true, secure:true } },{ scheme:'muse-docx', privileges:{ standard:true, secure:true } }]);
 const liveProviderTest = process.argv.includes('--live-provider-test');
 const testMode = process.argv.includes('--desktop-test') || liveProviderTest;
 const testBackground = testMode&&process.argv.includes('--background-lifecycle-test');
@@ -745,6 +745,7 @@ const operations = {
   readImageFile: input => require('./backend/image-file.cjs').readManagedImage(store, input),
   readVideoFile: input => require('./backend/video-file.cjs').readManagedVideo(store, input),
   readPdfFile: input => require('./backend/pdf-file.cjs').readManagedPdf(store, input),
+  readDocxFile: input => require('./backend/docx-file.cjs').readManagedDocx(store, input),
   readPdfAsset: input => require('./backend/pdf-assets.cjs').readPdfAsset(input),
   saveTextFile: input => { const result = store.saveTextFile(input || {}); if (/\.(csv|tsv)$/i.test(result.file.name)) result.preview = store.readFile(result.file.id, { preserveCsvSource: true }); refresh(); return result; },
   readFile: input => store.readFile(id(input.id), { preserveCsvSource: true }),
@@ -790,10 +791,11 @@ const operations = {
 function createWindow() {
   window = new BrowserWindow({ width: 1320, height: 880, minWidth: 850, minHeight: 620, show: !testMode&&!(process.argv.includes('--background')&&store.settings().backgroundTasks), frame: false,
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#141414' : '#faf9f6', title: 'Muse', icon: path.join(__dirname, 'assets', 'icon.png'),
-    webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, backgroundThrottling: !testMode, offscreen: testMode } });
+    webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, backgroundThrottling: !testMode, offscreen: testMode && process.env.MUSE_E2E_DOCX_TRUSTED_INPUT !== '1' } });
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-frame-navigate', event => {
     if (event.isMainFrame || ['about:srcdoc','about:blank'].includes(event.url)) return;
+    if (require('./backend/docx-preview.cjs').isDocxPreviewURL(event.url)) return;
     try { previewRuntime.document(event.url); } catch { event.preventDefault(); }
   });
   window.webContents.on('did-start-navigation', event => { if (event.isMainFrame && !event.isSameDocument) { previewRuntime.closeAll();dictation?.invalidate('navigation');disposeAudio(); } });
@@ -822,6 +824,10 @@ app.whenReady().then(async () => {
     decrypt: bytes => safeStorage.decryptString(Buffer.from(bytes))
   });
   previewRuntime = new PreviewRuntime(store);
+  protocol.handle('muse-docx', request => {
+    try{const result=require('./backend/docx-preview.cjs').docxPreviewDocument(__dirname,request);return new Response(result.bytes,{headers:{'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':result.csp,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});}
+    catch{return new Response('文档预览不可用。',{status:404,headers:{'Content-Type':'text/plain; charset=utf-8','Content-Security-Policy':"default-src 'none'"}});}
+  });
   protocol.handle('muse-preview', request => {
     try {
       if (request.method !== 'GET') throw new Error('Unsupported method');

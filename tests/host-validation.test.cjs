@@ -24,6 +24,14 @@ API_METHODS.push('readImageFile');
 API_METHODS.push('readVideoFile');
 API_METHODS.push('readPdfFile');
 API_METHODS.push('readPdfAsset');
+API_METHODS.push('readDocxFile');
+
+test('main DOCX reader transfers original managed bytes without calling the model or opening an external file',async t=>{
+ const host=fixture(t),source=path.join(host.dir,'owned.DOCX'),bytes=Buffer.from([80,75,3,4,0,255,128,7]);fs.writeFileSync(source,bytes);
+ const file=await host.store.addFile({sourcePath:source}),input={id:file.id,expectedName:file.name,expectedSha256:file.sha256},result=host.operations.readDocxFile(input);
+ assert.deepEqual(Buffer.from(result.docx),bytes);assert.match(result.mimeType,/wordprocessingml/);assert(!JSON.stringify(result).includes(host.dir));
+ new Uint8Array(result.docx).fill(0);assert.deepEqual(Buffer.from(host.operations.readDocxFile(input).docx),bytes);assert.deepEqual(fs.readFileSync(source),bytes);assert.equal(host.scheduled.length,0);assert.equal(host.external.length,0);
+});
 
 test('main PDF reader returns exact managed bytes without launching a decoder or model request',async t=>{
  const host=fixture(t),source=path.join(host.dir,'owned.PDF'),bytes=Buffer.concat([Buffer.from('%PDF-1.7\r\n'),Buffer.from([0,255,128,0]),Buffer.from('\r\n%%EOF')]);fs.writeFileSync(source,bytes);
