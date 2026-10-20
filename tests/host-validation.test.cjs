@@ -88,7 +88,7 @@ function fixture(t, overrides = {}) {
       // This VM is a separate JS realm. Recreate the host-owned wire payload
       // in the module's realm, as the actual Electron main process constructs it.
       runAgentConversation: options => mainRequire(name).runAgentConversation({ ...options, messages: JSON.parse(JSON.stringify(options.messages)) })
-    } : name === './backend/knowledge-tools.cjs' ? {...mainRequire(name),createKnowledgeRuntime:options=>mainRequire(name).createKnowledgeRuntime({...options,allowedMemoryIds:JSON.parse(JSON.stringify(options.allowedMemoryIds))})} : name === './backend/knowledge-search.cjs' || name === './backend/artifact-annotation.cjs' ? Object.fromEntries(Object.entries(mainRequire(name)).map(([key,value])=>[key,typeof value==='function'?(...args)=>value(...args.map(arg=>arg&&typeof arg==='object'?JSON.parse(JSON.stringify(arg)):arg)):value])) : name === './backend/schedule-tools.cjs'?{...mainRequire(name),createScheduleRuntime:options=>mainRequire(name).createScheduleRuntime({...options,attachmentIds:JSON.parse(JSON.stringify(options.attachmentIds)),getProviderBinding:()=>JSON.parse(JSON.stringify(options.getProviderBinding()))})}: name === './backend/schedule-time.cjs' ? Object.fromEntries(Object.entries(mainRequire(name)).map(([key,value])=>[key,['normalizeCadence','nextOccurrence','resolveLocalTime','localDateTime'].includes(key)?(...args)=>value(...args.map(arg=>arg&&typeof arg==='object'?JSON.parse(JSON.stringify(arg)):arg)):value])) : name === './backend/message-outbox.cjs' ? {
+    } : name === './backend/knowledge-tools.cjs' ? {...mainRequire(name),createKnowledgeRuntime:options=>mainRequire(name).createKnowledgeRuntime({...options,allowedMemoryIds:JSON.parse(JSON.stringify(options.allowedMemoryIds))})} : name === './backend/knowledge-search.cjs' || name === './backend/artifact-annotation.cjs' || name === './backend/active-panel.cjs' ? Object.fromEntries(Object.entries(mainRequire(name)).map(([key,value])=>[key,typeof value==='function'?(...args)=>value(...args.map(arg=>arg&&typeof arg==='object'?JSON.parse(JSON.stringify(arg)):arg)):value])) : name === './backend/schedule-tools.cjs'?{...mainRequire(name),createScheduleRuntime:options=>mainRequire(name).createScheduleRuntime({...options,attachmentIds:JSON.parse(JSON.stringify(options.attachmentIds)),getProviderBinding:()=>JSON.parse(JSON.stringify(options.getProviderBinding()))})}: name === './backend/schedule-time.cjs' ? Object.fromEntries(Object.entries(mainRequire(name)).map(([key,value])=>[key,['normalizeCadence','nextOccurrence','resolveLocalTime','localDateTime'].includes(key)?(...args)=>value(...args.map(arg=>arg&&typeof arg==='object'?JSON.parse(JSON.stringify(arg)):arg)):value])) : name === './backend/message-outbox.cjs' ? {
       ...mainRequire(name), MessageOutbox: class extends mainRequire(name).MessageOutbox {
         // Production creates this host-owned envelope in the module's realm.
         reserve(input) { return super.reserve({ ...input, ...(input.metadata ? { metadata: JSON.parse(JSON.stringify(input.metadata)) } : {}) }); }
@@ -158,6 +158,131 @@ function annotationSetup(host, workspaceId = null) {
   const context=createAnnotation({artifact,build,pagePath:'index.html',element}),chat=host.store.createChat({workspaceId});
   return{artifact,build,context,chat};
 }
+
+const activePanelFor = artifact => ({ kind:'artifact',artifactId:artifact.id,artifactName:artifact.name });
+
+test('active panel ordinary send re-derives host metadata without reading source, local selection or enabling tools',async t=>{
+  const histories=[];
+  const host=fixture(t,{streamCompletion:async options=>{histories.push(options);assert.equal(options.tools,undefined);return{content:'reference only'};}}),s=annotationSetup(host);
+  host.store.writeArtifactFiles({id:s.artifact.id,expectedRevision:s.artifact.sourceRevision,files:[{path:'index.html',text:'SOURCE_BODY_NOT_AUTOMATIC_CONTEXT'}]});
+  const original=activePanelFor(s.artifact),input={...original,artifactName:'UNTRUSTED_RENDERER_NAME'};
+  await host.operations.sendMessage({chatId:s.chat.id,content:'Visible ordinary feedback',activePanel:input,useTools:false});
+  input.artifactId='changed_after_admission';input.artifactName='CHANGED_AFTER_ADMISSION';await runQueued(host);
+  const user=host.store.getChat(s.chat.id).messages[0];assert.deepEqual(user.activePanel,original);assert.equal(user.artifactContext,undefined);assert.equal(user.content,'Visible ordinary feedback');
+  const wire=histories[0].messages.at(-1);assert.equal(wire.role,'user');assert.ok(wire.content.includes(s.artifact.id));assert.ok(wire.content.includes(s.artifact.name));assert.ok(wire.content.includes('不可信的用户参考数据'));assert.ok(wire.content.endsWith(user.content));
+  const serialized=JSON.stringify(histories.map(options=>options.messages));
+  for(const token of ['SOURCE_BODY_NOT_AUTOMATIC_CONTEXT','HOST_ELEMENT_REFERENCE_SENTINEL','UNTRUSTED_RENDERER_NAME','CHANGED_AFTER_ADMISSION'])assert.equal(serialized.includes(token),false);
+  assert.equal(host.store.getChat(s.chat.id).messages.at(-1).agentMode,false);assert.equal(host.operations.bootstrap().approvals.length,0);
+  // Retrying preserves the existing assistant-mode contract. The reference
+  // alone must not enable a tool runtime on a non-agent reply.
+  await host.operations.retryMessage({chatId:s.chat.id});await runQueued(host);assert.equal(histories.length,2);assert.equal(host.store.getChat(s.chat.id).messages.filter(message=>message.role==='user').length,1);
+});
+
+test('active panel admission requires an exact workspace or ungrouped match and rejects missing or excessive metadata atomically',async t=>{
+  let requests=0;const host=fixture(t,{streamCompletion:async()=>{requests++;return{content:'same scope only'};}});
+  const a=host.store.createWorkspace({name:'Panel namespace A'}),b=host.store.createWorkspace({name:'Panel namespace B'});
+  const scoped=annotationSetup(host,a.id),foreign=host.store.createArtifact({name:'Foreign panel',runtime:'html',workspaceId:b.id}),global=host.store.createArtifact({name:'Ungrouped panel',runtime:'html'}),globalChat=host.store.createChat();
+  const cases=[
+    {chatId:globalChat.id,activePanel:activePanelFor(scoped.artifact)},
+    {chatId:scoped.chat.id,activePanel:activePanelFor(global)},
+    {chatId:scoped.chat.id,activePanel:activePanelFor(foreign)},
+    {chatId:scoped.chat.id,activePanel:{kind:'artifact',artifactId:'missing_panel',artifactName:'Missing'}},
+    {chatId:scoped.chat.id,activePanel:{...activePanelFor(scoped.artifact),selectedText:'LOCAL_TEXT_MUST_NOT_TRAVEL'}},
+    {chatId:scoped.chat.id,activePanel:{...activePanelFor(scoped.artifact),source:'SOURCE_MUST_NOT_TRAVEL'}},
+    {chatId:scoped.chat.id,activePanel:{...activePanelFor(scoped.artifact),screenshot:'PIXELS_MUST_NOT_TRAVEL'}},
+    {chatId:scoped.chat.id,activePanel:{...activePanelFor(scoped.artifact),kind:'file'}}
+  ];
+  const before=structuredClone(host.store.state),disk=fs.readFileSync(host.store.statePath,'utf8'),backup=fs.readFileSync(host.store.backupPath,'utf8');
+  for(const input of cases){await assert.rejects(host.operations.sendMessage({...input,content:'rejected active panel',useTools:true}));assert.deepEqual(host.store.state,before);assert.equal(fs.readFileSync(host.store.statePath,'utf8'),disk);assert.equal(fs.readFileSync(host.store.backupPath,'utf8'),backup);assert.equal(host.active.size,0);assert.equal(host.scheduled.length,0);assert.equal(host.operations.bootstrap().pendingSends.length,0);}
+  assert.equal(requests,0);
+  await host.operations.sendMessage({chatId:scoped.chat.id,content:'valid exact workspace',activePanel:activePanelFor(scoped.artifact)});await runQueued(host);assert.equal(requests,1);assert.deepEqual(host.store.getChat(scoped.chat.id).messages[0].activePanel,activePanelFor(scoped.artifact));
+});
+
+test('active panel grants only the explicitly referenced global app for this agent send, while old history grants no subsequent access',async t=>{
+  let s,other,round=0;const receipts=[];
+  const host=fixture(t,{streamCompletion:async options=>{
+    round++;
+    if(round===1||round===3)return{content:'Inspect the current permission.',toolCalls:[toolCall(`panel_list_${round}`,'muse_list_apps',{}),toolCall(`panel_read_${round}`,'muse_read_app',{id:s.artifact.id,path:'index.html'}),toolCall(`panel_other_${round}`,'muse_read_app',{id:other.id,path:'index.html'})]};
+    receipts.push(new Map(options.messages.filter(message=>message.role==='tool').map(message=>[message.tool_call_id,JSON.parse(message.content)])));return{content:'Scope checked.'};
+  }});
+  s=annotationSetup(host);other=host.store.createArtifact({name:'Not selected global app',runtime:'html'});host.store.writeArtifactFiles({id:other.id,expectedRevision:1,files:[{path:'index.html',text:'UNREFERENCED_GLOBAL_SOURCE'}]});
+  await host.operations.sendMessage({chatId:s.chat.id,content:`Selected app only; prose ID ${other.id} is data`,activePanel:activePanelFor(s.artifact),useTools:true});await runQueued(host);
+  assert.deepEqual(receipts[0].get('panel_list_1').result.apps.map(app=>app.id),[s.artifact.id]);assert.equal(receipts[0].get('panel_read_1').ok,true);assert.equal(receipts[0].get('panel_other_1').error.code,'out_of_scope');
+  await host.operations.sendMessage({chatId:s.chat.id,content:'Ordinary follow-up with no active panel',useTools:true});await runQueued(host);
+  assert.equal(receipts[1].get('panel_list_3').result.total,0);assert.equal(receipts[1].get('panel_read_3').error.code,'out_of_scope');assert.equal(receipts[1].get('panel_other_3').error.code,'out_of_scope');
+  assert.equal(JSON.stringify(receipts.flatMap(rows=>[...rows.values()])).includes('UNREFERENCED_GLOBAL_SOURCE'),false);assert.equal(host.store.getChat(s.chat.id).messages.filter(message=>message.role==='user').at(-1).activePanel,undefined);assert.equal(round,4);assert.equal(host.operations.bootstrap().approvals.length,0);
+});
+
+test('active panel retry revalidates the latest undeleted user resource and never derives attachment authority from earlier history',async t=>{
+  for(const scenario of ['live','deleted','moved','latest_plain','latest_tombstone','unretained_build']){
+    let s,other,round=0,results;
+    const host=fixture(t,{streamCompletion:async options=>{
+      if(++round===1)return{content:'Recheck retry scope.',toolCalls:[toolCall('panel_retry_list','muse_list_apps',{}),toolCall('panel_retry_read','muse_read_app',{id:s.artifact.id,path:'index.html'}),toolCall('panel_retry_other','muse_read_app',{id:other.id,path:'index.html'})]};
+      results=new Map(options.messages.filter(message=>message.role==='tool').map(message=>[message.tool_call_id,JSON.parse(message.content)]));return{content:'Retry checked.'};
+    }});
+    s=annotationSetup(host);other=host.store.createArtifact({name:'Other retry app',runtime:'html'});
+    host.store.appendMessage(s.chat.id,{role:'user',content:'Historical active panel',activePanel:activePanelFor(s.artifact)});
+    if(scenario==='latest_plain'||scenario==='latest_tombstone'){
+      host.store.appendMessage(s.chat.id,{role:'assistant',content:'earlier reply'});
+      const latest=host.store.appendMessage(s.chat.id,{role:'user',content:'Latest user',...(scenario==='latest_tombstone'?{activePanel:activePanelFor(other)}:{})});
+      if(scenario==='latest_tombstone')host.operations.deleteTurn({chatId:s.chat.id,messageId:latest.id});
+    }
+    host.store.appendMessage(s.chat.id,{role:'assistant',content:'',status:'error',error:'synthetic retry failure',agentMode:true});
+    if(scenario==='deleted')host.operations.deleteArtifact({id:s.artifact.id});
+    if(scenario==='moved'){const workspace=host.store.createWorkspace({name:'Changed panel namespace'});host.store._commit(next=>{next.artifacts.find(app=>app.id===s.artifact.id).workspaceId=workspace.id;return null;});}
+    if(scenario==='unretained_build')for(let i=0;i<3;i++)host.store.commitArtifactBuild({id:s.artifact.id,sourceRevision:s.build.sourceRevision,build:{...structuredClone(s.build),id:`active_panel_new_build_${i}`}});
+    await host.operations.retryMessage({chatId:s.chat.id});await runQueued(host);
+    const allowed=['live','latest_tombstone','unretained_build'].includes(scenario),list=results.get('panel_retry_list'),read=results.get('panel_retry_read');
+    assert.equal(list.ok,true,scenario);assert.equal(results.get('panel_retry_other').error.code,'out_of_scope',scenario);
+    if(allowed){assert.deepEqual(list.result.apps.map(app=>app.id),[s.artifact.id],scenario);assert.equal(read.ok,true,scenario);}
+    else{assert.equal(list.result.total,0,scenario);assert.equal(read.error.code,'out_of_scope',scenario);}
+    assert.deepEqual(host.store.getChat(s.chat.id).messages[0].activePanel,activePanelFor(s.artifact),'history remains reference data');assert.equal(round,2,scenario);assert.equal(host.operations.bootstrap().approvals.length,0,scenario);
+  }
+});
+
+test('queued active panel captures its own detached identity at admission and keeps that resource through dispatch',async t=>{
+  const entered=deferred(),done=deferred();let s,other,round=0,receipts;
+  const host=fixture(t,{streamCompletion:async options=>{
+    if(++round===1){entered.resolve();await done.promise;return{content:'first complete'};}
+    if(round===2)return{content:'Inspect queued selection.',toolCalls:[toolCall('queued_panel_list','muse_list_apps',{}),toolCall('queued_panel_read','muse_read_app',{id:s.artifact.id,path:'index.html'}),toolCall('queued_panel_other','muse_read_app',{id:other.id,path:'index.html'})]};
+    receipts=new Map(options.messages.filter(message=>message.role==='tool').map(message=>[message.tool_call_id,JSON.parse(message.content)]));return{content:'queued complete'};
+  }});
+  s=annotationSetup(host);other=host.store.createArtifact({name:'Different current UI app',runtime:'html'});
+  const foreignWorkspace=host.store.createWorkspace({name:'Foreign queued scope'}),foreign=host.store.createArtifact({name:'Foreign queued app',runtime:'html',workspaceId:foreignWorkspace.id});
+  await host.operations.sendMessage({chatId:s.chat.id,content:'running first'});const first=host.scheduled.shift()();await entered.promise;
+  const before=structuredClone(host.store.state);await assert.rejects(host.operations.sendMessage({chatId:s.chat.id,content:'foreign queued resource',activePanel:activePanelFor(foreign),useTools:true}),/工作区/);assert.deepEqual(host.store.state,before);assert.equal(host.operations.bootstrap().pendingSends.length,0);
+  const input={...activePanelFor(s.artifact),artifactName:'QUEUED_FORGED_NAME'},queued=await host.operations.sendMessage({chatId:s.chat.id,content:'QUEUED_ACTIVE_PANEL_NOTE',activePanel:input,useTools:true});assert.equal(queued.queued,true);
+  input.artifactId=other.id;input.artifactName=other.name;
+  const publicCopy=structuredClone(host.operations.bootstrap()).pendingSends[0];assert.deepEqual(publicCopy.activePanel,activePanelFor(s.artifact));publicCopy.activePanel.artifactId=other.id;
+  assert.deepEqual(host.operations.bootstrap().pendingSends[0].activePanel,activePanelFor(s.artifact));assert.equal(host.store.getChat(s.chat.id).messages.some(message=>message.content==='QUEUED_ACTIVE_PANEL_NOTE'),false);
+  done.resolve();await first;await waitFor(()=>host.scheduled.length===1,'queued panel dispatch admitted');await runQueued(host);
+  const saved=host.store.getChat(s.chat.id).messages.find(message=>message.content==='QUEUED_ACTIVE_PANEL_NOTE');assert.deepEqual(saved.activePanel,activePanelFor(s.artifact));assert.equal(saved.artifactContext,undefined);
+  assert.deepEqual(receipts.get('queued_panel_list').result.apps.map(app=>app.id),[s.artifact.id]);assert.equal(receipts.get('queued_panel_read').ok,true);assert.equal(receipts.get('queued_panel_other').error.code,'out_of_scope');assert.equal(round,3);assert.equal(host.operations.bootstrap().pendingSends.length,0);
+});
+
+test('queued active panels fail revalidation after app deletion or namespace changes and preserve recoverable metadata',async t=>{
+  for(const scenario of ['deleted','app_moved','chat_moved']){
+    const entered=deferred(),done=deferred();let requests=0;
+    const host=fixture(t,{streamCompletion:async()=>{requests++;entered.resolve();await done.promise;return{content:'first complete'};}}),s=annotationSetup(host);
+    await host.operations.sendMessage({chatId:s.chat.id,content:'running'});const first=host.scheduled.shift()();await entered.promise;
+    const queued=await host.operations.sendMessage({chatId:s.chat.id,content:'STALE_ACTIVE_PANEL_MUST_NOT_SEND',activePanel:activePanelFor(s.artifact),useTools:true});
+    if(scenario==='deleted')host.operations.deleteArtifact({id:s.artifact.id});
+    else{const workspace=host.store.createWorkspace({name:'New namespace'});if(scenario==='app_moved')host.store._commit(next=>{next.artifacts.find(app=>app.id===s.artifact.id).workspaceId=workspace.id;return null;});else host.operations.updateChat({id:s.chat.id,workspaceId:workspace.id});}
+    done.resolve();await first;await waitFor(()=>host.operations.bootstrap().pendingSends[0]?.state==='failed','stale queued panel rejected');await waitFor(()=>host.active.size===0,'stale panel original generation settled');
+    assert.equal(requests,1,scenario);assert.equal(host.active.size,0,scenario);assert.equal(host.scheduled.length,0,scenario);assert.equal(host.store.getChat(s.chat.id).messages.some(message=>message.content==='STALE_ACTIVE_PANEL_MUST_NOT_SEND'),false,scenario);
+    const recovered=structuredClone(host.operations.cancelQueuedMessage({id:queued.queueId,preserveForRestore:true}));assert.equal(recovered.state,'failed');assert.deepEqual(recovered.activePanel,activePanelFor(s.artifact));assert.equal(recovered.useTools,true);assert.equal(host.operations.bootstrap().pendingSends.length,1);
+    await assert.rejects(host.operations.sendMessage(recovered));assert.equal(host.scheduled.length,0);assert.equal(requests,1);
+    host.operations.cancelQueuedMessage({id:queued.queueId});assert.equal(host.operations.bootstrap().pendingSends.length,0);
+  }
+});
+
+test('deleted active-panel user messages leave no reference in later host model context',async t=>{
+  const histories=[];const host=fixture(t,{streamCompletion:async options=>{histories.push(options.messages);return{content:'ordinary reply'};}}),s=annotationSetup(host);
+  await host.operations.sendMessage({chatId:s.chat.id,content:'REMOVE_PANEL_USER_NOTE',activePanel:activePanelFor(s.artifact)});await runQueued(host);
+  const user=host.store.getChat(s.chat.id).messages[0];host.operations.deleteTurn({chatId:s.chat.id,messageId:user.id});assert.equal(host.store.getChat(s.chat.id).messages[0].activePanel,undefined);
+  await host.operations.sendMessage({chatId:s.chat.id,content:'ordinary next request'});await runQueued(host);
+  const serialized=JSON.stringify(histories[1]);assert.equal(serialized.includes(s.artifact.id),false);assert.equal(serialized.includes(s.artifact.name),false);assert.equal(serialized.includes('REMOVE_PANEL_USER_NOTE'),false);assert.equal(serialized.includes('[用户当前引用的应用]'),false);
+});
 
 test('annotation send derives trusted app/build metadata and sends selected page context only as user reference',async t=>{
   let history;

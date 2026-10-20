@@ -7,13 +7,18 @@ Data shape:
   Settings = {baseUrl, model, systemPrompt, temperature, hasApiKey, theme:'system'|'light'|'dark', language:'zh', speechBaseUrl, transcriptionModel, synthesisModel, synthesisVoice, hasSpeechApiKey, dictationAutoSend:boolean, backgroundTasks:boolean}
   Workspace = {id,name,description,color,createdAt,updatedAt}
   Chat = {id,title,workspaceId:null|string,createdAt,updatedAt,pinned:boolean,messages:Message[]}
-  Message = {id,role:'user'|'assistant',content,createdAt,status?:'complete'|'streaming'|'error'|'cancelled',attachmentIds?:string[],error?:string,agentMode?:boolean,toolTrace?:ToolRound[],replyTo?:{messageId,role,excerpt},artifactContext?:ArtifactContext,isDeleted?:boolean}
+  Message = {id,role:'user'|'assistant',content,createdAt,status?:'complete'|'streaming'|'error'|'cancelled',attachmentIds?:string[],error?:string,agentMode?:boolean,toolTrace?:ToolRound[],replyTo?:{messageId,role,excerpt},artifactContext?:ArtifactContext,activePanel?:ActivePanel,isDeleted?:boolean}
+  ActivePanel = {kind:'artifact',artifactId,artifactName}
+    Exact own JSON fields only; safe artifact ID, valid UTF-8 name <=160 UTF-16 units, no Cc/Cf controls.
+    Host re-derives identity/name from the selected artifact and validates the conversation workspace before admission.
+    This is a resource reference, not source, DOM selection, screenshot or tool authority. Only user messages may carry it.
+    Local history/Chat Completions text adaptation is independent Windows behavior; original active_panel server persistence is unknown.
   ArtifactContext = {kind:'artifact_element',artifactId,artifactName,buildId,sourceRevision,pagePath,element:{tag,id,classes:string[],text,path,viewport:{width,height},click:{x,y}}}
     Captured through the current private preview port; host re-derives app/build metadata and validates scope before admission.
     Stored history is untrusted reference data; replay alone grants no tool authority. A new selection or retry revalidates any selected app, and writes/builds need approval.
   ToolRound = {content,calls:[{id,name,arguments:string,status:'pending'|'running'|'awaiting_approval'|'complete'|'denied'|'error'|'cancelled',result?:string}]}
   File = {id,name,mime,size,workspaceId:null|string,createdAt,textStatus:'ready'|'unsupported'|'error',textPreview?,error?}
-  PendingSend = {id,chatId,content,attachmentIds,useTools,clientMessageId?,replyToMessageId?,artifactContext?:ArtifactContext,queuedAt,state:'queued'|'failed',error?}
+  PendingSend = {id,chatId,content,attachmentIds,useTools,clientMessageId?,replyToMessageId?,artifactContext?:ArtifactContext,activePanel?:ActivePanel,queuedAt,state:'queued'|'failed',error?}
   Snapshot = {settings,workspaces,chats,files,approvals:[{id,chatId,requestId,toolCallId,name,workspaceId,arguments,permissions,summary,createdAt}],pendingSends:PendingSend[],app:{version,platform,dataDirectory?}}
 
 window.muse methods:
@@ -43,7 +48,7 @@ window.muse methods:
   deleteChat({id}) -> Snapshot
   searchMessages({query,chatId?,workspaceId?,limit?:1..100,cursor?}) -> {hits:[{chatId,messageId,title,role,workspaceId,createdAt,snippet,matchStart,matchLength}],nextCursor:null|string}
   deleteTurn({chatId,messageId}) -> {chat:Chat,deletedMessageIds:string[]}  // user-only tombstone; active generation must be stopped first
-  sendMessage({chatId,content,attachmentIds?:string[],useTools?:boolean,replyToMessageId?:string,clientMessageId?:string,artifactContext?:ArtifactContext}) -> {requestId:string}|{queued:true,queueId,chatId}
+  sendMessage({chatId,content,attachmentIds?:string[],useTools?:boolean,replyToMessageId?:string,clientMessageId?:string,artifactContext?:ArtifactContext,activePanel?:ActivePanel}) -> {requestId:string}|{queued:true,queueId,chatId}
   cancelQueuedMessage({id,preserveForRestore?:boolean}) -> PendingSend  // true cancels dispatch but retains failed intent until renderer safely restores it; false/omitted removes it
   stopGeneration({chatId}) -> void
   respondApproval({id,decision:'approve'|'deny'}) -> Snapshot  // current live request only; never restores approval after restart
@@ -102,6 +107,8 @@ Backend module boundaries (main process):
   backend/chat-search.cjs exports searchMessages(chats, input), searching saved message bodies with literal Unicode matching and query/scope-bound tuple cursors.
   backend/message-outbox.cjs exports MessageOutbox, isSafeOutboxRetry, waitForOutboxRetry and limits.
     Memory-only FIFO reservations; optional per-chat lanes are a Windows adaptation, not original Muse server behavior.
+  backend/active-panel.cjs exports activePanelShape(value), createActivePanel({artifact}), formatActivePanelContext(value).
+    createActivePanel reads only host-fetched artifact.id/name. The formatter returns explicitly untrusted user-reference text, never system instructions.
 
 Important invariants:
   Preview synthesis uses speechBaseUrl/synthesisModel/synthesisVoice and the independently encrypted speech credential. No chat text is automatically converted to TTS.
@@ -117,6 +124,12 @@ Important invariants:
   Send admission is bounded to 32 live reservations/64 MiB estimated intent data, with a 5-minute waiting deadline that never interrupts an active attempt.
   Windows holds each chat lane through generation; other chats proceed independently. Stop cancels that chat's waiting sends; failed intents may be restored manually.
   Provider identity or workspace changes invalidate waiting intents. Shutdown discards the memory-only queue and never replays it on restart.
+  Ordinary sends capture the current selected application's resource identity; changing/closing the panel cannot silently select a different app for an existing intent.
+  ActivePanel and ArtifactContext are immutable message snapshots. Imported IDs remap only when the corresponding artifact was actually restored; removed-app history stays descriptive.
+  Historical references alone grant no tools. New sends and retries revalidate selected apps against current Store scope; explicit useTools and independent runtime rules still control access.
+  Context references are formatted as user data. They do not automatically upload source, DOM selections or screenshots; authorized app-tool calls can separately expose selected source to the model.
+  Contextual draft recovery never merges an older app reference into new text, attachments or quotes. IPC completions before a paint observe current draft maps; occupied drafts leave a separate recoverable intent.
+  Deleting a user message clears its current-app and element references from current state, recovery backup and new exports; deleting an app does not rewrite descriptive message history.
   Reply snapshots point to an earlier same-chat stable message. Deletion clears the selected user's body, attachment links, own quote and other snapshots of its body, preserving later replies/tool receipts.
   Workspace scope includes that workspace's text documents plus explicitly attached files.
   Rendering Markdown uses sanitization and external links are delegated to the main process.
@@ -129,5 +142,6 @@ UI scope:
   Chinese polished desktop workspace. Sidebar new chat, search, chats grouped/pinned, Spaces/workspaces, settings.
   Welcome/new chat composer, streaming chat with Markdown/copy/retry/stop, native file attachments.
   Workspace page has editable name/description, files, scoped chats. File preview panel.
+  The local application panel docks beside ordinary chat, with narrow-window source/preview tabs. Current-app references remain visible and follow panel selection/close; a restored draft reference has an explicit remove action.
   Settings covers base URL/key/model, connection test, model discovery, prompt/temp/theme, backup import/export.
   Empty state must not fake an AI answer. Ask user to configure provider, then send real requests.

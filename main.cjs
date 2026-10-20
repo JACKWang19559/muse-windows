@@ -22,6 +22,7 @@ const { rebuildMemoryIndex, searchMemories, memorySourceDigest } = require('./ba
 const { parseSkillPackage, HOST_TOOL_NAMES } = require('./backend/skill-package.cjs');
 const { buildSelectedContext, validateContextLease } = require('./backend/context-builder.cjs');
 const { annotationShape, createAnnotation, formatAnnotationContext } = require('./backend/artifact-annotation.cjs');
+const { activePanelShape, createActivePanel, formatActivePanelContext } = require('./backend/active-panel.cjs');
 const { createKnowledgeRuntime } = require('./backend/knowledge-tools.cjs');
 const { createDictationSessionManager } = require('./backend/dictation-session.cjs');
 const { transcribeAudio, normalizeSpeechBaseUrl } = require('./backend/asr-provider.cjs');
@@ -240,6 +241,12 @@ function preparedArtifactContext(value, workspaceId) {
   const build = store.readArtifactBuild({ id:artifact.id, buildId:selected.buildId });
   return createAnnotation({ artifact, build, pagePath:selected.pagePath, element:selected.element });
 }
+function preparedActivePanel(value, workspaceId) {
+  if(value==null)return null;
+  const selected=activePanelShape(value),artifact=store.getArtifact(selected.artifactId);
+  if(artifact.workspaceId!==workspaceId)throw new Error('当前应用不属于这个对话的工作区，请重新选择。');
+  return createActivePanel({artifact});
+}
 function contextMessages(chat, excludedId, settings, all) {
   const workspace = all.workspaces.find(x => x.id === chat.workspaceId);
   const result = [];
@@ -274,7 +281,8 @@ function contextMessages(chat, excludedId, settings, all) {
       const target = message.replyTo && chat.messages.find(item => item.id === message.replyTo.messageId);
       const quote = message.replyTo ? target?.isDeleted ? '引用的历史消息已删除。\n\n' : `引用的历史消息（${message.replyTo.role === 'user' ? '用户' : '助手'}，仅作参考）：${JSON.stringify(message.replyTo.excerpt || '附件消息或空文本')}\n\n` : '';
       const annotation = message.artifactContext ? formatAnnotationContext(message.artifactContext) + '\n\n' : '';
-      result.push({ role: message.role, content: quote + annotation + message.content });
+      const panel = message.activePanel ? formatActivePanelContext(message.activePanel) + '\n\n' : '';
+      result.push({ role: message.role, content: quote + panel + annotation + message.content });
     }
   }
   return result;
@@ -305,8 +313,9 @@ async function submitMessage(input) {
   if (pendingSends.size >= 32) throw new Error('待发送消息已达上限，请先处理现有消息。');
   const selection=selectedContext(chat,!!input.useTools);
   const artifactContext = preparedArtifactContext(input.artifactContext, chat.workspaceId);
+  const activePanel = preparedActivePanel(input.activePanel, chat.workspaceId);
   const revision = providerRevision(), controller = new AbortController();
-  const payload = { chatId, content, attachmentIds, useTools: !!input.useTools, ...(artifactContext ? { artifactContext } : {}), ...(clientMessageId ? { clientMessageId } : {}), ...(replyToMessageId ? { replyToMessageId } : {}) };
+  const payload = { chatId, content, attachmentIds, useTools: !!input.useTools, ...(artifactContext ? { artifactContext } : {}), ...(activePanel ? { activePanel } : {}), ...(clientMessageId ? { clientMessageId } : {}), ...(replyToMessageId ? { replyToMessageId } : {}) };
   const reservation = sendOutbox.reserve({ bytes: Buffer.byteLength(JSON.stringify(payload)), laneKey: chatId, signal: controller.signal });
   if (!reservation) throw new Error('发送队列已满，请稍后重试。');
   const queueId = reservation.id;
@@ -357,11 +366,13 @@ async function startGeneration(input, retry = false, lease = null) {
       const content = text(input.content || '').trim();
       const artifactContext = preparedArtifactContext(input.artifactContext, chat.workspaceId);
       job.annotationArtifactId=artifactContext?.artifactId||null;
+      const activePanel = preparedActivePanel(input.activePanel, chat.workspaceId);
+      job.panelArtifactId=activePanel?.artifactId||null;
       const attachmentIds = Array.isArray(input.attachmentIds) ? [...new Set(input.attachmentIds.map(id))].slice(0, 20) : [];
       if (!content && !attachmentIds.length) throw new Error('请写点内容或添加文件。');
       for (const fileId of attachmentIds) if (!store.getFile(fileId)) throw new Error('附件不存在，请重新选择。');
       const userMessageId = input.clientMessageId == null ? crypto.randomUUID() : id(input.clientMessageId);
-      store.appendMessage(chatId, { id: userMessageId, role: 'user', content: content || '请分析我提供的文件。', attachmentIds, createdAt: new Date().toISOString(), status: 'complete', ...(artifactContext ? { artifactContext } : {}), ...(input.replyToMessageId != null ? { replyToMessageId: id(input.replyToMessageId) } : {}) });
+      store.appendMessage(chatId, { id: userMessageId, role: 'user', content: content || '请分析我提供的文件。', attachmentIds, createdAt: new Date().toISOString(), status: 'complete', ...(artifactContext ? { artifactContext } : {}), ...(activePanel ? { activePanel } : {}), ...(input.replyToMessageId != null ? { replyToMessageId: id(input.replyToMessageId) } : {}) });
       job.admissionIds.push(userMessageId);
       chat = store.getChat(chatId);
       if (chat.messages.filter(x => x.role === 'user').length === 1 && (!chat.title || ['新对话', '新聊天'].includes(chat.title))) {
@@ -370,10 +381,11 @@ async function startGeneration(input, retry = false, lease = null) {
     }
     chat = store.getChat(chatId);
     if(retry){
-      const reference=[...chat.messages].reverse().find(message=>message.role==='user'&&!message.isDeleted)?.artifactContext;
+      const prior=[...chat.messages].reverse().find(message=>message.role==='user'&&!message.isDeleted),reference=prior?.artifactContext;
       // Replayed text is historical data. A retry may attach only the same
       // currently existing, host-revalidated app; a stale reference grants none.
       if(reference){try{job.annotationArtifactId=preparedArtifactContext(reference,chat.workspaceId)?.artifactId||null;}catch{job.annotationArtifactId=null;}}
+      if(prior?.activePanel){try{job.panelArtifactId=preparedActivePanel(prior.activePanel,chat.workspaceId)?.artifactId||null;}catch{job.panelArtifactId=null;}}
     }
     const last = chat.messages.at(-1);
     // A tool receipt records a real operation. Keep it even when the final
@@ -401,7 +413,7 @@ async function startGeneration(input, retry = false, lease = null) {
       onApproval: request => requestToolApproval(chatId, job, request),
       onToolEvent
     }) : null;
-    const appRuntime = job.agentMode ? createArtifactRuntime({ store, workspaceId: job.workspaceId, attachedArtifactIds:job.annotationArtifactId?[job.annotationArtifactId]:[], signal: controller.signal,
+    const appRuntime = job.agentMode ? createArtifactRuntime({ store, workspaceId: job.workspaceId, attachedArtifactIds:[...new Set([job.annotationArtifactId,job.panelArtifactId].filter(Boolean))], signal: controller.signal,
       requestApproval: request => requestToolApproval(chatId, job, request), onActivity: onToolEvent }) : null;
     const scheduleRuntime=job.agentMode?createScheduleRuntime({store,workspaceId:job.workspaceId,attachmentIds,signal:controller.signal,requestApproval:request=>requestToolApproval(chatId,job,request),onActivity:onToolEvent,getProviderBinding:providerBinding,onChanged:({type,id})=>{if(type!=='create')scheduler?.cancel(id);refresh();},runSchedule:input=>schedulerInstance().runNow(input)}):null;
     const scheduleNames=new Set(scheduleRuntime?.tools.map(tool=>tool.function.name)||[]);

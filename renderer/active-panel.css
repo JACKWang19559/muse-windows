@@ -1,0 +1,186 @@
+/* Current-app context is visible alongside the ordinary chat composer. */
+.desktop-app.artifact-docked {
+  --artifact-dock-width: clamp(500px, 58vw, 1000px);
+}
+.desktop-app.artifact-docked .app-body {
+  padding-right: calc(var(--artifact-dock-width) + 12px);
+}
+.desktop-app.artifact-docked .artifact-panel {
+  inset: 47px 8px 8px auto;
+  width: var(--artifact-dock-width);
+  border-color: var(--line-strong);
+  border-radius: 12px;
+  box-shadow: -8px 4px 28px #00000012;
+  background: var(--bg);
+}
+.desktop-app.artifact-docked .sidebar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 248px;
+  box-shadow: 8px 0 25px #0002;
+  z-index: 32;
+}
+.desktop-app.artifact-docked .sidebar.closed {
+  display: none;
+}
+.desktop-app.artifact-docked .sidebar-mobile-backdrop {
+  display: block;
+  position: absolute;
+  inset: 0 calc(var(--artifact-dock-width) + 12px) 0 0;
+  background: #0003;
+  z-index: 31;
+}
+.desktop-app.artifact-docked .file-preview {
+  display: none;
+}
+/* A notification can span the narrower chat. Keep its close control usable
+   without blocking the composer or application beneath the message. */
+.desktop-app.artifact-docked .toast {
+  pointer-events: none;
+}
+.desktop-app.artifact-docked .toast .icon-button {
+  pointer-events: auto;
+}
+.desktop-app.artifact-docked .chat-messages,
+.desktop-app.artifact-docked .chat-composer-area {
+  width: calc(100% - 32px);
+  max-width: 760px;
+}
+.desktop-app.artifact-docked .content-header {
+  padding-inline: 16px;
+  gap: 8px;
+}
+.desktop-app.artifact-docked .artifact-header {
+  padding: 13px 14px;
+  gap: 9px;
+}
+.desktop-app.artifact-docked .artifact-header h2 {
+  font-size: 15px;
+}
+.desktop-app.artifact-docked .artifact-header p {
+  font-size: 10px;
+  line-height: 1.6;
+}
+.desktop-app.artifact-docked .artifact-library {
+  width: 155px;
+  padding: 11px 9px;
+  gap: 12px;
+}
+.desktop-app.artifact-docked .artifact-library nav button {
+  padding: 9px 6px;
+  gap: 6px;
+  font-size: 12px;
+}
+.desktop-app.artifact-docked .artifact-create > div {
+  gap: 4px;
+}
+.desktop-app.artifact-docked .artifact-create select {
+  width: 65px;
+}
+.desktop-app.artifact-docked .artifact-create .button {
+  padding-inline: 7px;
+  gap: 3px;
+}
+.desktop-app.artifact-docked .artifact-workbench > header {
+  padding: 11px 12px;
+  gap: 7px;
+}
+.desktop-app.artifact-docked .artifact-workbench > header > h3 {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.desktop-app.artifact-docked .artifact-workbench > header > .artifact-workbench-actions {
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.desktop-app.artifact-docked .artifact-split {
+  grid-template-columns: minmax(190px, 42%) minmax(240px, 1fr);
+}
+.desktop-app.artifact-docked .artifact-workbench > header > .artifact-workbench-tabs {
+  display: none;
+}
+.desktop-app.artifact-docked .artifact-revision {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.desktop-app.artifact-docked .knowledge-chatbar {
+  min-width: 0;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  gap: 7px;
+}
+.desktop-app.artifact-docked .knowledge-chatbar select {
+  min-width: 0;
+  max-width: min(100%, 220px);
+  flex: 0 1 200px;
+}
+.desktop-app.artifact-docked .artifact-annotation > footer {
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.desktop-app.artifact-docked .artifact-annotation > footer > span {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.artifact-workbench-tabs button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: 0;
+  border-radius: 5px;
+  padding: 6px 9px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+}
+.artifact-workbench-tabs button[aria-pressed='true'] {
+  background: var(--active);
+  color: var(--accent);
+}
+@media (max-width: 1100px) {
+  .desktop-app.artifact-docked .artifact-library {
+    width: 138px;
+    padding: 10px 7px;
+  }
+  .desktop-app.artifact-docked .artifact-library-note {
+    font-size: 10px;
+  }
+  .desktop-app.artifact-docked .artifact-workbench > header > .artifact-workbench-tabs {
+    display: flex;
+    margin-left: 0;
+    padding: 2px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+  }
+  .desktop-app.artifact-docked .artifact-split {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .desktop-app.artifact-docked .artifact-source,
+  .desktop-app.artifact-docked .artifact-preview-column {
+    flex: 1;
+    min-width: 0;
+    border-right: 0;
+  }
+  .desktop-app.artifact-docked .artifact-workbench[data-view='preview'] .artifact-source,
+  .desktop-app.artifact-docked .artifact-workbench[data-view='source'] .artifact-preview-column {
+    display: none;
+  }
+  .desktop-app.artifact-docked .artifact-preview-bar,
+  .desktop-app.artifact-docked .artifact-build-picker {
+    flex-wrap: wrap;
+    padding: 7px 9px;
+    gap: 5px;
+  }
+  .desktop-app.artifact-docked .artifact-footnote {
+    padding: 7px 10px;
+    line-height: 1.5;
+  }
+}

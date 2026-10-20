@@ -14,7 +14,7 @@ module.exports=async({window,store,operations,folder,page,wait,check,fill})=>{
   const frameFor=()=>window.webContents.mainFrame.frames.find(frame=>frame.url.startsWith('muse-preview:'));
   const inFrame=async fn=>{const frame=frameFor();if(!frame)throw Error('Missing annotation preview frame');return frame.executeJavaScript(`(${fn.toString()})()`);};
   const open=async()=>{
-    await page(()=>document.querySelector('[data-testid="artifacts-open"]').click());
+    await page(()=>{if(!document.querySelector('[data-testid="artifact-panel"]'))document.querySelector('[data-testid="artifacts-open"]').click();});
     await wait(()=>!!document.querySelector('[data-testid="artifact-panel"]'));
     await page(id=>document.querySelector(`[data-artifact-id="${id}"]`).click(),artifact.id);
     await wait(()=>document.querySelector('[data-testid="artifact-pick"]')?.disabled===false);
@@ -66,7 +66,7 @@ module.exports=async({window,store,operations,folder,page,wait,check,fill})=>{
   await new Promise(resolve=>setTimeout(resolve,150));
   await window.webContents.capturePage().then(image=>fs.writeFileSync(path.join(folder,'artifact-annotation.png'),image.toPNG()));
   await page(()=>{const button=document.querySelector('[data-testid="artifact-annotation-send"]');button.click();button.click();});
-  await wait(()=>!document.querySelector('[data-testid="artifact-panel"]'));
+  await wait(()=>!document.querySelector('[data-testid="artifact-annotation"]')&&!!document.querySelector('[data-testid="artifact-panel"]'));
   const complete=await wait(async id=>{const c=(await window.muse.bootstrap()).chats.find(c=>c.id===id);return c?.messages.at(-1)?.status==='complete'?c:null;},chat.id);
   const selected=complete.messages.find(message=>message.role==='user'&&message.content===note),context=selected?.artifactContext;
   check('Annotation uses the current chat and stores the visible note separately from page context',!!selected&&context?.artifactId===artifact.id&&context.buildId&&selected.content===note&&complete.messages.filter(message=>message.role==='user').length===1);
@@ -81,6 +81,7 @@ module.exports=async({window,store,operations,folder,page,wait,check,fill})=>{
   check('Busy-chat admission retains the selected build and element in the normal pending send',queued.artifactContext?.artifactId===artifact.id&&queued.content==='ANNOTATION_DEMO queued page feedback');
   await page(id=>window.muse.stopGeneration({chatId:id}),chat.id);
   await wait(async id=>(await window.muse.bootstrap()).pendingSends.find(row=>row.id===id)?.state==='failed',queued.id);
+  await page(()=>document.querySelector('[aria-label="关闭本地应用"]').click());
   await fill('composer-input','EXISTING_DRAFT_MUST_SURVIVE');
   await page(id=>document.querySelector(`[data-queue-id="${id}"] [data-testid="queue-restore"]`).click(),queued.id);
   await new Promise(resolve=>setTimeout(resolve,100));
@@ -131,7 +132,7 @@ module.exports=async({window,store,operations,folder,page,wait,check,fill})=>{
     check('First-chat admission failure retains the page note and untouched workspace composer',await page(expected=>document.querySelector('[data-testid="artifact-annotation-note"]').value===expected&&document.querySelector('[data-testid="composer-input"]').value==='KEEP_UNSUBMITTED_WORKSPACE_DRAFT',retryNote));
   }finally{releaseFailure();operations.sendMessage=originalSend;}
   await page(()=>document.querySelector('[data-testid="artifact-annotation-send"]').click());
-  await wait(()=>!document.querySelector('[data-testid="artifact-panel"]'));
+  await wait(()=>!document.querySelector('[data-testid="artifact-annotation"]')&&!!document.querySelector('[data-testid="artifact-panel"]'));
   const promoted=await wait(async note=>(await window.muse.bootstrap()).chats.find(c=>c.messages.some(message=>message.content===note)&&c.messages.at(-1)?.status==='complete'),retryNote);
   check('Successful first-chat feedback promotes its route only after admission and preserves the ordinary draft',promoted.workspaceId===workspace.id&&promoted.messages.at(-1).content.includes('ANNOTATION_CONTEXT_RECEIVED')&&await page(()=>document.querySelector('[data-testid="composer-input"]').value==='KEEP_UNSUBMITTED_WORKSPACE_DRAFT'));
   const beforeModel=store.getArtifact(artifact.id);

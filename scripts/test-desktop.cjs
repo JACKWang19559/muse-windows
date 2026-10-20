@@ -81,7 +81,8 @@ const server = http.createServer(async (request, response) => {
     return;
   }
   const annotationOK=user.includes('[User annotated an element in their artifact]')&&user.includes('Element: button#selected-action.one.two.three')&&user.includes('DOM path: body > main > button')&&user.includes('Viewport: ')&&user.includes('Click position: ')&&user.includes('ELEMENT_CONTEXT_TOKEN')&&!user.includes('PRIVATE_INPUT_VALUE_NOT_CONTEXT');
-  const chunks = user.includes('ANNOTATION_DEMO') ? [annotationOK?'ANNOTATION_CONTEXT_RECEIVED':'ANNOTATION_CONTEXT_MISSING'] : user.includes('取消') ? Array(200).fill('进行中的回复。') : ['# 桌面验收通过\n\n','已收到你的问题。','参考资料代号：**WIND-CEDAR-42**。\n\n','- 流式中文回复\n- 本地文件上下文\n'];
+  const panelPresent=user.includes('[用户当前引用的应用]'),panelOK=panelPresent&&/\n应用: [^\n]+ \([A-Za-z0-9_-]+\)\n/.test(user)&&!(/PANEL_(SOURCE|DOM|INPUT|SELECTION|SCREENSHOT)_PRIVATE_[AB]_12/.test(user));
+  const chunks = user.includes('PANEL_DEMO_') ? [panelPresent?(panelOK?'PANEL_CONTEXT_RECEIVED':'PANEL_CONTEXT_INVALID'):'PANEL_CONTEXT_ABSENT'] : user.includes('ANNOTATION_DEMO') ? [annotationOK?'ANNOTATION_CONTEXT_RECEIVED':'ANNOTATION_CONTEXT_MISSING'] : user.includes('取消') ? Array(200).fill('进行中的回复。') : ['# 桌面验收通过\n\n','已收到你的问题。','参考资料代号：**WIND-CEDAR-42**。\n\n','- 流式中文回复\n- 本地文件上下文\n'];
   let index = 0;
   const timer = setInterval(() => {
     if (index >= chunks.length) { clearInterval(timer); response.end('data: [DONE]\n\n'); return; }
