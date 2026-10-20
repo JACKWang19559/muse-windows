@@ -7,10 +7,11 @@ Data shape:
   Settings = {baseUrl, model, systemPrompt, temperature, hasApiKey, theme:'system'|'light'|'dark', language:'zh', transcriptionModel?}
   Workspace = {id,name,description,color,createdAt,updatedAt}
   Chat = {id,title,workspaceId:null|string,createdAt,updatedAt,pinned:boolean,messages:Message[]}
-  Message = {id,role:'user'|'assistant',content,createdAt,status?:'complete'|'streaming'|'error'|'cancelled',attachmentIds?:string[],error?:string,agentMode?:boolean,toolTrace?:ToolRound[]}
+  Message = {id,role:'user'|'assistant',content,createdAt,status?:'complete'|'streaming'|'error'|'cancelled',attachmentIds?:string[],error?:string,agentMode?:boolean,toolTrace?:ToolRound[],replyTo?:{messageId,role,excerpt},isDeleted?:boolean}
   ToolRound = {content,calls:[{id,name,arguments:string,status:'pending'|'running'|'awaiting_approval'|'complete'|'denied'|'error'|'cancelled',result?:string}]}
   File = {id,name,mime,size,workspaceId:null|string,createdAt,textStatus:'ready'|'unsupported'|'error',textPreview?,error?}
-  Snapshot = {settings,workspaces,chats,files,approvals:[{id,chatId,requestId,toolCallId,name,workspaceId,arguments,permissions,summary,createdAt}],app:{version,platform,dataDirectory?}}
+  PendingSend = {id,chatId,content,attachmentIds,useTools,clientMessageId?,replyToMessageId?,queuedAt,state:'queued'|'failed',error?}
+  Snapshot = {settings,workspaces,chats,files,approvals:[{id,chatId,requestId,toolCallId,name,workspaceId,arguments,permissions,summary,createdAt}],pendingSends:PendingSend[],app:{version,platform,dataDirectory?}}
 
 window.muse methods:
   bootstrap() -> Snapshot
@@ -23,7 +24,10 @@ window.muse methods:
   createChat({workspaceId?:string|null,title?:string}) -> Chat
   updateChat({id,title?,pinned?,workspaceId?}) -> Chat
   deleteChat({id}) -> Snapshot
-  sendMessage({chatId,content,attachmentIds?:string[],useTools?:boolean}) -> {requestId:string}
+  searchMessages({query,chatId?,workspaceId?,limit?:1..100,cursor?}) -> {hits:[{chatId,messageId,title,role,workspaceId,createdAt,snippet,matchStart,matchLength}],nextCursor:null|string}
+  deleteTurn({chatId,messageId}) -> {chat:Chat,deletedMessageIds:string[]}  // user-only tombstone; active generation must be stopped first
+  sendMessage({chatId,content,attachmentIds?:string[],useTools?:boolean,replyToMessageId?:string,clientMessageId?:string}) -> {requestId:string}|{queued:true,queueId,chatId}
+  cancelQueuedMessage({id}) -> PendingSend  // remove waiting/failed intent; caller may restore it as a draft
   stopGeneration({chatId}) -> void
   respondApproval({id,decision:'approve'|'deny'}) -> Snapshot  // current live request only; never restores approval after restart
   retryMessage({chatId}) -> {requestId:string}
@@ -55,6 +59,8 @@ Backend module boundaries (main process):
     .createWorkspace(input), .updateWorkspace(input), .deleteWorkspace(id)
     .createChat(input), .updateChat(input), .deleteChat(id), .getChat(id)
     .appendMessage(chatId,message), .updateMessage(chatId,messageId,patch)
+    .deleteTurn({chatId,messageId}), .rollbackUnsentMessages({chatId,messageIds})
+    rollbackUnsentMessages is host-only; caller must prove provider dispatch has not started.
     .addFile({sourcePath,workspaceId?}), .removeFile(id), .getFile(id), .filePath(id), .readFile(id)
     .exportData(), .importData(data), .flush()
     store methods may be awaited by caller; sync implementations are allowed.
@@ -74,9 +80,17 @@ Backend module boundaries (main process):
   backend/tool-trace.cjs exports normalizeToolTrace, traceHistory, cancelToolTrace, hasUnfinishedToolCalls, remapToolTrace.
     Trace rounds are {content,calls:[{id,name,arguments,status,result?}]}; arguments/results are JSON strings.
     Only terminal calls carry results; replay emits matched assistant/tool pairs, never unfinished calls.
+  backend/chat-search.cjs exports searchMessages(chats, input), searching saved message bodies with literal Unicode matching and query/scope-bound tuple cursors.
+  backend/message-outbox.cjs exports MessageOutbox, isSafeOutboxRetry, waitForOutboxRetry and limits.
+    Memory-only FIFO reservations; optional per-chat lanes are a Windows adaptation, not original Muse server behavior.
 
 Important invariants:
   One active request per chat, streaming messages persisted on completion/cancel/error.
+  Waiting intents remain separate from canonical history until admission; no automatic retry after provider dispatch.
+  Send admission is bounded to 32 live reservations/64 MiB estimated intent data, with a 5-minute waiting deadline that never interrupts an active attempt.
+  Windows holds each chat lane through generation; other chats proceed independently. Stop cancels that chat's waiting sends; failed intents may be restored manually.
+  Provider identity or workspace changes invalidate waiting intents. Shutdown discards the memory-only queue and never replays it on restart.
+  Reply snapshots point to an earlier same-chat stable message. Deletion clears the selected user's body, attachment links, own quote and other snapshots of its body, preserving later replies/tool receipts.
   Workspace scope includes that workspace's text documents plus explicitly attached files.
   Rendering Markdown uses sanitization and external links are delegated to the main process.
   No shell command execution; attachments/imported project content are treated as inert data.

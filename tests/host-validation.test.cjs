@@ -17,7 +17,7 @@ const appRoot = path.resolve(__dirname, '..');
 const mainFile = path.join(appRoot, 'main.cjs');
 const mainRequire = createRequire(mainFile);
 const rendererURL = pathToFileURL(path.join(appRoot, 'build', 'index.html')).href;
-const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat sendMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe'.split(' ');
+const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe'.split(' ');
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
@@ -63,6 +63,11 @@ function fixture(t, overrides = {}) {
       // This VM is a separate JS realm. Recreate the host-owned wire payload
       // in the module's realm, as the actual Electron main process constructs it.
       runAgentConversation: options => mainRequire(name).runAgentConversation({ ...options, messages: JSON.parse(JSON.stringify(options.messages)) })
+    } : name === './backend/message-outbox.cjs' ? {
+      ...mainRequire(name), MessageOutbox: class extends mainRequire(name).MessageOutbox {
+        // Production creates this host-owned envelope in the module's realm.
+        reserve(input) { return super.reserve({ ...input, ...(input.metadata ? { metadata: JSON.parse(JSON.stringify(input.metadata)) } : {}) }); }
+      }
     } : mainRequire(name),
     __dirname: appRoot, process, console: { log() {}, error: (...args) => errors.push(args.join(' ')) },
     Buffer, URL, AbortController, AbortSignal, setTimeout, clearTimeout,
@@ -92,6 +97,181 @@ async function runQueued(host) {
 }
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
 const toolCall = (id, name, args) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } });
+
+test('same-chat sends wait in FIFO while other chats can generate and no intent is appended before dispatch', async t => {
+  const entered = deferred(), firstDone = deferred(), requests = [];
+  const host = fixture(t, { streamCompletion: async options => {
+    const prompt = options.messages.at(-1).content; requests.push({ prompt, messages: options.messages });
+    if (prompt === 'first') { entered.resolve(); await firstDone.promise; }
+    return { content: `reply to ${prompt}` };
+  } });
+  const chat = host.store.createChat(), other = host.store.createChat();
+  await host.operations.sendMessage({ chatId: chat.id, content: 'first' }); host.scheduled.shift()(); await entered.promise;
+  const queued = await host.operations.sendMessage({ chatId: chat.id, content: 'second' });
+  assert.equal(queued.queued, true); assert.equal(host.store.getChat(chat.id).messages.length, 2);
+  const snapshot = host.operations.bootstrap(); snapshot.pendingSends[0].attachmentIds.push('forged');
+  assert.equal(host.operations.bootstrap().pendingSends[0].attachmentIds.length, 0);
+  assert.ok(!JSON.stringify(snapshot).includes('review-key-original-12345'));
+  await host.operations.sendMessage({ chatId: other.id, content: 'other' }); host.scheduled.shift()();
+  await waitFor(() => !host.active.has(other.id), 'independent chat completes');
+  assert.deepEqual(requests.map(request => request.prompt), ['first', 'other']);
+  firstDone.resolve(); await waitFor(() => host.scheduled.length === 1, 'next FIFO send admitted');
+  assert.equal(host.operations.bootstrap().pendingSends.length, 0);
+  await runQueued(host);
+  assert.deepEqual(requests.map(request => request.prompt), ['first', 'other', 'second']);
+  assert.ok(requests[2].messages.some(message => message.role === 'assistant' && message.content === 'reply to first'));
+  assert.deepEqual(host.store.getChat(chat.id).messages.filter(message => message.role === 'user').map(message => message.content), ['first', 'second']);
+});
+
+test('generation setup failure rolls back only its newly admitted suffix before any provider request', async t => {
+  let requests = 0;
+  const host = fixture(t, { streamCompletion: async () => { requests++; return { content: 'done' }; } });
+  const workspace = host.store.createWorkspace({ name: 'admission' }), chat = host.store.createChat({ workspaceId: workspace.id });
+  await host.store.createTextFile({ workspaceId: workspace.id, name: 'reference.md', content: 'reference' });
+  const read = host.store.readFile.bind(host.store); host.store.readFile = () => { throw new Error('context source unavailable'); };
+  const input = { chatId: chat.id, clientMessageId: 'client_admission_1', content: 'single request' };
+  await assert.rejects(host.operations.sendMessage(input), /context source unavailable/);
+  assert.equal(host.store.getChat(chat.id).messages.length, 0); assert.equal(host.active.size, 0); assert.equal(host.scheduled.length, 0); assert.equal(requests, 0);
+  host.store.readFile = read;
+  await host.operations.sendMessage(input); await runQueued(host);
+  assert.equal(requests, 1); assert.equal(host.store.getChat(chat.id).messages.filter(message => message.id === input.clientMessageId).length, 1);
+});
+
+test('a queued setup failure restores an unsent intent after rollback and explicit resend cannot duplicate its user message', async t => {
+  const entered = deferred(), done = deferred(); let requests = 0;
+  const host = fixture(t, { streamCompletion: async () => { if (++requests === 1) { entered.resolve(); await done.promise; } return { content: 'done' }; } });
+  const workspace = host.store.createWorkspace({ name: 'queued admission' }), chat = host.store.createChat({ workspaceId: workspace.id });
+  await host.store.createTextFile({ workspaceId: workspace.id, name: 'reference.md', content: 'reference' });
+  await host.operations.sendMessage({ chatId: chat.id, content: 'first' }); host.scheduled.shift()(); await entered.promise;
+  const queued = await host.operations.sendMessage({ chatId: chat.id, clientMessageId: 'client_queued_admission', content: 'second once' });
+  const read = host.store.readFile.bind(host.store); host.store.readFile = () => { throw new Error('missing document'); }; done.resolve();
+  await waitFor(() => host.operations.bootstrap().pendingSends[0]?.state === 'failed', 'queue setup rollback');
+  assert.equal(host.store.getChat(chat.id).messages.length, 2); assert.equal(requests, 1);
+  const intent = host.operations.cancelQueuedMessage({ id: queued.queueId }); host.store.readFile = read;
+  await host.operations.sendMessage(intent); await runQueued(host);
+  assert.equal(requests, 2); assert.equal(host.store.getChat(chat.id).messages.filter(message => message.content === 'second once').length, 1);
+});
+
+test('failed rollback keeps admitted identity and never exposes the same request as a new unsent intent', async t => {
+  const entered = deferred(), done = deferred(); let requests = 0;
+  const host = fixture(t, { streamCompletion: async () => { if (++requests === 1) { entered.resolve(); await done.promise; } return { content: 'done' }; } });
+  const workspace = host.store.createWorkspace({ name: 'admitted fallback' }), chat = host.store.createChat({ workspaceId: workspace.id });
+  await host.store.createTextFile({ workspaceId: workspace.id, name: 'reference.md', content: 'reference' });
+  await host.operations.sendMessage({ chatId: chat.id, content: 'first' }); host.scheduled.shift()(); await entered.promise;
+  await host.operations.sendMessage({ chatId: chat.id, clientMessageId: 'client_already_saved', content: 'saved once' });
+  const read = host.store.readFile.bind(host.store), rollback = host.store.rollbackUnsentMessages.bind(host.store);
+  host.store.readFile = () => { throw new Error('missing document'); }; host.store.rollbackUnsentMessages = () => { throw new Error('disk unavailable'); }; done.resolve();
+  await waitFor(() => host.active.size === 0 && host.store.getChat(chat.id).messages.length === 4, 'admitted failure retained');
+  assert.equal(host.operations.bootstrap().pendingSends.length, 0); assert.equal(host.store.getChat(chat.id).messages.at(-1).status, 'error'); assert.equal(requests, 1);
+  host.store.readFile = read; host.store.rollbackUnsentMessages = rollback;
+  await host.operations.retryMessage({ chatId: chat.id }); await runQueued(host);
+  assert.equal(requests, 2); assert.equal(host.store.getChat(chat.id).messages.filter(message => message.id === 'client_already_saved').length, 1);
+});
+
+test('host queue capacity includes the active send and waiting intents are not silently discarded', async t => {
+  const host = fixture(t), chat = host.store.createChat();
+  await host.operations.sendMessage({ chatId: chat.id, content: 'active not yet dispatched' });
+  for (let i = 0; i < 31; i++) assert.equal((await host.operations.sendMessage({ chatId: chat.id, content: `queued ${i}` })).queued, true);
+  await assert.rejects(host.operations.sendMessage({ chatId: chat.id, content: 'over capacity' }), /队列已满/);
+  assert.equal(host.operations.bootstrap().pendingSends.length, 31);
+  host.operations.stopGeneration({ chatId: chat.id }); await runQueued(host);
+  assert.equal(host.operations.bootstrap().pendingSends.filter(item => item.state === 'failed').length, 31);
+  for (const item of host.operations.bootstrap().pendingSends) host.operations.cancelQueuedMessage({ id: item.id });
+});
+
+test('stop cancels waiting intents without dispatch and recovery returns their draft for an explicit resend', async t => {
+  const entered = deferred(); let requests = 0;
+  const host = fixture(t, { streamCompletion: async options => {
+    requests++; entered.resolve();
+    return new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => reject(Object.assign(new Error('cancelled'), { name: 'AbortError' })), { once: true }));
+  } });
+  const chat = host.store.createChat();
+  await host.operations.sendMessage({ chatId: chat.id, content: 'running' }); host.scheduled.shift()(); await entered.promise;
+  const queued = await host.operations.sendMessage({ chatId: chat.id, content: 'restore this', useTools: true });
+  host.operations.stopGeneration({ chatId: chat.id }); await waitFor(() => host.active.size === 0, 'stop all pending work');
+  const item = host.operations.bootstrap().pendingSends[0];
+  assert.equal(item.state, 'failed'); assert.equal(requests, 1); assert.equal(host.scheduled.length, 0);
+  const draft = host.operations.cancelQueuedMessage({ id: queued.queueId });
+  assert.equal(draft.content, 'restore this'); assert.equal(draft.useTools, true); assert.equal(host.operations.bootstrap().pendingSends.length, 0);
+  assert.throws(() => host.operations.cancelQueuedMessage({ id: queued.queueId }), /已发送|移出/);
+});
+
+test('queued sends refuse changed model credentials but a theme change does not change the provider binding', async t => {
+  for (const change of [{ model: 'model-b' }, { apiKey: 'other-mock-key-12345' }, { theme: 'dark' }]) {
+    const entered = deferred(), done = deferred(); let requests = 0;
+    const host = fixture(t, { streamCompletion: async () => { if (++requests === 1) { entered.resolve(); await done.promise; } return { content: 'answer' }; } });
+    const chat = host.store.createChat();
+    await host.operations.sendMessage({ chatId: chat.id, content: 'running' }); host.scheduled.shift()(); await entered.promise;
+    await host.operations.sendMessage({ chatId: chat.id, content: 'pending' }); host.operations.saveSettings(change); done.resolve();
+    if (change.theme) {
+      await waitFor(() => host.scheduled.length === 1, 'theme permits next send'); await runQueued(host); assert.equal(requests, 2);
+    } else {
+      await waitFor(() => host.operations.bootstrap().pendingSends[0]?.state === 'failed', 'changed connection prevents send');
+      assert.equal(requests, 1); assert.equal(host.scheduled.length, 0); assert.equal(host.store.getChat(chat.id).messages.length, 2);
+      host.operations.cancelQueuedMessage({ id: host.operations.bootstrap().pendingSends[0].id });
+    }
+  }
+});
+
+test('moving or deleting a chat invalidates its waiting sends and never recreates a deleted chat', async t => {
+  for (const operation of ['move', 'delete']) {
+    const entered = deferred(); let requests = 0;
+    const host = fixture(t, { streamCompletion: async options => { requests++; entered.resolve(); return new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => reject(Object.assign(new Error('cancelled'), { name: 'AbortError' })), { once: true })); } });
+    const workspace = host.store.createWorkspace({ name: 'queue scope' }), chat = host.store.createChat({ workspaceId: workspace.id });
+    await host.operations.sendMessage({ chatId: chat.id, content: 'running' }); host.scheduled.shift()(); await entered.promise;
+    await host.operations.sendMessage({ chatId: chat.id, content: 'never dispatch' });
+    if (operation === 'move') host.operations.updateChat({ id: chat.id, workspaceId: null }); else host.operations.deleteChat({ id: chat.id });
+    await waitFor(() => host.active.size === 0, 'scope change cancels active generation');
+    assert.equal(requests, 1); assert.equal(host.scheduled.length, 0);
+    if (operation === 'move') assert.equal(host.operations.bootstrap().pendingSends[0].state, 'failed');
+    else { assert.equal(host.operations.bootstrap().pendingSends.length, 0); assert.throws(() => host.store.getChat(chat.id)); }
+  }
+});
+
+test('uncertain provider failures are never retried automatically and queued next messages send only once', async t => {
+  const entered = deferred(), disconnected = deferred(); let requests = 0;
+  const host = fixture(t, { streamCompletion: async () => { if (++requests === 1) { entered.resolve(); await disconnected.promise; throw new Error('connection lost after dispatch'); } return { content: 'next answer' }; } });
+  const chat = host.store.createChat();
+  await host.operations.sendMessage({ chatId: chat.id, content: 'first' }); host.scheduled.shift()(); await entered.promise;
+  await host.operations.sendMessage({ chatId: chat.id, content: 'next' }); disconnected.resolve();
+  await waitFor(() => host.scheduled.length === 1, 'next intent admitted'); await runQueued(host);
+  assert.equal(requests, 2); assert.equal(host.store.getChat(chat.id).messages[1].status, 'error');
+  assert.equal(host.store.getChat(chat.id).messages.filter(message => message.content === 'first').length, 1);
+});
+
+test('quoted message identity is checked locally and its bounded excerpt reaches model context', async t => {
+  let history;
+  const host = fixture(t, { streamCompletion: async options => { history = options.messages; return { content: 'quoted response' }; } });
+  const chat = host.store.createChat(), other = host.store.createChat();
+  const original = host.store.appendMessage(chat.id, { role: 'assistant', content: 'QUOTE-CONTEXT-42' });
+  const foreign = host.store.appendMessage(other.id, { role: 'user', content: 'FOREIGN-CONTEXT-MUST-NOT-LEAK' });
+  for (let i = 0; i < 83; i++) host.store.appendMessage(chat.id, { role: i % 2 ? 'assistant' : 'user', content: `history ${i}` });
+  await assert.rejects(host.operations.sendMessage({ chatId: chat.id, content: 'wrong quote', replyToMessageId: foreign.id }), /引用|消息/);
+  assert.equal(host.store.getChat(chat.id).messages.length, 84);
+  await host.operations.sendMessage({ chatId: chat.id, content: 'explain quoted text', replyToMessageId: original.id }); await runQueued(host);
+  const sent = host.store.getChat(chat.id).messages.at(-2);
+  assert.equal(sent.replyTo.messageId, original.id); assert.equal(sent.replyTo.excerpt, 'QUOTE-CONTEXT-42');
+  assert.ok(history.at(-1).content.includes('QUOTE-CONTEXT-42')); assert.ok(history.at(-1).content.includes('explain quoted text'));
+  assert.ok(!JSON.stringify(history).includes('FOREIGN-CONTEXT-MUST-NOT-LEAK'));
+  assert.ok(!history.some(message => message.content === original.content), 'the target is outside the recent-message budget; quote still supplies it');
+});
+
+test('deleting a user message is prohibited while generating and scrubs subsequent context and search', async t => {
+  let history;
+  const host = fixture(t, { streamCompletion: async options => { history = options.messages; return { content: 'after deletion' }; } });
+  const chat = host.store.createChat(), target = host.store.appendMessage(chat.id, { role: 'user', content: 'DELETE-SECRET-ONE' });
+  host.store.appendMessage(chat.id, { role: 'assistant', content: 'kept response' });
+  host.store.appendMessage(chat.id, { role: 'user', content: 'followup', replyToMessageId: target.id });
+  await host.operations.sendMessage({ chatId: chat.id, content: 'wait' });
+  assert.throws(() => host.operations.deleteTurn({ chatId: chat.id, messageId: target.id }), /停止/);
+  await runQueued(host);
+  assert.equal(host.operations.searchMessages({ query: 'DELETE-SECRET-ONE' }).hits[0].messageId, target.id);
+  const deleted = host.operations.deleteTurn({ chatId: chat.id, messageId: target.id });
+  assert.equal(deleted.chat.messages[0].isDeleted, true); assert.equal(deleted.chat.messages[1].content, 'kept response');
+  assert.equal(host.operations.searchMessages({ query: 'DELETE-SECRET-ONE' }).hits.length, 0);
+  await host.operations.sendMessage({ chatId: chat.id, content: 'continue' }); await runQueued(host);
+  assert.ok(!JSON.stringify(history).includes('DELETE-SECRET-ONE')); assert.ok(JSON.stringify(history).includes('引用的历史消息已删除'));
+});
 
 test('agent writes wait for a concrete one-shot approval and return the result to the model', async t => {
   let requests = 0, finalHistory;
@@ -387,7 +567,8 @@ test('stopping a stream persists partial output once, drops late deltas and perm
   await host.operations.sendMessage({ chatId: chat.id, content: 'question' });
   host.scheduled.shift()();
   await entered.promise;
-  await assert.rejects(host.operations.sendMessage({ chatId: chat.id, content: 'duplicate' }), /正在生成/);
+  const queued = await host.operations.sendMessage({ chatId: chat.id, content: 'duplicate' });
+  assert.equal(queued.queued, true);
   host.operations.stopGeneration({ chatId: chat.id });
   options.onDelta('late forbidden');
   await waitFor(() => host.active.size === 0, 'cancelled job clears');

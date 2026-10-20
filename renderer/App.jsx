@@ -8,15 +8,17 @@ import {
   FolderPlus, Info, KeyRound, LoaderCircle, MessageCircle, Minus, Monitor, Moon,
   MoreHorizontal, PanelLeft, Paperclip, Pencil, Pin, Plus, RefreshCw, Search,
   Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Square, Sun, Trash2,
-  Upload, X, AlertCircle, Database, Server, StopCircle,
+  Upload, X, AlertCircle, Database, Server, StopCircle, Reply,
 } from 'lucide-react';
 import './styles.css';
 import FileEditor from './FileEditor.jsx';
 import { AgentActivity, ApprovalQueue } from './AgentActivity.jsx';
+import SearchDialog from './SearchDialog.jsx';
+import PendingSends from './PendingSends.jsx';
 
 const api = window.muse;
 const COLORS = ['#47766a', '#607eb3', '#a07cb5', '#c49456', '#bd7777', '#7c8992'];
-const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], approvals: [], app: {} };
+const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], approvals: [], pendingSends: [], app: {} };
 
 function Brand({ size = 28, className = '' }) {
   return <svg width={size} height={size} viewBox="0 0 40 40" fill="none" className={`brand-mark ${className}`} aria-hidden="true">
@@ -39,7 +41,7 @@ function dateText(value) {
   if (Number.isNaN(date.getTime())) return '';
   return date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' });
 }
-function excerpt(text = '', max = 75) { const plain = text.replace(/[#*_>`\[\]]/g, '').replace(/\s+/g, ' ').trim(); return plain.length > max ? `${plain.slice(0, max)}…` : plain; }
+function excerpt(text = '', max = 75) { const element = document.createElement('div'); element.innerHTML = DOMPurify.sanitize(marked.parse(text.slice(0, Math.max(2000, max * 8)), { gfm: true, async: false }), { ALLOWED_TAGS: [], ALLOWED_ATTR: [] }); const plain = element.textContent.replace(/\s+/g, ' ').trim(); return plain.length > max ? `${plain.slice(0, max)}…` : plain; }
 function upsert(items, item) { return items.some(x => x.id === item.id) ? items.map(x => x.id === item.id ? item : x) : [item, ...items]; }
 function sortChats(chats) { return [...chats].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()); }
 
@@ -71,11 +73,41 @@ function Modal({ title, subtitle, onClose, children, className = '', testId }) {
   </div>;
 }
 
-function Markdown({ content, notify }) {
-  const html = useMemo(() => DOMPurify.sanitize(marked.parse(content || '', { gfm: true, breaks: true, async: false }), {
-    FORBID_TAGS: ['style', 'iframe', 'form', 'input', 'button', 'audio', 'video'],
-    FORBID_ATTR: ['style', 'srcset'],
-  }), [content]);
+const literalPattern = query => new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
+function HighlightText({ text, query }) {
+  if (!query) return text;
+  const parts = []; let start = 0, count = 0;
+  for (const match of text.matchAll(literalPattern(query))) {
+    parts.push(text.slice(start, match.index), <mark key={match.index}>{match[0]}</mark>);
+    start = match.index + match[0].length;
+    if (++count >= 40) break;
+  }
+  parts.push(text.slice(start)); return parts;
+}
+function Markdown({ content, notify, highlight }) {
+  const html = useMemo(() => {
+    const safe = DOMPurify.sanitize(marked.parse(content || '', { gfm: true, breaks: true, async: false }), {
+      FORBID_TAGS: ['style', 'iframe', 'form', 'input', 'button', 'audio', 'video'],
+      FORBID_ATTR: ['style', 'srcset'],
+    });
+    if (!highlight) return safe;
+    const container = document.createElement('div'); container.innerHTML = safe;
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT), nodes = [];
+    while (walker.nextNode()) if (!walker.currentNode.parentElement?.closest('mark')) nodes.push(walker.currentNode);
+    let count = 0;
+    for (const node of nodes) {
+      const fragment = document.createDocumentFragment(); let start = 0;
+      for (const match of node.textContent.matchAll(literalPattern(highlight))) {
+        fragment.append(node.textContent.slice(start, match.index));
+        const mark = document.createElement('mark'); mark.textContent = match[0]; fragment.append(mark);
+        start = match.index + match[0].length;
+        if (++count >= 40) break;
+      }
+      if (start) { fragment.append(node.textContent.slice(start)); node.replaceWith(fragment); }
+      if (count >= 40) break;
+    }
+    return container.innerHTML;
+  }, [content, highlight]);
   return <div className="markdown" dangerouslySetInnerHTML={{ __html: html }} onClick={event => {
     const link = event.target.closest('a');
     if (!link) return;
@@ -86,9 +118,11 @@ function Markdown({ content, notify }) {
   }} />;
 }
 
-function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport, onDrop, onSend, onStop, busy, importing, welcome = false, placeholder, model, configured, useTools, onToolsChange }) {
+function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport, onDrop, onSend, onStop, busy, admitting, importing, welcome = false, placeholder, model, configured, useTools, onToolsChange, quote, onClearQuote, historyMessages = [], historyKey }) {
   const input = useRef(null);
   const composing = useRef(false);
+  const recall = useRef(null);
+  useEffect(() => { recall.current = null; }, [historyKey]);
   useLayoutEffect(() => { if (input.current) { input.current.style.height = 'auto'; input.current.style.height = `${Math.min(input.current.scrollHeight, 190)}px`; } }, [value]);
   useEffect(() => {
     const focus = () => input.current?.focus();
@@ -96,16 +130,36 @@ function Composer({ value, onChange, attachedFiles, onRemoveAttachment, onImport
     return () => window.removeEventListener('muse-focus-composer', focus);
   }, []);
   return <div className={`composer-shell ${welcome ? 'composer-welcome' : ''}`} data-testid="composer" onDragOver={event => { event.preventDefault(); event.stopPropagation(); }} onDrop={event => { event.preventDefault(); event.stopPropagation(); onDrop?.(Array.from(event.dataTransfer.files)); }}>
+    {quote && <div className="composer-quote" data-testid="composer-quote"><Reply size={15} /><div><strong>回复 {quote.role === 'user' ? '你' : 'Muse'}</strong><span>{excerpt(quote.content || '附件消息', 180)}</span></div><IconButton icon={X} label="取消引用" onClick={onClearQuote} /></div>}
     {attachedFiles.length > 0 && <div className="attachment-tray">{attachedFiles.map(file => <div className="attachment-pill" key={file.id} title={file.name}><FileText size={15} /><span>{file.name}</span><IconButton icon={X} label={`移除附件 ${file.name}`} onClick={() => onRemoveAttachment(file.id)} /></div>)}</div>}
-    <textarea ref={input} value={value} onChange={event => onChange(event.target.value)} data-testid="composer-input" rows={welcome ? 2 : 1}
+    <textarea ref={input} value={value} onChange={event => { recall.current = null; onChange(event.target.value); }} data-testid="composer-input" rows={welcome ? 2 : 1}
       aria-label="发送消息" placeholder={placeholder || (configured ? '写下你的想法，或拖入一份文件…' : '先连接你的模型，再聊聊想做什么…')}
       onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }}
-      onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !composing.current && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); if (!busy && (value.trim() || attachedFiles.length)) onSend(); } }} />
+      onKeyDown={event => {
+        if (composing.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
+        const element = event.currentTarget;
+        if (!event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && element.selectionStart === element.selectionEnd) {
+          const up = event.key === 'ArrowUp' && element.selectionStart === 0;
+          const down = event.key === 'ArrowDown' && element.selectionEnd === value.length;
+          if (up || down && recall.current) {
+            const state = recall.current || { original: value, index: 0, values: historyMessages.filter(message => message.role === 'user' && !message.isDeleted && !['streaming', 'error'].includes(message.status) && message.content.trim()).map(message => message.content).reverse() };
+            if (!recall.current) state.index = -1;
+            const next = up ? Math.min(state.index + 1, state.values.length - 1) : state.index - 1;
+            if (state.values.length && next >= -1) {
+              event.preventDefault(); state.index = next; recall.current = next < 0 ? null : state;
+              const text = next < 0 ? state.original : state.values[next]; onChange(text);
+              requestAnimationFrame(() => input.current?.setSelectionRange(up ? 0 : text.length, up ? 0 : text.length));
+              return;
+            }
+          }
+        }
+        if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); if (value.trim() || attachedFiles.length) onSend(); }
+      }} />
     <div className="composer-toolbar"><div className="composer-tools"><IconButton icon={Paperclip} label="添加文件" data-testid="file-import" onClick={onImport} disabled={importing} />{importing && <Spinner size={15} />}
-      <button className={`agent-mode-toggle ${useTools ? 'enabled' : ''}`} aria-pressed={!!useTools} title="让模型读取当前工作区文件；创建或修改文件前会请求确认" data-testid="agent-mode-toggle" disabled={busy} onClick={() => onToolsChange(!useTools)}><ShieldCheck size={13} />文件助手</button>
+      <button className={`agent-mode-toggle ${useTools ? 'enabled' : ''}`} aria-pressed={!!useTools} title="让模型读取当前工作区文件；创建或修改文件前会请求确认" data-testid="agent-mode-toggle" disabled={admitting} onClick={() => onToolsChange(!useTools)}><ShieldCheck size={13} />文件助手</button>
       <span className="composer-model"><span className={`connection-dot ${configured ? 'connected' : ''}`} />{configured ? model || '选择模型' : '尚未连接模型'}</span></div>
-      <div className="composer-submit"><span className="composer-keyhint">Shift + Enter 换行</span>{busy ? <button type="button" className="send-button stop-button" onClick={onStop} title="停止生成" aria-label="停止生成" data-testid="stop-generation"><Square size={13} fill="currentColor" /></button>
-        : <button type="button" className="send-button" onClick={onSend} disabled={!value.trim() && !attachedFiles.length || importing} title="发送消息" aria-label="发送消息" data-testid="send-message"><ArrowUp size={19} strokeWidth={2} /></button>}</div>
+      <div className="composer-submit"><span className="composer-keyhint">Shift + Enter 换行</span>{busy && <button type="button" className="send-button stop-button" onClick={onStop} title="停止生成及等待发送" aria-label="停止生成" data-testid="stop-generation"><Square size={13} fill="currentColor" /></button>}
+        {(!busy || value.trim() || attachedFiles.length > 0) && <button type="button" className="send-button" onClick={onSend} disabled={!value.trim() && !attachedFiles.length || importing || admitting} title={busy ? '加入待发送' : '发送消息'} aria-label={busy ? '加入待发送' : '发送消息'} data-testid="send-message"><ArrowUp size={19} strokeWidth={2} /></button>}</div>
     </div>
   </div>;
 }
@@ -199,27 +253,6 @@ function SettingsDialog({ settings, app, onClose, onSaved, onImport, notify, onT
   </Modal>;
 }
 
-function SearchDialog({ snapshot, onClose, onSelect }) {
-  const [query, setQuery] = useState('');
-  const [selected, setSelected] = useState(0);
-  const results = useMemo(() => {
-    const search = query.trim().toLowerCase();
-    if (!search) return sortChats(snapshot.chats).slice(0, 8).map(chat => ({ type: 'chat', id: chat.id, name: chat.title, description: excerpt(chat.messages.at(-1)?.content || '打开对话') }));
-    return [
-      ...snapshot.workspaces.filter(space => `${space.name} ${space.description}`.toLowerCase().includes(search)).map(space => ({ type: 'workspace', id: space.id, name: space.name, description: space.description || '工作区' })),
-      ...sortChats(snapshot.chats).filter(chat => `${chat.title} ${chat.messages.map(message => message.content).join(' ')}`.toLowerCase().includes(search)).map(chat => ({ type: 'chat', id: chat.id, name: chat.title, description: excerpt(chat.messages.find(message => message.content.toLowerCase().includes(search))?.content || '对话') })),
-      ...snapshot.files.filter(file => file.name.toLowerCase().includes(search)).map(file => ({ type: 'file', id: file.id, name: file.name, description: `文件 · ${formatBytes(file.size)}` })),
-    ].slice(0, 30);
-  }, [query, snapshot]);
-  useEffect(() => setSelected(0), [query]);
-  const choose = item => { if (item) { onSelect(item); onClose(); } };
-  return <Modal title="搜索工作台" onClose={onClose} className="search-modal" testId="search-dialog">
-    <div className="search-input-wrap"><Search size={21} /><input data-testid="search-input" value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索对话、工作区和文件…" autoFocus onKeyDown={event => { if (event.key === 'ArrowDown') { event.preventDefault(); setSelected(value => Math.min(value + 1, results.length - 1)); } if (event.key === 'ArrowUp') { event.preventDefault(); setSelected(value => Math.max(value - 1, 0)); } if (event.key === 'Enter') choose(results[selected]); }} /><kbd>ESC</kbd></div>
-    <div className="search-results"><span className="list-label">{query.trim() ? `${results.length} 个结果` : '最近对话'}</span>{results.length ? results.map((item, index) => { const Icon = item.type === 'workspace' ? Folder : item.type === 'file' ? FileText : MessageCircle; return <button key={`${item.type}-${item.id}`} className={`search-result ${selected === index ? 'selected' : ''}`} onMouseMove={() => setSelected(index)} onClick={() => choose(item)}><span className="search-result-icon"><Icon size={19} /></span><span><strong>{item.name}</strong><small>{excerpt(item.description, 95)}</small></span><span className="search-result-type">{item.type === 'workspace' ? '工作区' : item.type === 'file' ? '文件' : '对话'}</span><ArrowRight size={15} /></button>; }) : <div className="search-empty"><Search size={28} /><p>{query ? '没有找到相关内容' : '你的第一段对话，会从这里开始'}</p><span>{query ? '试试其他关键词' : '创建对话后，就可以在这里快速找到它'}</span></div>}</div>
-    <footer className="search-footer"><span><kbd>↑</kbd><kbd>↓</kbd>选择</span><span><kbd>Enter</kbd>打开</span></footer>
-  </Modal>;
-}
-
 function App() {
   const [snapshot, setSnapshot] = useState(null);
   const snapshotRef = useRef(null);
@@ -240,6 +273,10 @@ function App() {
   const [drafts, setDrafts] = useState({});
   const [attachments, setAttachments] = useState({});
   const [agentModes, setAgentModes] = useState({});
+  const [quotes, setQuotes] = useState({});
+  const draftState = useRef({ drafts, attachments });
+  draftState.current = { drafts, attachments };
+  const modeRevisions = useRef(new Map());
   const [importing, setImporting] = useState(false);
   const [pendingChats, setPendingChats] = useState(new Set());
   const [sending, setSending] = useState(false);
@@ -250,6 +287,7 @@ function App() {
   const [dragging, setDragging] = useState(false);
   const dragCount = useRef(0);
   const scroll = useRef(null);
+  const jumpSequence = useRef(0);
   const followBottom = useRef(true);
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const deferredDeltas = useRef(new Map());
@@ -325,10 +363,11 @@ function App() {
   const draft = drafts[composerKey] || '';
   const attachedIds = attachments[composerKey] || [];
   const attachedFiles = attachedIds.map(id => data.files.find(file => file.id === id)).filter(Boolean);
+  const quote = chat?.messages.find(message => message.id === quotes[composerKey] && !message.isDeleted);
   const configured = !!data.settings.baseUrl && !!data.settings.model;
   const busy = sending || !!chat && (pendingChats.has(chat.id) || chat.messages.some(message => message.status === 'streaming'));
   const sortedChats = useMemo(() => sortChats(data.chats), [data.chats]);
-  const openRoute = useCallback(next => { setRoute(next); setMenu(null); if (window.innerWidth < 900) setSidebarOpen(false); followBottom.current = true; setShowScrollBottom(false); }, []);
+  const openRoute = useCallback(next => { setRoute(next.messageId ? { ...next, jumpToken: ++jumpSequence.current } : next); setMenu(null); if (window.innerWidth < 900) setSidebarOpen(false); followBottom.current = !next.messageId; setShowScrollBottom(false); }, []);
   const newChat = useCallback((scope = null) => { openRoute({ type: 'welcome', workspaceId: typeof scope === 'string' ? scope : null }); setTimeout(() => window.dispatchEvent(new Event('muse-focus-composer')), 60); }, [openRoute]);
 
   useEffect(() => {
@@ -343,8 +382,13 @@ function App() {
   useEffect(() => { if (route.type === 'chat' && snapshot && !chat || route.type === 'workspace' && snapshot && !workspace) setRoute({ type: 'welcome', workspaceId: null }); }, [route, snapshot, chat, workspace]);
   const lastMessage = chat?.messages.at(-1);
   useLayoutEffect(() => { if (scroll.current && followBottom.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [chat?.id, chat?.messages.length, lastMessage?.content, lastMessage?.status]);
+  useLayoutEffect(() => {
+    if (!route.messageId || !chat) return;
+    const target = [...(scroll.current?.querySelectorAll('[data-message-id]') || [])].find(element => element.dataset.messageId === route.messageId);
+    if (target) { followBottom.current = false; target.scrollIntoView({ block: 'center' }); target.focus({ preventScroll: true }); }
+  }, [route.messageId, route.jumpToken, chat?.id, chat?.messages.length]);
 
-  const updateDraft = value => setDrafts(previous => ({ ...previous, [composerKey]: value }));
+  const updateDraft = value => { draftState.current.drafts = { ...draftState.current.drafts, [composerKey]: value }; setDrafts(previous => ({ ...previous, [composerKey]: value })); };
   const addFiles = async (dropped, scope = workspaceId, attach = true) => {
     if (importing) return;
     setImporting(true);
@@ -359,24 +403,56 @@ function App() {
     } catch (error) { notify(error.message, 'error'); } finally { setImporting(false); }
   };
   const send = async () => {
-    if (sendLock.current || busy || !draft.trim() && !attachedIds.length) return;
+    if (sendLock.current || !draft.trim() && !attachedIds.length) return;
     if (!configured) { setSettingsOpen(true); notify('连接你的模型后，就可以开始对话了', 'info'); return; }
     sendLock.current = true; setSending(true);
-    const key = composerKey, text = draft, files = [...attachedIds];
+    const key = composerKey, text = draft, files = [...attachedIds], quotedId = quote?.id, clientMessageId = crypto.randomUUID();
+    // Remove only this submitted draft now. New typing during admission stays
+    // separate and cannot be erased by a later IPC response.
+    setDrafts(previous => ({ ...previous, [key]: previous[key] === text ? '' : previous[key] }));
+    setAttachments(previous => ({ ...previous, [key]: (previous[key] || []).filter(id => !files.includes(id)) }));
+    setQuotes(previous => previous[key] === quotedId ? { ...previous, [key]: null } : previous);
     let target = chat;
     try {
-      if (!target) { target = await api.createChat({ workspaceId }); setAgentModes(previous => ({ ...previous, [`chat:${target.id}`]: useTools })); setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, target) })); openRoute({ type: 'chat', id: target.id }); }
+      if (!target) {
+        target = await api.createChat({ workspaceId }); const nextKey = `chat:${target.id}`;
+        setDrafts(previous => ({ ...previous, [nextKey]: previous[key] || '', [key]: '' }));
+        setAttachments(previous => ({ ...previous, [nextKey]: previous[key] || [], [key]: [] }));
+        setQuotes(previous => ({ ...previous, [nextKey]: previous[key] || null, [key]: null }));
+        setAgentModes(previous => ({ ...previous, [nextKey]: useTools }));
+        setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, target) })); openRoute({ type: 'chat', id: target.id });
+      }
       setPendingChats(previous => new Set(previous).add(target.id));
       followBottom.current = true;
-      await api.sendMessage({ chatId: target.id, content: text, attachmentIds: files, useTools });
-      setDrafts(previous => ({ ...previous, [key]: '' })); setAttachments(previous => ({ ...previous, [key]: [] }));
+      await api.sendMessage({ chatId: target.id, content: text, attachmentIds: files, useTools, clientMessageId, ...(quotedId ? { replyToMessageId: quotedId } : {}) });
     } catch (error) {
       if (target) setPendingChats(previous => { const next = new Set(previous); next.delete(target.id); return next; });
-      if (target && key.startsWith('new:')) { setDrafts(previous => ({ ...previous, [`chat:${target.id}`]: text })); setAttachments(previous => ({ ...previous, [`chat:${target.id}`]: files })); }
+      let admitted = false;
+      try { admitted = target && (await api.bootstrap()).chats.find(item => item.id === target.id)?.messages.some(message => message.id === clientMessageId); } catch { /* Preserve input if admission cannot be confirmed. */ }
+      if (!admitted) {
+        const restoreKey = target ? `chat:${target.id}` : key;
+        setDrafts(previous => ({ ...previous, [restoreKey]: previous[restoreKey] ? `${text}\n\n${previous[restoreKey]}` : text }));
+        setAttachments(previous => ({ ...previous, [restoreKey]: [...new Set([...files, ...(previous[restoreKey] || [])])] }));
+        if (quotedId) setQuotes(previous => ({ ...previous, [restoreKey]: previous[restoreKey] || quotedId }));
+      }
       notify(error.message, 'error');
     } finally { sendLock.current = false; setSending(false); }
   };
   const stop = () => { if (chat) api.stopGeneration({ chatId: chat.id }).catch(error => notify(error.message, 'error')); };
+  const removeQueued = async (item, restore = false) => {
+    const key = `chat:${item.chatId}`, modeRevision = modeRevisions.current.get(key) || 0;
+    try {
+      const intent = await api.cancelQueuedMessage({ id: item.id });
+      if (restore) {
+        const hasDraft = !!draftState.current.drafts[key]?.trim() || (draftState.current.attachments[key] || []).length > 0;
+        setDrafts(previous => ({ ...previous, [key]: previous[key] ? `${previous[key]}\n\n${intent.content}` : intent.content }));
+        setAttachments(previous => ({ ...previous, [key]: [...new Set([...(previous[key] || []), ...intent.attachmentIds.filter(id => data.files.some(file => file.id === id))])] }));
+        if (intent.replyToMessageId) setQuotes(previous => ({ ...previous, [key]: previous[key] || intent.replyToMessageId }));
+        if (!hasDraft && (modeRevisions.current.get(key) || 0) === modeRevision) setAgentModes(previous => ({ ...previous, [key]: intent.useTools }));
+        notify('已恢复到草稿，可以修改后发送'); window.dispatchEvent(new Event('muse-focus-composer'));
+      }
+    } catch (error) { notify(error.message, 'error'); }
+  };
   const retry = async () => { if (!chat || busy) return; setPendingChats(previous => new Set(previous).add(chat.id)); try { await api.retryMessage({ chatId: chat.id }); } catch (error) { setPendingChats(previous => { const next = new Set(previous); next.delete(chat.id); return next; }); notify(error.message, 'error'); } };
   const saveEntity = async value => {
     if (value.kind === 'workspace') {
@@ -389,10 +465,16 @@ function App() {
   };
   const updateChat = async input => { try { const saved = await api.updateChat(input); setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, saved) })); } catch (error) { notify(error.message, 'error'); } setMenu(null); };
   const askRemoveFile = file => setConfirm({ title: '移除这份文件？', body: `“${file.name}”及其未保存修改将从工作台中移除。你电脑中的原始文件不会改变。`, action: '移除文件', run: async () => { replaceSnapshot(await api.removeFile({ id: file.id })); setAttachments(previous => Object.fromEntries(Object.entries(previous).map(([key, ids]) => [key, ids.filter(id => id !== file.id)]))); closeFilePreview(file.id); } });
+  const quoteMessage = message => { setQuotes(previous => ({ ...previous, [composerKey]: message.id })); window.dispatchEvent(new Event('muse-focus-composer')); };
+  const askDeleteTurn = message => setConfirm({ title: '删除这条消息？', body: '这条用户消息的正文、附件关联和引用摘录将被清除，并保留删除占位。其他回复和已经完成的文件操作记录会保留。', action: '删除消息', run: async () => {
+    const result = await api.deleteTurn({ chatId: chat.id, messageId: message.id });
+    setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, result.chat) }));
+    setQuotes(previous => Object.fromEntries(Object.entries(previous).map(([key, value]) => [key, value === message.id ? null : value])));
+  } });
   const askDeleteChat = item => { setMenu(null); setConfirm({ title: '删除这段对话？', body: `“${item.title}”中的消息将从工作台删除。`, action: '删除对话', run: async () => { replaceSnapshot(await api.deleteChat({ id: item.id })); if (chat?.id === item.id) newChat(item.workspaceId); } }); };
   const askDeleteWorkspace = item => { setMenu(null); setConfirm({ title: '删除这个工作区？', body: `“${item.name}”将被删除，其中的对话和文件会保留在个人工作台。`, action: '删除工作区', run: async () => { replaceSnapshot(await api.deleteWorkspace({ id: item.id })); newChat(); } }); };
   const exportChat = async format => { setMenu(null); try { const result = await api.exportChat({ chatId: chat.id, format }); if (!result.cancelled) notify('对话已导出'); } catch (error) { notify(error.message, 'error'); } };
-  const composerProps = { value: draft, onChange: updateDraft, attachedFiles, onRemoveAttachment: id => setAttachments(previous => ({ ...previous, [composerKey]: attachedIds.filter(item => item !== id) })), onImport: () => addFiles(), onDrop: files => { dragCount.current = 0; setDragging(false); if (files.length) addFiles(files); }, onSend: send, onStop: stop, busy, importing, model: data.settings.model, configured, useTools, onToolsChange: enabled => setAgentModes(previous => ({ ...previous, [composerKey]: enabled })) };
+  const composerProps = { value: draft, onChange: updateDraft, attachedFiles, onRemoveAttachment: id => setAttachments(previous => ({ ...previous, [composerKey]: attachedIds.filter(item => item !== id) })), onImport: () => addFiles(), onDrop: files => { dragCount.current = 0; setDragging(false); if (files.length) addFiles(files); }, onSend: send, onStop: stop, busy, admitting: sending, importing, model: data.settings.model, configured, useTools, onToolsChange: enabled => { modeRevisions.current.set(composerKey, (modeRevisions.current.get(composerKey) || 0) + 1); setAgentModes(previous => ({ ...previous, [composerKey]: enabled })); }, quote, onClearQuote: () => setQuotes(previous => ({ ...previous, [composerKey]: null })), historyMessages: chat?.messages, historyKey: composerKey };
 
   if (!snapshot) return <div className="boot-screen"><Brand size={56} /><h1>Muse</h1>{bootError ? <><p className="boot-error">{bootError}</p><button className="button secondary" onClick={() => window.location.reload()}><RefreshCw size={15} />重新打开</button></> : <p><Spinner size={16} />正在打开你的工作台…</p>}</div>;
 
@@ -425,18 +507,22 @@ function App() {
           <div className="workspace-composer-area"><Composer {...composerProps} placeholder={`在「${workspace.name}」中开始一段对话…`} /><p className="composer-caption">工作区中的文字资料会随相关消息发送至你配置的模型。</p></div>
         </div></div> : chat ? <>
           <div className="chat-scroll" ref={scroll} onScroll={() => { const element = scroll.current; const near = element.scrollHeight - element.scrollTop - element.clientHeight < 100; followBottom.current = near; setShowScrollBottom(!near); }} data-testid="chat-messages"><div className="chat-messages">
-            {chat.messages.length ? chat.messages.map((message, index) => <article className={`message message-${message.role}`} key={message.id} data-role={message.role} data-message-id={message.id} data-status={message.status || 'complete'}>
-              {message.role === 'assistant' && <span className="assistant-avatar"><Brand size={23} /></span>}<div className="message-body">{message.role === 'user' ? <><div className="user-message-content">{message.content}</div>{message.attachmentIds?.length > 0 && <div className="message-attachments">{message.attachmentIds.map(id => { const file = data.files.find(file => file.id === id); return file ? <button key={id} onClick={() => setFilePreviewId(id)}><FileText size={14} /><span>{file.name}</span></button> : null; })}</div>}</> : <>
+            {chat.messages.length ? chat.messages.map((message, index) => <article className={`message message-${message.role} ${route.messageId === message.id ? 'message-search-target' : ''}`} key={message.id} tabIndex={-1} data-role={message.role} data-message-id={message.id} data-status={message.status || 'complete'}>
+              {message.role === 'assistant' && <span className="assistant-avatar"><Brand size={23} /></span>}<div className="message-body">{message.role === 'user' ? message.isDeleted ? <p className="message-deleted" data-testid="deleted-message"><Trash2 size={13} />你删除了一条消息</p> : <>
+                {message.replyTo && <button className="message-quote" data-testid="message-quote" onClick={() => openRoute({ type: 'chat', id: chat.id, messageId: message.replyTo.messageId })}><Reply size={14} /><span><strong>{message.replyTo.role === 'user' ? '你' : 'Muse'}</strong>{chat.messages.find(item => item.id === message.replyTo.messageId)?.isDeleted ? '已删除的消息' : excerpt(message.replyTo.excerpt || '附件消息', 180)}</span></button>}
+                <div className="user-message-content"><HighlightText text={message.content} query={route.messageId === message.id ? route.query : null} /></div>{message.attachmentIds?.length > 0 && <div className="message-attachments">{message.attachmentIds.map(id => { const file = data.files.find(file => file.id === id); return file ? <button key={id} onClick={() => setFilePreviewId(id)}><FileText size={14} /><span>{file.name}</span></button> : null; })}</div>}
+                <div className="message-actions user-message-actions"><CopyButton content={message.content} notify={notify} /><IconButton icon={Reply} label="引用回复" data-testid="quote-message" onClick={() => quoteMessage(message)} disabled={busy} /><IconButton icon={Trash2} label="删除消息" data-testid="delete-turn" onClick={() => askDeleteTurn(message)} disabled={busy} />{index === chat.messages.length - 1 && <IconButton icon={RefreshCw} label="继续回复" data-testid="retry-message" onClick={retry} disabled={busy} />}<span>{dateText(message.createdAt)}</span></div>
+              </> : <>
                 <AgentActivity trace={message.toolTrace} files={data.files} onOpenFile={setFilePreviewId} />
-                {!message.content && message.status === 'streaming' ? <div className="thinking"><span /><span /><span /><small>{data.approvals.some(approval => approval.chatId === chat.id) ? '等待你确认文件操作' : '正在思考'}</small></div> : <Markdown content={message.content} notify={notify} />}
+                {!message.content && message.status === 'streaming' ? <div className="thinking"><span /><span /><span /><small>{data.approvals.some(approval => approval.chatId === chat.id) ? '等待你确认文件操作' : '正在思考'}</small></div> : <Markdown content={message.content} notify={notify} highlight={route.messageId === message.id ? route.query : null} />}
                 {message.status === 'streaming' && message.content && <span className="stream-caret" aria-label="正在生成" />}
                 {message.status === 'error' && <div className="message-error" role="alert"><AlertCircle size={16} /><div><strong>这次回复没有完成</strong><p>{message.error || '请检查模型连接后重试。'}</p></div></div>}
                 {message.status === 'cancelled' && <p className="message-stopped"><Square size={11} />已停止生成</p>}
-                {message.status !== 'streaming' && <div className="message-actions"><CopyButton content={message.content} notify={notify} />{index === chat.messages.length - 1 && <IconButton icon={RefreshCw} label="重新生成" data-testid="retry-message" onClick={retry} disabled={busy} />}<span>{dateText(message.createdAt)}</span></div>}
+                {message.status !== 'streaming' && <div className="message-actions"><CopyButton content={message.content} notify={notify} /><IconButton icon={Reply} label="引用回复" data-testid="quote-message" onClick={() => quoteMessage(message)} disabled={busy} />{index === chat.messages.length - 1 && <IconButton icon={RefreshCw} label="重新生成" data-testid="retry-message" onClick={retry} disabled={busy} />}<span>{dateText(message.createdAt)}</span></div>}
               </>}</div></article>) : <div className="chat-empty"><Brand size={45} /><h3>新的对话，新的可能。</h3><p>从一个问题，或一份资料开始。</p></div>}
           </div></div>
           {showScrollBottom && <button className="scroll-bottom" title="回到底部" aria-label="回到底部" onClick={() => { followBottom.current = true; setShowScrollBottom(false); if (scroll.current) scroll.current.scrollTo({ top: scroll.current.scrollHeight, behavior: 'smooth' }); }}><ArrowDown size={16} /></button>}
-          <div className="chat-composer-area"><Composer {...composerProps} /><p className="composer-caption">模型的回答可能有误，重要信息请自行核实。<span>你的资料，留在你的工作台。</span></p></div>
+          <div className="chat-composer-area"><PendingSends items={data.pendingSends.filter(item => item.chatId === chat.id)} onRestore={item => removeQueued(item, true)} onCancel={item => removeQueued(item)} /><Composer {...composerProps} /><p className="composer-caption">模型的回答可能有误，重要信息请自行核实。<span>你的资料，留在你的工作台。</span></p></div>
         </> : <div className="welcome-scroll"><section className="welcome-page"><div className="welcome-emblem"><Brand size={63} /><span className="orbit-dot orbit-one" /><span className="orbit-dot orbit-two" /></div><span className="welcome-eyebrow">留一点空间，给新的可能</span><h2>今天，让什么想法发生？</h2><p className="welcome-subtitle">从一句话、一份资料，或一个还没成形的念头开始。</p>
           {workspace && <button className="welcome-scope" onClick={() => openRoute({ type: 'workspace', id: workspace.id })}><Folder size={14} style={{ color: workspace.color }} />在 {workspace.name} 中开始<ChevronRight size={13} /></button>}
           <Composer {...composerProps} welcome />
@@ -449,7 +535,7 @@ function App() {
     <ApprovalQueue approvals={data.approvals} chats={data.chats} files={data.files} onRespond={input => api.respondApproval(input)} onOpenChat={id => openRoute({ type: 'chat', id })} notify={notify} />
     {dragging && <div className="drop-overlay"><div><span><Upload size={31} /></span><h2>把资料放到这里</h2><p>{route.type === 'workspace' ? `添加到「${workspace?.name || '工作区'}」` : '作为附件，和模型一起看看。'}</p></div></div>}
     {settingsOpen && <SettingsDialog settings={data.settings} app={data.app} onClose={() => { setSettingsOpen(false); setThemePreview(null); }} onSaved={settings => setSnapshot(previous => ({ ...previous, settings }))} onImport={replaceSnapshot} notify={notify} onThemePreview={setThemePreview} />}
-    {searchOpen && <SearchDialog snapshot={data} onClose={() => setSearchOpen(false)} onSelect={item => { if (item.type === 'file') setFilePreviewId(item.id); else openRoute({ type: item.type, id: item.id }); }} />}
+    {searchOpen && <SearchDialog snapshot={data} currentChatId={chat?.id} Modal={Modal} onClose={() => setSearchOpen(false)} onSelect={item => { if (item.type === 'file') setFilePreviewId(item.id); else openRoute({ type: item.type === 'message' ? 'chat' : item.type, id: item.id, ...(item.messageId ? { messageId: item.messageId, query: item.query } : {}) }); }} />}
     {entity && <EntityDialog key={`${entity.kind}:${entity.id || 'new'}`} entity={entity} onClose={() => setEntity(null)} onSave={saveEntity} />}
     {newFile && <NewFileDialog workspaceId={newFile.workspaceId} onClose={() => setNewFile(null)} notify={notify} onCreated={file => { setSnapshot(previous => ({ ...previous, files: upsert(previous.files, file) })); setFilePreviewId(file.id); setNewFile(null); notify('文件已创建'); }} />}
     {confirm && <Modal title={confirm.title} onClose={() => !confirmBusy && setConfirm(null)} className="confirm-modal"><p className="confirm-body">{confirm.body}</p><footer className="modal-footer"><button className="button secondary" onClick={() => setConfirm(null)} disabled={confirmBusy}>取消</button><button className="button danger" disabled={confirmBusy} data-testid="confirm-delete" onClick={async () => { setConfirmBusy(true); try { await confirm.run(); setConfirm(null); } catch (error) { notify(error.message, 'error'); } finally { setConfirmBusy(false); } }}>{confirmBusy && <Spinner size={15} />}{confirm.action}</button></footer></Modal>}

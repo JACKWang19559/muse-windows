@@ -13,6 +13,7 @@ const MAX_BACKUP_BYTES = 250 * 1024 * 1024;
 const MAX_BACKUP_JSON_BYTES = 150 * 1024 * 1024;
 const MAX_STATE_BYTES = 100 * 1024 * 1024;
 const MAX_EDITABLE_FILE_BYTES = 1024 * 1024;
+const MAX_REPLY_EXCERPT_CHARS = 2000;
 const FILE_EDIT_DIRECTORY = /^\.file-edit-[0-9a-f-]{36}$/;
 const ID = /^[A-Za-z0-9_-]{1,100}$/;
 const DEFAULTS = { baseUrl: 'https://api.openai.com/v1', model: '', systemPrompt: '你是一位认真、清晰、乐于协作的 AI 助手。请优先使用中文回答，并明确区分事实与推测。', temperature: 0.7, theme: 'system', language: 'zh', transcriptionModel: '' };
@@ -76,6 +77,16 @@ function workspaceShape(value) {
   record(value, '工作区');
   return { id: identifier(value.id), name: string(value.name, '工作区名称', 160, { empty: false }), description: string(value.description, '工作区描述', 4000), color: /^#[0-9a-fA-F]{6}$/.test(value.color) ? value.color : fail('工作区颜色无效。'), createdAt: date(value.createdAt), updatedAt: date(value.updatedAt) };
 }
+function replyShape(value) {
+  record(value, '消息引用'); onlyKeys(value, ['messageId', 'role', 'excerpt'], '消息引用');
+  if (!['user', 'assistant'].includes(value.role)) fail('引用消息角色无效。');
+  return { messageId: identifier(value.messageId, '引用消息标识符'), role: value.role, excerpt: string(value.excerpt, '引用摘录', MAX_REPLY_EXCERPT_CHARS) };
+}
+function replyExcerpt(content) {
+  let excerpt = content.slice(0, MAX_REPLY_EXCERPT_CHARS);
+  if (/[\uD800-\uDBFF]/.test(excerpt.at(-1) || '')) excerpt = excerpt.slice(0, -1);
+  return excerpt;
+}
 function messageShape(value) {
   record(value, '消息');
   if (!['user', 'assistant'].includes(value.role)) fail('消息角色无效。');
@@ -85,10 +96,13 @@ function messageShape(value) {
   if (value.error != null) result.error = string(value.error, '消息错误说明', 4000);
   if (value.agentMode != null) { if (value.role !== 'assistant' || typeof value.agentMode !== 'boolean') fail('文件助手模式无效。'); result.agentMode = value.agentMode; }
   if (value.toolTrace != null) { if (value.role !== 'assistant' || !value.agentMode) fail('工具记录只能属于文件助手回复。'); result.toolTrace = normalizeToolTrace(value.toolTrace); }
+  if (value.replyTo != null) { if (value.role !== 'user') fail('只有用户消息可携带回复引用。'); result.replyTo = replyShape(value.replyTo); }
+  if (value.isDeleted != null) { if (value.role !== 'user' || typeof value.isDeleted !== 'boolean') fail('消息删除状态无效。'); result.isDeleted = value.isDeleted; }
   if (value.attachmentIds != null) {
     if (!Array.isArray(value.attachmentIds) || value.attachmentIds.length > 100) fail('附件列表无效。');
     result.attachmentIds = [...new Set(value.attachmentIds.map(id => identifier(id, '附件标识符')))];
   }
+  if (result.isDeleted && (result.content !== '' || result.attachmentIds != null || result.replyTo != null || result.error || result.status != null && result.status !== 'complete')) fail('已删除消息不能保留正文、附件、引用或活动状态。');
   return result;
 }
 function chatShape(value) {
@@ -125,7 +139,16 @@ function validateRelations(state) {
   for (const item of [...state.chats, ...state.files]) if (item.workspaceId !== null && !workspaces.has(item.workspaceId)) fail('数据引用了不存在的工作区。');
   for (const chat of state.chats) {
     unique(chat.messages.map(item => item.id), '消息');
-    for (const message of chat.messages) for (const id of message.attachmentIds || []) if (!files.has(id)) fail('消息引用了不存在的附件。');
+    const preceding = new Map();
+    for (const message of chat.messages) {
+      for (const id of message.attachmentIds || []) if (!files.has(id)) fail('消息引用了不存在的附件。');
+      if (message.replyTo) {
+        const target = preceding.get(message.replyTo.messageId);
+        if (!target || target.role !== message.replyTo.role) fail('消息引用必须指向同一对话中更早的消息，并匹配目标角色。');
+        if (target.isDeleted && message.replyTo.excerpt !== '') fail('已删除引用目标不能保留摘录。');
+      }
+      preceding.set(message.id, message);
+    }
   }
 }
 function stateShape(value) {
@@ -265,25 +288,30 @@ class Store {
       this.recoveryNotice = '已恢复上次中断的文件编辑，文件与预览保持一致。';
     }
   }
-  _persistState(state) {
+  _persistState(state, { replaceBackup = false } = {}) {
     const json = JSON.stringify(state);
     if (Buffer.byteLength(json) > MAX_STATE_BYTES) fail('本地数据超出容量限制。');
     const temporary = path.join(this.dataDir, `.state-${crypto.randomUUID()}.tmp`);
     let descriptor;
     try {
       descriptor = fs.openSync(temporary, 'wx', 0o600); fs.writeFileSync(descriptor, json, 'utf8'); fs.fsyncSync(descriptor); fs.closeSync(descriptor); descriptor = null;
-      if (fs.existsSync(this.statePath)) {
-        const stat = fs.lstatSync(this.statePath);
-        if (!stat.isFile() || stat.isSymbolicLink()) fail('本地数据路径不安全。');
+      if (fs.existsSync(this.statePath) || replaceBackup) {
+        if (fs.existsSync(this.statePath)) { const stat = fs.lstatSync(this.statePath); if (!stat.isFile() || stat.isSymbolicLink()) fail('本地数据路径不安全。'); }
         const backupTmp = path.join(this.dataDir, `.backup-${crypto.randomUUID()}.tmp`);
-        try { fs.copyFileSync(this.statePath, backupTmp, fs.constants.COPYFILE_EXCL); fs.renameSync(backupTmp, this.backupPath); }
+        try {
+          // Deletion must not leave the removed body or quote snapshot in the
+          // automatic recovery backup. Both durable copies get the tombstone.
+          if (replaceBackup) this._writeSynced(backupTmp, Buffer.from(json, 'utf8'));
+          else fs.copyFileSync(this.statePath, backupTmp, fs.constants.COPYFILE_EXCL);
+          fs.renameSync(backupTmp, this.backupPath);
+        }
         finally { if (fs.existsSync(backupTmp)) fs.unlinkSync(backupTmp); }
       }
       fs.renameSync(temporary, this.statePath);
     } catch (error) { filesystemFailure(error, '无法保存本地数据，请检查磁盘空间和文件权限。'); }
     finally { if (descriptor != null) fs.closeSync(descriptor); if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
   }
-  _commit(change) { const next = copy(this.state), result = change(next), validated = stateShape(next); this._persistState(validated); this.state = validated; return copy(result); }
+  _commit(change, persistenceOptions) { const next = copy(this.state), result = change(next), validated = stateShape(next); this._persistState(validated, persistenceOptions); this.state = validated; return copy(result); }
   _workspace(id, state = this.state) { const workspace = state.workspaces.find(item => item.id === id); if (!workspace) fail('工作区不存在。'); return workspace; }
   _workspaceId(id, state = this.state) { if (id == null) return null; identifier(id); this._workspace(id, state); return id; }
   _chat(id, state = this.state) { identifier(id); const chat = state.chats.find(item => item.id === id); if (!chat) fail('对话不存在。'); return chat; }
@@ -338,10 +366,52 @@ class Store {
   deleteChat(id) { this._chat(id); this._commit(next => { next.chats = next.chats.filter(item => item.id !== id); return null; }); return this.snapshot(); }
   getChat(id) { return copy(this._chat(id)); }
   appendMessage(chatId, input) {
-    record(input, '消息'); onlyKeys(input, ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace'], '消息');
-    const message = messageShape({ id: input.id || uid('msg'), createdAt: stamp(), status: 'complete', ...input });
+    record(input, '消息'); onlyKeys(input, ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace', 'replyToMessageId'], '消息');
+    const { replyToMessageId, ...fields } = input;
+    const message = messageShape({ id: input.id || uid('msg'), createdAt: stamp(), status: 'complete', ...fields });
     for (const id of message.attachmentIds || []) this._file(id);
-    return this._commit(next => { const chat = this._chat(chatId, next); if (chat.messages.some(item => item.id === message.id)) fail('消息标识符已存在。'); chat.messages.push(message); chat.updatedAt = stamp(); return message; });
+    return this._commit(next => {
+      const chat = this._chat(chatId, next); if (chat.messages.some(item => item.id === message.id)) fail('消息标识符已存在。');
+      if (replyToMessageId != null) {
+        identifier(replyToMessageId, '引用消息标识符');
+        const target = chat.messages.find(item => item.id === replyToMessageId);
+        if (message.role !== 'user' || !target || target.isDeleted || target.status === 'streaming' || target.id === message.id) fail('回复引用必须指向同一对话中既有、未删除且已停止生成的消息。');
+        message.replyTo = { messageId: target.id, role: target.role, excerpt: replyExcerpt(target.content) };
+      }
+      chat.messages.push(message); chat.updatedAt = stamp(); return message;
+    });
+  }
+  // Main-process admission cleanup only. The caller must establish that HTTP
+  // dispatch has NOT begun; Store cannot prove network delivery or undo it.
+  // This method is intentionally absent from the renderer/preload API.
+  rollbackUnsentMessages(input) {
+    record(input, '未发送消息回滚'); onlyKeys(input, ['chatId', 'messageIds'], '未发送消息回滚');
+    identifier(input.chatId, '对话标识符');
+    if (!Array.isArray(input.messageIds) || input.messageIds.length < 1 || input.messageIds.length > 2) fail('只能回滚本次准入新增的末尾一至两条消息。');
+    const ids = input.messageIds.map(id => identifier(id, '消息标识符'));
+    unique(ids, '回滚消息');
+    return this._commit(next => {
+      const chat = this._chat(input.chatId, next), suffix = chat.messages.slice(-ids.length);
+      if (suffix.length !== ids.length || suffix.some((message, index) => message.id !== ids[index])) fail('消息顺序或对话末尾已变化，不能回滚未发送消息。');
+      if (suffix.some(message => message.toolTrace?.length)) fail('消息已有工具执行记录，不能作为未发送消息回滚。');
+      const selected = new Set(ids);
+      // Store relations are chat-local. Another chat may legitimately reuse an
+      // ID, so its unrelated reference must not be treated as this target.
+      if (chat.messages.some(message => message.replyTo && selected.has(message.replyTo.messageId))) fail('消息已被其它消息引用，不能回滚。');
+      chat.messages.splice(chat.messages.length - ids.length, ids.length);
+      chat.updatedAt = stamp(); return chat;
+    }, { replaceBackup: true });
+  }
+  deleteTurn(input) {
+    record(input, '消息删除'); onlyKeys(input, ['chatId', 'messageId'], '消息删除'); identifier(input.messageId, '消息标识符');
+    return this._commit(next => {
+      const chat = this._chat(input.chatId, next), index = chat.messages.findIndex(item => item.id === input.messageId), selected = chat.messages[index];
+      if (!selected || selected.role !== 'user') fail('只能删除本对话中既有的用户消息。');
+      chat.messages[index] = { id: selected.id, role: 'user', content: '', createdAt: selected.createdAt, status: 'complete', isDeleted: true };
+      for (const message of chat.messages) if (message.replyTo?.messageId === selected.id) message.replyTo.excerpt = '';
+      chat.updatedAt = stamp();
+      return { chat, deletedMessageIds: [selected.id] };
+    }, { replaceBackup: true });
   }
   updateMessage(chatId, messageId, patch) {
     record(patch, '消息'); onlyKeys(patch, ['content', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace'], '消息');
@@ -473,7 +543,7 @@ class Store {
     for (const item of data.chats) {
       onlyKeys(record(item, '对话'), ['id', 'title', 'workspaceId', 'createdAt', 'updatedAt', 'pinned', 'messages'], '备份对话');
       if (!Array.isArray(item.messages)) fail('备份消息列表无效。');
-      for (const message of item.messages) onlyKeys(record(message, '消息'), ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace'], '备份消息');
+      for (const message of item.messages) onlyKeys(record(message, '消息'), ['id', 'role', 'content', 'createdAt', 'status', 'attachmentIds', 'error', 'agentMode', 'toolTrace', 'replyTo', 'isDeleted'], '备份消息');
     }
     let total = 0;
     const buffers = new Map(), source = { workspaces: data.workspaces.map(workspaceShape), chats: data.chats.map(chatShape), files: data.files.map(file => {
@@ -489,7 +559,10 @@ class Store {
     try {
       for (const item of source.files) { const file = await this._prepareFile(buffers.get(item.id), item.name, item.workspaceId === null ? null : workspaceIds.get(item.workspaceId)); file.createdAt = item.createdAt; prepared.push(file); fileIds.set(item.id, file.id); }
       const workspaces = source.workspaces.map(item => ({ ...item, id: workspaceIds.get(item.id) }));
-      const chats = source.chats.map(item => ({ ...item, id: uid('chat'), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), messages: item.messages.map(message => ({ ...message, id: uid('msg'), status: message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace) ? 'cancelled' : message.status, ...(message.toolTrace ? { toolTrace: remapToolTrace(cancelToolTrace(message.toolTrace), { fileIds, workspaceIds }) } : {}), ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) }));
+      const chats = source.chats.map(item => {
+        const messageIds = new Map(item.messages.map(message => [message.id, uid('msg')]));
+        return { ...item, id: uid('chat'), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), messages: item.messages.map(message => ({ ...message, id: messageIds.get(message.id), status: message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace) ? 'cancelled' : message.status, ...(message.replyTo ? { replyTo: { ...message.replyTo, messageId: messageIds.get(message.replyTo.messageId) } } : {}), ...(message.toolTrace ? { toolTrace: remapToolTrace(cancelToolTrace(message.toolTrace), { fileIds, workspaceIds }) } : {}), ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) };
+      });
       this._commit(next => { if (next.workspaces.length + workspaces.length > 1000 || next.chats.length + chats.length > 5000 || next.files.length + prepared.length > 10000) fail('合并后的数据数量超出限制。'); next.settings = settings; next.workspaces.push(...workspaces); next.chats.push(...chats); next.files.push(...prepared); return null; });
       return this.snapshot();
     } catch (error) { for (const item of prepared) this._discardFile(item); throw error; }

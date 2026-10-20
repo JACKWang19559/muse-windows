@@ -204,6 +204,8 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     check('Stop UI cancels a pending approval without creating its file',stopState.approvals.length===0&&!stopState.files.some(file=>file.name==='stopped-agent.md'));
     const staleDenied=await page(async id=>{try{await window.muse.respondApproval({id,decision:'approve'});return false;}catch{return true;}},stoppedApproval.id);
     check('Stale approval cannot be replayed through the real isolated IPC',staleDenied);
+    await require('./chat-lifecycle-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+    await require('./queue-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     const report={passed:true,checks,check_count:checks.length,provider:'local deterministic test server only',target_mac_app_executed:false};
     fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify(report,null,2));
     app.exit(0);
