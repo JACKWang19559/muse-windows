@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Check, ChevronRight, FileText, LoaderCircle, ShieldCheck, Square, X } from 'lucide-react';
 
-const LABELS = { workspace_list_files: '查看工作区文件', workspace_read_file: '读取文件', workspace_create_text_file: '创建文件', workspace_save_text_file: '保存文件' };
+const LABELS = { workspace_list_files: '查看工作区文件', workspace_read_file: '读取文件', workspace_create_text_file: '创建文件', workspace_save_text_file: '保存文件', muse_list_apps:'查看本地应用', muse_read_app:'读取应用源码', muse_create_app:'创建本地应用', muse_write_app:'修改应用源码', muse_build_app:'构建应用' };
 const STATES = { pending: '待处理', running: '正在处理', awaiting_approval: '等待确认', complete: '已完成', denied: '已拒绝', error: '未完成', cancelled: '已停止' };
 const parse = value => { try { return JSON.parse(value); } catch { return null; } };
 
@@ -29,7 +29,7 @@ export function ApprovalQueue({ approvals, chats, files, onRespond, onOpenChat, 
   };
   return <aside className="approval-queue" aria-label="文件操作确认" data-testid="approval-queue">{approvals.map(approval => {
     const chat = chats.find(chat => chat.id === approval.chatId), args = approval.arguments || {};
-    const name = args.name || files.find(file => file.id === args.id)?.name || '当前文件';
-    return <section className="approval-card" key={approval.id} data-approval-id={approval.id}><header><ShieldCheck size={18} /><div><h3>{LABELS[approval.name] || '文件操作'}需要你确认</h3><button className="text-button" onClick={() => onOpenChat(approval.chatId)}>{chat?.title || '打开对话'}<ChevronRight size={12} /></button></div></header><p className="approval-file-name"><FileText size={15} />{name}</p><p className="approval-description">{approval.name === 'workspace_create_text_file' ? '将在工作区创建这份文件。' : '将更新工作台中的文件副本，原始导入文件保持不变。'}本次确认仅允许这一项操作。</p><details><summary>查看将要写入的完整内容</summary><pre className="approval-content">{args.content ?? JSON.stringify(args, null, 2)}</pre></details><footer><button className="button secondary small" disabled={busy !== null} onClick={() => respond(approval, 'deny')} data-testid="approval-deny"><X size={13} />拒绝</button><button className="button primary small" disabled={busy !== null} onClick={() => respond(approval, 'approve')} data-testid="approval-approve">{busy === approval.id ? <LoaderCircle size={13} className="spin" /> : <Check size={13} />}允许本次操作</button></footer></section>;
+    const name = args.name || files.find(file => file.id === args.id)?.name || (approval.name.startsWith('muse_') ? '当前应用' : '当前文件');
+    return <section className="approval-card" key={approval.id} data-approval-id={approval.id}><header><ShieldCheck size={18} /><div><h3>{LABELS[approval.name] || '工作区操作'}需要你确认</h3><button className="text-button" onClick={() => onOpenChat(approval.chatId)}>{chat?.title || '打开对话'}<ChevronRight size={12} /></button></div></header><p className="approval-file-name"><FileText size={15} />{name}</p><p className="approval-description">{approval.summary || (approval.name === 'workspace_create_text_file' ? '将在工作区创建这份文件。' : '将更新工作台中的文件副本，原始导入文件保持不变。')}本次确认仅允许这一项操作。</p><details><summary>查看本次操作的完整参数与内容</summary><pre className="approval-content">{args.content ?? JSON.stringify(args, null, 2)}</pre></details><footer><button className="button secondary small" disabled={busy !== null} onClick={() => respond(approval, 'deny')} data-testid="approval-deny"><X size={13} />拒绝</button><button className="button primary small" disabled={busy !== null} onClick={() => respond(approval, 'approve')} data-testid="approval-approve">{busy === approval.id ? <LoaderCircle size={13} className="spin" /> : <Check size={13} />}允许本次操作</button></footer></section>;
   })}</aside>;
 }

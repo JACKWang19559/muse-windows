@@ -15,10 +15,11 @@ import FileEditor from './FileEditor.jsx';
 import { AgentActivity, ApprovalQueue } from './AgentActivity.jsx';
 import SearchDialog from './SearchDialog.jsx';
 import PendingSends from './PendingSends.jsx';
+import ArtifactPanel from './ArtifactPanel.jsx';
 
 const api = window.muse;
 const COLORS = ['#47766a', '#607eb3', '#a07cb5', '#c49456', '#bd7777', '#7c8992'];
-const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], approvals: [], pendingSends: [], app: {} };
+const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], artifacts: [], approvals: [], pendingSends: [], app: {} };
 
 function Brand({ size = 28, className = '' }) {
   return <svg width={size} height={size} viewBox="0 0 40 40" fill="none" className={`brand-mark ${className}`} aria-hidden="true">
@@ -261,6 +262,7 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(() => window.location.hash === '#settings');
   const [searchOpen, setSearchOpen] = useState(false);
+  const [artifactsOpen, setArtifactsOpen] = useState(false);
   const [entity, setEntity] = useState(null);
   const [confirm, setConfirm] = useState(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
@@ -489,7 +491,7 @@ function App() {
     <div className="app-body">{sidebarOpen && <div className="sidebar-mobile-backdrop" onClick={() => setSidebarOpen(false)} />}
       <aside className={`sidebar ${sidebarOpen ? 'open' : 'closed'}`}>
         <div className="sidebar-top"><button className="personal-space" onClick={() => newChat()}><span className="personal-avatar"><Brand size={19} /></span><span><strong>我的工作台</strong><small>让想法慢慢成形</small></span></button><IconButton icon={PanelLeft} label="收起侧栏" onClick={() => setSidebarOpen(false)} /></div>
-        <div className="sidebar-primary"><button className="new-chat-button" onClick={() => newChat()} data-testid="new-chat"><Plus size={18} /><span>新对话</span><kbd>Ctrl N</kbd></button><button className="sidebar-search" onClick={() => setSearchOpen(true)} data-testid="search-open"><Search size={17} /><span>搜索</span><kbd>Ctrl K</kbd></button></div>
+        <div className="sidebar-primary"><button className="new-chat-button" onClick={() => newChat()} data-testid="new-chat"><Plus size={18} /><span>新对话</span><kbd>Ctrl N</kbd></button><button className="sidebar-search" onClick={() => setSearchOpen(true)} data-testid="search-open"><Search size={17} /><span>搜索</span><kbd>Ctrl K</kbd></button><button className="sidebar-search" onClick={() => setArtifactsOpen(true)} data-testid="artifacts-open"><Monitor size={17}/><span>本地应用</span><small>{data.artifacts.filter(item=>(item.workspaceId??null)===workspaceId).length||''}</small></button></div>
         <div className="sidebar-scroll"><div className="sidebar-group"><div className="sidebar-group-heading"><span>工作区</span><IconButton icon={Plus} label="创建工作区" data-testid="workspace-new" onClick={() => setEntity({ kind: 'workspace' })} /></div>{data.workspaces.length ? data.workspaces.map(space => <button key={space.id} className={`workspace-nav ${workspace?.id === space.id && route.type === 'workspace' ? 'active' : ''}`} onClick={() => openRoute({ type: 'workspace', id: space.id })} data-testid="workspace-nav"><Folder size={17} style={{ color: space.color || COLORS[0] }} /><span>{space.name}</span><span className="workspace-count">{data.chats.filter(item => item.workspaceId === space.id).length || ''}</span></button>) : <button className="workspace-empty-link" onClick={() => setEntity({ kind: 'workspace' })}><FolderPlus size={15} /><span>创建你的第一个工作区</span></button>}</div>
           {sortedChats.some(item => item.pinned) && <div className="sidebar-group"><div className="sidebar-group-heading"><span>置顶</span></div>{sortedChats.filter(item => item.pinned).map(renderChatItem)}</div>}
           <div className="sidebar-group conversation-group"><div className="sidebar-group-heading"><span>最近对话</span>{sortedChats.length > 0 && <small>{sortedChats.length}</small>}</div>{sortedChats.some(item => !item.pinned) ? sortedChats.filter(item => !item.pinned).map(renderChatItem) : <div className="sidebar-chat-empty"><MessageCircle size={23} strokeWidth={1.2} /><span>好想法，从一句话开始</span><small>你的对话会出现在这里</small></div>}</div>
@@ -533,6 +535,7 @@ function App() {
       {filePreviewIds.length > 0 && <FileEditor ids={filePreviewIds} activeId={filePreviewId} files={data.files} onSelect={setFilePreviewId} onCloseTab={closeFilePreview} onClose={() => { setFilePreviewIds([]); selectFilePreview(null); }} onRemove={askRemoveFile} notify={notify} Modal={Modal} renderMarkdown={content => <Markdown content={content} notify={notify} />} />}
     </div>
     <ApprovalQueue approvals={data.approvals} chats={data.chats} files={data.files} onRespond={input => api.respondApproval(input)} onOpenChat={id => openRoute({ type: 'chat', id })} notify={notify} />
+    {artifactsOpen && <ArtifactPanel artifacts={data.artifacts} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={()=>setArtifactsOpen(false)} notify={notify}/>}
     {dragging && <div className="drop-overlay"><div><span><Upload size={31} /></span><h2>把资料放到这里</h2><p>{route.type === 'workspace' ? `添加到「${workspace?.name || '工作区'}」` : '作为附件，和模型一起看看。'}</p></div></div>}
     {settingsOpen && <SettingsDialog settings={data.settings} app={data.app} onClose={() => { setSettingsOpen(false); setThemePreview(null); }} onSaved={settings => setSnapshot(previous => ({ ...previous, settings }))} onImport={replaceSnapshot} notify={notify} onThemePreview={setThemePreview} />}
     {searchOpen && <SearchDialog snapshot={data} currentChatId={chat?.id} Modal={Modal} onClose={() => setSearchOpen(false)} onSelect={item => { if (item.type === 'file') setFilePreviewId(item.id); else openRoute({ type: item.type === 'message' ? 'chat' : item.type, id: item.id, ...(item.messageId ? { messageId: item.messageId, query: item.query } : {}) }); }} />}

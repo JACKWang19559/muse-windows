@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const { TextDecoder } = require('node:util');
 const { MAX_FILE_BYTES, MAX_TEXT_CHARS, TEXT_EXTENSIONS, describeFile, extractDocument } = require('./documents.cjs');
 const { normalizeToolTrace, cancelToolTrace, hasUnfinishedToolCalls, remapToolTrace } = require('./tool-trace.cjs');
+const { MAX_ARTIFACTS, strictRecord: artifactInput, validArray: artifactArray, artifactPath, revision: artifactRevision, dataKey: artifactDataKey, jsonValue: artifactJson, fileBytes: artifactFileBytes, sourceDigest, validateArtifactFiles, validateArtifactBuild, validateArtifact, publicArtifact, starterFiles } = require('./artifact-model.cjs');
 
 const STATE_VERSION = 1;
 const BACKUP_FORMAT = 'muse-windows-backup';
@@ -135,8 +136,9 @@ function fileShape(value, internal = false) {
 function unique(values, label) { if (new Set(values).size !== values.length) fail(`${label}存在重复的标识符。`); }
 function validateRelations(state) {
   unique(state.workspaces.map(item => item.id), '工作区'); unique(state.chats.map(item => item.id), '对话'); unique(state.files.map(item => item.id), '文件');
+  unique((state.artifacts || []).map(item => item.id), 'Space');
   const workspaces = new Set(state.workspaces.map(item => item.id)), files = new Set(state.files.map(item => item.id));
-  for (const item of [...state.chats, ...state.files]) if (item.workspaceId !== null && !workspaces.has(item.workspaceId)) fail('数据引用了不存在的工作区。');
+  for (const item of [...state.chats, ...state.files, ...(state.artifacts || [])]) if (item.workspaceId !== null && !workspaces.has(item.workspaceId)) fail('数据引用了不存在的工作区。');
   for (const chat of state.chats) {
     unique(chat.messages.map(item => item.id), '消息');
     const preceding = new Map();
@@ -156,7 +158,8 @@ function stateShape(value) {
   if (value.schemaVersion !== STATE_VERSION || !Array.isArray(value.workspaces) || value.workspaces.length > 1000 || !Array.isArray(value.chats) || value.chats.length > 5000 || !Array.isArray(value.files) || value.files.length > 10000) fail('本地数据版本或结构不受支持。');
   const encrypted = value.encryptedApiKey;
   if (encrypted != null && (typeof encrypted !== 'string' || encrypted.length > 65536 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encrypted))) fail('本地密钥记录损坏。');
-  const state = { schemaVersion: STATE_VERSION, settings: validateSettings(value.settings), encryptedApiKey: encrypted || null, workspaces: value.workspaces.map(workspaceShape), chats: value.chats.map(chatShape), files: value.files.map(item => fileShape(item, true)) };
+  const artifacts = value.artifacts === undefined ? [] : artifactArray(value.artifacts, MAX_ARTIFACTS, 'Space 列表').map(validateArtifact);
+  const state = { schemaVersion: STATE_VERSION, settings: validateSettings(value.settings), encryptedApiKey: encrypted || null, workspaces: value.workspaces.map(workspaceShape), chats: value.chats.map(chatShape), files: value.files.map(item => fileShape(item, true)), artifacts };
   validateRelations(state);
   return state;
 }
@@ -175,7 +178,7 @@ class Store {
         try { this.state = this._load(this.backupPath); }
         catch { fail('本地数据缺失且自动备份无法读取。文件已保留，请从手动备份恢复。'); }
         this.recoveryNotice = '本地数据文件缺失，已恢复上一次自动备份。';
-      } else this.state = { schemaVersion: 1, settings: { ...DEFAULTS }, encryptedApiKey: null, workspaces: [], chats: [], files: [] };
+      } else this.state = { schemaVersion: 1, settings: { ...DEFAULTS }, encryptedApiKey: null, workspaces: [], chats: [], files: [], artifacts: [] };
     }
     else {
       try { this.state = this._load(this.statePath); }
@@ -316,7 +319,8 @@ class Store {
   _workspaceId(id, state = this.state) { if (id == null) return null; identifier(id); this._workspace(id, state); return id; }
   _chat(id, state = this.state) { identifier(id); const chat = state.chats.find(item => item.id === id); if (!chat) fail('对话不存在。'); return chat; }
   _file(id, state = this.state) { identifier(id); const file = state.files.find(item => item.id === id); if (!file) fail('附件不存在。'); return file; }
-  snapshot() { return { settings: this.settings(), workspaces: copy(this.state.workspaces), chats: copy(this.state.chats), files: this.state.files.map(publicFile), app: { version: '0.1.0', platform: process.platform } }; }
+  _artifact(id, state = this.state) { identifier(id); const artifact = state.artifacts.find(item => item.id === id); if (!artifact) fail('Space 不存在。'); return artifact; }
+  snapshot() { return { settings: this.settings(), workspaces: copy(this.state.workspaces), chats: copy(this.state.chats), files: this.state.files.map(publicFile), artifacts: this.state.artifacts.map(publicArtifact), app: { version: '0.1.0', platform: process.platform } }; }
   settings() { return { ...copy(this.state.settings), hasApiKey: Boolean(this.state.encryptedApiKey) }; }
   secret() {
     if (!this.state.encryptedApiKey) return '';
@@ -351,7 +355,7 @@ class Store {
     return this._commit(next => { const item = this._workspace(input.id, next), value = workspaceShape({ ...item, ...input, updatedAt: stamp() }); Object.assign(item, value); return item; });
   }
   deleteWorkspace(id) {
-    this._workspace(id); this._commit(next => { next.workspaces = next.workspaces.filter(item => item.id !== id); for (const item of [...next.chats, ...next.files]) if (item.workspaceId === id) { item.workspaceId = null; if ('updatedAt' in item) item.updatedAt = stamp(); } return null; }); return this.snapshot();
+    this._workspace(id); this._commit(next => { next.workspaces = next.workspaces.filter(item => item.id !== id); for (const item of [...next.chats, ...next.files, ...next.artifacts]) if (item.workspaceId === id) { item.workspaceId = null; if ('updatedAt' in item) item.updatedAt = stamp(); } return null; }); return this.snapshot();
   }
   createChat(input = {}) {
     record(input, '对话'); onlyKeys(input, ['workspaceId', 'title'], '对话');
@@ -523,15 +527,88 @@ class Store {
     const chat = this._chat(chatId), explicit = new Set(attachmentIds.map(id => this._file(id).id));
     return this.state.files.filter(file => (chat.workspaceId !== null && file.workspaceId === chat.workspaceId) || explicit.has(file.id)).filter(file => file.textStatus === 'ready').map(file => ({ ...publicFile(file), ...this.readFile(file.id) }));
   }
+  getArtifact(id) { return publicArtifact(this._artifact(id)); }
+  createArtifact(input) {
+    artifactInput(input, ['name', 'workspaceId', 'runtime']);
+    const now = stamp(), runtime = input.runtime, workspaceId = this._workspaceId(input.workspaceId);
+    const artifact = validateArtifact({ id: uid('artifact'), name: typeof input.name === 'string' ? input.name.trim() : input.name, workspaceId, runtime, entryPath: runtime === 'html' ? 'index.html' : 'src/main.tsx', sourceRevision: 1, createdAt: now, updatedAt: now, files: starterFiles(runtime), builds: [], data: { version: 0, values: {} } });
+    return this._commit(next => { if (next.artifacts.length >= MAX_ARTIFACTS) fail('Space 数量超过限制。'); this._workspaceId(workspaceId, next); next.artifacts.push(artifact); return publicArtifact(artifact); });
+  }
+  writeArtifactFiles(input) {
+    artifactInput(input, ['id', 'expectedRevision', 'files', 'deletePaths', 'entryPath']);
+    const expectedRevision = artifactRevision(input.expectedRevision), files = validateArtifactFiles(input.files);
+    const deletePaths = artifactArray(input.deletePaths ?? [], 200, '删除源码路径').map(artifactPath);
+    if (new Set(deletePaths.map(value => value.toLowerCase())).size !== deletePaths.length) fail('删除源码路径重复。');
+    if (!files.length && !deletePaths.length && input.entryPath == null) fail('没有需要修改的 Space 源码。');
+    const entryPath = input.entryPath == null ? null : artifactPath(input.entryPath);
+    if (files.some(file => deletePaths.includes(file.path))) fail('同一路径不能同时写入和删除。');
+    return this._commit(next => {
+      const artifact = this._artifact(input.id, next);
+      if (artifact.sourceRevision !== expectedRevision) fail('Space 源码已被其他编辑器修改，请重新载入。');
+      if (artifact.sourceRevision === Number.MAX_SAFE_INTEGER) fail('Space 版本超出限制。');
+      for (const deleted of deletePaths) if (!artifact.files.some(file => file.path === deleted)) fail('待删除的源码文件不存在。');
+      const replacements = new Map(files.map(file => [file.path, file]));
+      artifact.files = artifact.files.filter(file => !deletePaths.includes(file.path)).map(file => { const replacement = replacements.get(file.path); replacements.delete(file.path); return replacement || file; });
+      artifact.files.push(...replacements.values());
+      if (entryPath !== null) artifact.entryPath = entryPath;
+      artifact.sourceRevision++; artifact.updatedAt = stamp();
+      return publicArtifact(validateArtifact(artifact));
+    });
+  }
+  readArtifactFile(input) {
+    artifactInput(input, ['id', 'path']); const name = artifactPath(input.path), artifact = this._artifact(input.id);
+    const file = artifact.files.find(item => item.path === name); if (!file) fail('Space 源码文件不存在。');
+    const bytes = artifactFileBytes(file);
+    return { ...copy(file), sha256: sha256(bytes), size: bytes.length, editable: Object.hasOwn(file, 'text') };
+  }
+  // Host-only: not included in the general state snapshot or the preview SDK.
+  artifactSourceSnapshot(id) {
+    const { name, workspaceId, runtime, entryPath, sourceRevision, createdAt, updatedAt, files } = this._artifact(id);
+    return { id, name, workspaceId, runtime, entryPath, sourceRevision, createdAt, updatedAt, files: copy(files) };
+  }
+  commitArtifactBuild(input) {
+    artifactInput(input, ['id', 'sourceRevision', 'build']); const sourceRevision = artifactRevision(input.sourceRevision), build = validateArtifactBuild(input.build);
+    return this._commit(next => {
+      const artifact = this._artifact(input.id, next);
+      if (artifact.sourceRevision !== sourceRevision || build.sourceRevision !== sourceRevision || build.sourceDigest !== sourceDigest(artifact)) fail('Space 源码已变化，构建结果未保存，请重新构建。');
+      if (artifact.builds.some(item => item.id === build.id)) fail('构建标识符已存在，不能覆盖不可变构建。');
+      const expectedPage = artifact.runtime === 'react' ? 'index.html' : artifact.entryPath;
+      if (!build.pages.some(page => page.path === expectedPage)) fail('构建缺少入口页面。');
+      artifact.builds = [...artifact.builds, build].slice(-3); artifact.updatedAt = stamp(); return publicArtifact(artifact);
+    });
+  }
+  readArtifactBuild(input) {
+    artifactInput(input, ['id', 'buildId']); const artifact = this._artifact(input.id);
+    if (input.buildId != null) identifier(input.buildId, '构建标识符');
+    const build = input.buildId == null ? artifact.builds.at(-1) : artifact.builds.find(item => item.id === input.buildId);
+    if (!build) fail('Space 尚无可用构建。'); return copy(build);
+  }
+  deleteArtifact(id) { this._artifact(id); this._commit(next => { next.artifacts = next.artifacts.filter(item => item.id !== id); return null; }, { replaceBackup: true }); return this.snapshot(); }
+  artifactDataGet(input) {
+    artifactInput(input, ['id', 'key']); const key = artifactDataKey(input.key), data = this._artifact(input.id).data;
+    return { key, found: Object.hasOwn(data.values, key), ...(Object.hasOwn(data.values, key) ? { value: copy(data.values[key]) } : {}), version: data.version };
+  }
+  artifactDataList(input) {
+    artifactInput(input, ['id', 'prefix']); const prefix = artifactDataKey(input.prefix ?? '', true), data = this._artifact(input.id).data;
+    return { version: data.version, items: Object.keys(data.values).filter(key => key.startsWith(prefix)).sort().map(key => ({ key, value: copy(data.values[key]) })) };
+  }
+  artifactDataSet(input) {
+    artifactInput(input, ['id', 'key', 'value', 'expectedVersion']); const key = artifactDataKey(input.key), value = artifactJson(input.value), expectedVersion = artifactRevision(input.expectedVersion, true);
+    return this._commit(next => { const artifact = this._artifact(input.id, next), data = artifact.data; if (data.version !== expectedVersion) fail('Space 数据已变化，请重新读取后再保存。'); if (data.version === Number.MAX_SAFE_INTEGER) fail('Space 数据版本超出限制。'); data.values[key] = value; data.version++; artifact.updatedAt = stamp(); return { version: data.version, key, value }; });
+  }
+  artifactDataDelete(input) {
+    artifactInput(input, ['id', 'key', 'expectedVersion']); const key = artifactDataKey(input.key), expectedVersion = artifactRevision(input.expectedVersion, true);
+    return this._commit(next => { const artifact = this._artifact(input.id, next), data = artifact.data; if (data.version !== expectedVersion) fail('Space 数据已变化，请重新读取后再删除。'); if (data.version === Number.MAX_SAFE_INTEGER) fail('Space 数据版本超出限制。'); const deleted = Object.hasOwn(data.values, key); delete data.values[key]; data.version++; artifact.updatedAt = stamp(); return { version: data.version, deleted }; }, { replaceBackup: true });
+  }
   exportData() {
     let total = 0;
     const files = this.state.files.map(file => { const bytes = fs.readFileSync(this.filePath(file.id)); total += bytes.length; if (total > MAX_BACKUP_BYTES) fail('附件总量过大，请分批备份。'); return { ...publicFile(file), dataBase64: bytes.toString('base64'), sha256: crypto.createHash('sha256').update(bytes).digest('hex') }; });
-    const data = { format: BACKUP_FORMAT, schemaVersion: 1, exportedAt: stamp(), settings: copy(this.state.settings), workspaces: copy(this.state.workspaces), chats: copy(this.state.chats), files };
+    const data = { format: BACKUP_FORMAT, schemaVersion: 1, exportedAt: stamp(), settings: copy(this.state.settings), workspaces: copy(this.state.workspaces), chats: copy(this.state.chats), files, artifacts: this.state.artifacts.map(artifact => ({ ...copy(artifact), builds: copy(artifact.builds.slice(-1)) })) };
     if (Buffer.byteLength(JSON.stringify(data)) > MAX_BACKUP_JSON_BYTES) fail('备份超过 150 MB，请先减少附件数量后重试。');
     return data;
   }
   async importData(data) {
-    record(data, '备份'); onlyKeys(data, ['format', 'schemaVersion', 'exportedAt', 'settings', 'workspaces', 'chats', 'files'], '备份');
+    record(data, '备份'); onlyKeys(data, ['format', 'schemaVersion', 'exportedAt', 'settings', 'workspaces', 'chats', 'files', 'artifacts'], '备份');
     let serialized;
     try { serialized = JSON.stringify(data); } catch { fail('备份结构无效，无法读取。'); }
     if (Buffer.byteLength(serialized) > MAX_BACKUP_JSON_BYTES) fail('备份超过 150 MB，无法导入。');
@@ -553,17 +630,22 @@ class Store {
       const bytes = Buffer.from(file.dataBase64, 'base64'); total += bytes.length;
       if (total > MAX_BACKUP_BYTES || bytes.length !== item.size || typeof file.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(file.sha256) || crypto.createHash('sha256').update(bytes).digest('hex') !== file.sha256) fail('备份附件大小或校验值不匹配。');
       buffers.set(item.id, bytes); return item;
-    }) };
+    }), artifacts: data.artifacts === undefined ? [] : artifactArray(data.artifacts, MAX_ARTIFACTS, '备份 Space').map(validateArtifact) };
     validateRelations(source);
     const workspaceIds = new Map(source.workspaces.map(item => [item.id, uid('ws')])), fileIds = new Map(), prepared = [];
+    const artifactIds = new Map(source.artifacts.map(item => [item.id, uid('artifact')])), buildIds = new Map();
+    // Only the retained latest build exists after import. Older historical IDs
+    // stay historical instead of being remapped to phantom build identities.
+    for (const item of source.artifacts) for (const build of item.builds.slice(-1)) if (!buildIds.has(build.id)) buildIds.set(build.id, uid('build'));
     try {
       for (const item of source.files) { const file = await this._prepareFile(buffers.get(item.id), item.name, item.workspaceId === null ? null : workspaceIds.get(item.workspaceId)); file.createdAt = item.createdAt; prepared.push(file); fileIds.set(item.id, file.id); }
       const workspaces = source.workspaces.map(item => ({ ...item, id: workspaceIds.get(item.id) }));
+      const artifacts = source.artifacts.map(item => ({ ...item, id: artifactIds.get(item.id), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), builds: item.builds.slice(-1).map(build => ({ ...build, id: buildIds.get(build.id) })) }));
       const chats = source.chats.map(item => {
         const messageIds = new Map(item.messages.map(message => [message.id, uid('msg')]));
-        return { ...item, id: uid('chat'), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), messages: item.messages.map(message => ({ ...message, id: messageIds.get(message.id), status: message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace) ? 'cancelled' : message.status, ...(message.replyTo ? { replyTo: { ...message.replyTo, messageId: messageIds.get(message.replyTo.messageId) } } : {}), ...(message.toolTrace ? { toolTrace: remapToolTrace(cancelToolTrace(message.toolTrace), { fileIds, workspaceIds }) } : {}), ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) };
+        return { ...item, id: uid('chat'), workspaceId: item.workspaceId === null ? null : workspaceIds.get(item.workspaceId), messages: item.messages.map(message => ({ ...message, id: messageIds.get(message.id), status: message.status === 'streaming' || message.toolTrace && hasUnfinishedToolCalls(message.toolTrace) ? 'cancelled' : message.status, ...(message.replyTo ? { replyTo: { ...message.replyTo, messageId: messageIds.get(message.replyTo.messageId) } } : {}), ...(message.toolTrace ? { toolTrace: remapToolTrace(cancelToolTrace(message.toolTrace), { fileIds, workspaceIds, artifactIds, buildIds }) } : {}), ...(message.attachmentIds ? { attachmentIds: message.attachmentIds.map(id => fileIds.get(id)) } : {}) })) };
       });
-      this._commit(next => { if (next.workspaces.length + workspaces.length > 1000 || next.chats.length + chats.length > 5000 || next.files.length + prepared.length > 10000) fail('合并后的数据数量超出限制。'); next.settings = settings; next.workspaces.push(...workspaces); next.chats.push(...chats); next.files.push(...prepared); return null; });
+      this._commit(next => { if (next.workspaces.length + workspaces.length > 1000 || next.chats.length + chats.length > 5000 || next.files.length + prepared.length > 10000 || next.artifacts.length + artifacts.length > MAX_ARTIFACTS) fail('合并后的数据数量超出限制。'); next.settings = settings; next.workspaces.push(...workspaces); next.chats.push(...chats); next.files.push(...prepared); next.artifacts.push(...artifacts); return null; });
       return this.snapshot();
     } catch (error) { for (const item of prepared) this._discardFile(item); throw error; }
   }

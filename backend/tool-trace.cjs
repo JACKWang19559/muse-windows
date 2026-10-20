@@ -73,9 +73,10 @@ function traceHistory(value) {
 function cancelRounds(rounds) { return rounds.map(round => ({ ...round, calls: round.calls.map(call => FINAL_STATES.has(call.status) ? call : { ...call, status: 'cancelled', result: CANCELLED_RESULT }) })); }
 function cancelToolTrace(value) { return cancelRounds(normalizeToolTrace(value)); }
 function hasUnfinishedToolCalls(value) { return normalizeToolTrace(value).some(round => round.calls.some(call => !FINAL_STATES.has(call.status))); }
-function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map() } = {}) {
-  if (types.isProxy(fileIds) || types.isProxy(workspaceIds) || !(fileIds instanceof Map) || !(workspaceIds instanceof Map)) fail();
+function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map(), artifactIds = new Map(), buildIds = new Map() } = {}) {
+  if ([fileIds, workspaceIds, artifactIds, buildIds].some(mapping => types.isProxy(mapping) || !(mapping instanceof Map))) fail();
   const known = new Set(['workspace_list_files', 'workspace_read_file', 'workspace_create_text_file', 'workspace_save_text_file']);
+  const appTools = new Set(['muse_list_apps', 'muse_read_app', 'muse_create_app', 'muse_write_app', 'muse_build_app']);
   const object = candidate => candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate);
   const rewrite = (source, transform) => {
     let parsed;
@@ -93,10 +94,13 @@ function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map() }
     try { return JSON.stringify(parsed); } catch { return source; }
   };
   const rounds = normalizeToolTrace(value).map(round => ({ ...round, calls: round.calls.map(call => {
-    if (!known.has(call.name)) return call;
+    if (!known.has(call.name) && !appTools.has(call.name)) return call;
     const result = { ...call };
     if (call.name === 'workspace_read_file' || call.name === 'workspace_save_text_file') {
       result.arguments = rewrite(call.arguments, (args, field) => field(args, 'id', fileIds));
+    }
+    if (['muse_read_app', 'muse_write_app', 'muse_build_app'].includes(call.name)) {
+      result.arguments = rewrite(call.arguments, (args, field) => field(args, 'id', artifactIds));
     }
     if (call.result != null) result.result = rewrite(call.result, (envelope, field) => {
       if (!object(envelope) || envelope.ok !== true || !object(envelope.result)) return;
@@ -108,6 +112,17 @@ function remapToolTrace(value, { fileIds = new Map(), workspaceIds = new Map() }
       } else if (call.name === 'workspace_create_text_file' || call.name === 'workspace_save_text_file') {
         field(payload.file, 'id', fileIds); field(payload.file, 'workspaceId', workspaceIds);
         field(payload.preview, 'id', fileIds);
+      } else if (appTools.has(call.name)) {
+        // Artifact source, page HTML, arbitrary app data and display names are
+        // opaque history. Only known receipt identity slots may be remapped.
+        const app = target => {
+          if (!object(target)) return;
+          field(target, 'id', artifactIds); field(target, 'workspaceId', workspaceIds);
+          if (Array.isArray(target.builds)) for (const build of target.builds) field(build, 'id', buildIds);
+        };
+        app(payload.app);
+        if (Array.isArray(payload.apps)) for (const item of payload.apps) app(item);
+        field(payload, 'buildId', buildIds);
       }
     });
     return result;

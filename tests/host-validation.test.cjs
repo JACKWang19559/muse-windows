@@ -17,7 +17,7 @@ const appRoot = path.resolve(__dirname, '..');
 const mainFile = path.join(appRoot, 'main.cjs');
 const mainRequire = createRequire(mainFile);
 const rendererURL = pathToFileURL(path.join(appRoot, 'build', 'index.html')).href;
-const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe'.split(' ');
+const API_METHODS = 'bootstrap saveSettings testConnection listModels createWorkspace updateWorkspace deleteWorkspace createChat updateChat deleteChat searchMessages deleteTurn sendMessage cancelQueuedMessage stopGeneration respondApproval retryMessage importFiles importDroppedFiles removeFile createTextFile saveTextFile readFile openFile exportChat exportData importData copyText openExternal windowControl subscribe createArtifact writeArtifactFiles readArtifactFile buildArtifact deleteArtifact openArtifactPreview activateArtifactPreview closeArtifactPreview artifactRequest exportArtifact'.split(' ');
 
 function temporary(t) {
   // The managed Windows sandbox's redirected system temp permits writes but
@@ -56,7 +56,7 @@ function fixture(t, overrides = {}) {
     app, BrowserWindow: function () {}, ipcMain: { handle: (channel, callback) => handlers.set(channel, callback) },
     dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }), showSaveDialog: async () => ({ canceled: true }) },
     safeStorage: {}, shell: { openExternal: async url => external.push(url), openPath: async () => '', showItemInFolder() {} },
-    clipboard: { writeText() {} }, nativeTheme: {}, Menu: { setApplicationMenu() {} }
+    clipboard: { writeText() {} }, nativeTheme: {}, Menu: { setApplicationMenu() {} }, protocol: {registerSchemesAsPrivileged(){},handle(){}}
   };
   const sandbox = {
     require: name => name === 'electron' ? electron : name === './backend/provider.cjs' ? provider : name === './backend/agent-loop.cjs' ? {
@@ -426,6 +426,12 @@ test('main rejects foreign webContents, child frames and remote documents before
   assert.throws(() => host.assertSender({ sender: host.webContents, senderFrame: { url: rendererURL } }));
   host.webContents.mainFrame.url = 'https://provider-a.example/';
   assert.throws(() => host.assertSender({ sender: host.webContents, senderFrame: host.webContents.mainFrame }));
+});
+
+test('preload never exposes the host API inside a child frame',()=>{
+  let exposed=false;
+  vm.runInNewContext(fs.readFileSync(path.join(appRoot,'preload.cjs'),'utf8'),{require:()=>({contextBridge:{exposeInMainWorld(){exposed=true;}},ipcRenderer:{}}),process:{isMainFrame:false}});
+  assert.equal(exposed,false);
 });
 
 test('managed file creation and edits refresh public state and subsequent model context', async t => {

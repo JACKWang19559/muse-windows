@@ -11,7 +11,7 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     while (Date.now() < deadline) { const result = await page(fn, value); if (result) return result; await new Promise(r=>setTimeout(r,60)); }
     throw new Error('Timed out waiting for renderer: ' + fn.toString().slice(0,150));
   };
-  const check = (name, result) => { assert.ok(result, name); checks.push({name,passed:true}); };
+  const check = (name, result) => { assert.ok(result, name); checks.push({name,passed:true}); fs.writeFileSync(path.join(folder,'desktop-progress.json'),JSON.stringify({checks,check_count:checks.length},null,2)); };
   const fill = async (testId,value) => page(input=>{
     const el=document.querySelector(`[data-testid="${input.testId}"]`);
     if(!el)throw new Error('Missing input '+input.testId);
@@ -206,6 +206,8 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     check('Stale approval cannot be replayed through the real isolated IPC',staleDenied);
     await require('./chat-lifecycle-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./queue-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+    await require('./artifact-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+    await require('./artifact-editing-scenario.cjs')({window,store,operations,folder,page,wait,check,fill});
     const report={passed:true,checks,check_count:checks.length,provider:'local deterministic test server only',target_mac_app_executed:false};
     fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify(report,null,2));
     app.exit(0);
