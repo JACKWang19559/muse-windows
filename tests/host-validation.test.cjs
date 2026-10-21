@@ -25,6 +25,15 @@ API_METHODS.push('readVideoFile');
 API_METHODS.push('readPdfFile');
 API_METHODS.push('readPdfAsset');
 API_METHODS.push('readDocxFile');
+API_METHODS.push('readSpreadsheetFile','openSpreadsheetLink');
+
+test('main XLSX reader preserves managed bytes and the dedicated link handler rejects unsafe protocols',async t=>{
+ const host=fixture(t),source=path.join(host.dir,'owned.xlsx'),bytes=require('../scripts/spreadsheet-fixtures.cjs').spreadsheetFixture();fs.writeFileSync(source,bytes);
+ const file=await host.store.addFile({sourcePath:source}),input={id:file.id,expectedName:file.name,expectedSha256:file.sha256},result=host.operations.readSpreadsheetFile(input);
+ assert.deepEqual(Buffer.from(result.spreadsheet),bytes);assert.match(result.mimeType,/spreadsheetml/);assert(!JSON.stringify(result).includes(host.dir));assert.throws(()=>host.operations.readSpreadsheetFile({...input,path:source}));
+ for(const value of ['javascript:alert(1)','file:///private','https://u:p@owned.invalid'])await assert.rejects(host.operations.openSpreadsheetLink(value));
+ assert.equal(host.external.length,0);await host.operations.openSpreadsheetLink('mailto:owned@example.invalid');assert.equal(host.external.length,1);assert.equal(host.scheduled.length,0);
+});
 
 test('main DOCX reader transfers original managed bytes without calling the model or opening an external file',async t=>{
  const host=fixture(t),source=path.join(host.dir,'owned.DOCX'),bytes=Buffer.from([80,75,3,4,0,255,128,7]);fs.writeFileSync(source,bytes);

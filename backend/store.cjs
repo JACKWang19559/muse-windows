@@ -158,7 +158,10 @@ function fileShape(value, internal = false) {
   if (value.textPreview != null) result.textPreview = string(value.textPreview, '文件预览', 1500);
   if (value.error != null) result.error = string(value.error, '文件错误说明', 2000);
   if (internal) {
-    const expected = `${result.id}.${describeFile(result.name).managedExtension}`;
+    // Releases before XLSX preview stored these unchanged bytes under .bin.
+    // Keep their exact recorded location until an explicit rename moves them.
+    const legacyXlsx=describeFile(result.name).ext==='xlsx'&&value._storedName===`${result.id}.bin`;
+    const expected = legacyXlsx?value._storedName:`${result.id}.${describeFile(result.name).managedExtension}`;
     if (value._storedName !== expected || value._textName !== `${result.id}.text` || typeof value._textTruncated !== 'boolean') fail('本地文件路径记录无效。');
     result._storedName = expected; result._textName = value._textName; result._textTruncated = value._textTruncated;
     if (value._sha256 != null) { if (typeof value._sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value._sha256)) fail('本地文件校验值无效。'); result._sha256 = value._sha256; }

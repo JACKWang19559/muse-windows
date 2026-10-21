@@ -6,6 +6,7 @@ const {isImageFile}=require('../backend/image-format.cjs');
 const {isPreviewMediaFile,isVideoFile}=require('../backend/video-format.cjs');
 const {isPdfFile}=require('../backend/pdf-format.cjs');
 const {isDocxFile}=require('../backend/docx-format.cjs');
+const {isSpreadsheetFile}=require('../backend/spreadsheet-format.cjs');
 
 test('JSON editor classification handles case and keeps unrelated text extensions separate',()=>{
   for(const name of ['data.json','data.JSON','rows.jsonl','rows.JsOnL'])assert.equal(isJsonFile(name),true);
@@ -57,7 +58,7 @@ function editor(name='fixture.json',baseline='{"before":true}'){
   const api={readFile:async input=>{readCalls.push(input);if(failRead)throw Error('Synthetic unsupported format');return preview(baseline);},saveTextFile:async input=>{calls.push(JSON.parse(JSON.stringify(input)));if(failSave)throw Error('Synthetic save conflict');return{preview:preview(input.content)};},exportFile:async input=>{downloads.push(JSON.parse(JSON.stringify(input)));if(failDownload)throw Error('Synthetic download error');return await downloadResult;}};
   const useState=initial=>{const i=cursor++;if(!(i in hooks))hooks[i]=typeof initial==='function'?initial():initial;return[hooks[i],v=>updates.push(()=>{hooks[i]=typeof v==='function'?v(hooks[i]):v;})];};
   const useRef=initial=>{const i=cursor++;return hooks[i]||(hooks[i]={current:initial});};
-  const context=vm.createContext({api,isJsonFile,jsonSaveError,isImageFile,isVideoFile,isPreviewMediaFile,isPdfFile,isDocxFile,useState,useRef,useEffect(){},props:{ids:['file_fixture'],activeId:'file_fixture',files:[{id:'file_fixture',name}],notify:(...args)=>notices.push(args)}});vm.runInContext(actionCode,context);
+  const context=vm.createContext({api,isJsonFile,jsonSaveError,isImageFile,isVideoFile,isPreviewMediaFile,isPdfFile,isDocxFile,isSpreadsheetFile,useState,useRef,useEffect(){},props:{ids:['file_fixture'],activeId:'file_fixture',files:[{id:'file_fixture',name}],notify:(...args)=>notices.push(args)}});vm.runInContext(actionCode,context);
   const render=()=>{while(updates.length)updates.shift()();cursor=0;vm.runInContext('FileEditor(props)',context);return context.probe;};render();
   return{calls,notices,downloads,readCalls,render,get probe(){return context.probe;},async load(){await context.probe.load('file_fixture');return render();},edit(text){context.probe.patch('file_fixture',{text,mode:'edit'});return render();},fail(value){failSave=value;},failRead(value){failRead=value;},failDownload(value){failDownload=value;},replyDownload(value){downloadResult=value;}};
 }

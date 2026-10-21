@@ -1,6 +1,6 @@
 {
   "name": "muse-windows",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "private": true,
   "license": "MIT",
   "repository": {
@@ -22,9 +22,11 @@
     "package:win": "npm run build && node scripts/package.cjs"
   },
   "dependencies": {
+    "@xmldom/xmldom": "0.9.12",
     "docx-preview": "0.4.1",
     "dompurify": "3.4.17",
     "esbuild": "0.28.2",
+    "fast-formula-parser": "1.0.19",
     "fflate": "0.8.3",
     "jszip": "3.10.1",
     "lucide-react": "1.60.0",
@@ -33,9 +35,11 @@
     "pdf-parse": "2.4.5",
     "pdfjs-dist": "5.4.296",
     "react": "19.3.1",
-    "react-dom": "19.3.1"
+    "react-dom": "19.3.1",
+    "ssf": "0.11.2"
   },
   "devDependencies": {
-    "electron": "44.9.1"
+    "electron": "44.9.1",
+    "exceljs": "4.4.0"
   }
 }

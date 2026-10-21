@@ -735,7 +735,7 @@ const operations = {
     return snapshot();
   },
   importFiles: async input => {
-    const choice = await dialog.showOpenDialog(window, { title: '添加参考文件', properties: ['openFile', 'multiSelections'], filters: [{ name: '文档与文本', extensions: ['txt','md','markdown','pdf','docx','csv','tsv','json','js','jsx','ts','tsx','py','html','css','xml','yaml','yml','log','sql','c','cpp','h','go','rs'] }, { name: '所有文件', extensions: ['*'] }] });
+    const choice = await dialog.showOpenDialog(window, { title: '添加参考文件', properties: ['openFile', 'multiSelections'], filters: [{ name: '文档与文本', extensions: ['txt','md','markdown','pdf','docx','xlsx','csv','tsv','json','js','jsx','ts','tsx','py','html','css','xml','yaml','yml','log','sql','c','cpp','h','go','rs'] }, { name: '所有文件', extensions: ['*'] }] });
     return choice.canceled ? [] : addFiles(choice.filePaths, input?.workspaceId);
   },
   importDroppedPaths: input => { if (!Array.isArray(input.paths) || input.paths.some(p => typeof p !== 'string')) throw new Error('拖入的文件无效。'); return addFiles(input.paths, input.workspaceId); },
@@ -746,6 +746,8 @@ const operations = {
   readVideoFile: input => require('./backend/video-file.cjs').readManagedVideo(store, input),
   readPdfFile: input => require('./backend/pdf-file.cjs').readManagedPdf(store, input),
   readDocxFile: input => require('./backend/docx-file.cjs').readManagedDocx(store, input),
+  readSpreadsheetFile: input => require('./backend/spreadsheet-file.cjs').readManagedSpreadsheet(store, input),
+  openSpreadsheetLink: async value => { const href=require('./backend/spreadsheet-format.cjs').spreadsheetLink(value);if(!href)throw Error('此工作簿链接无法打开。');await shell.openExternal(href); },
   readPdfAsset: input => require('./backend/pdf-assets.cjs').readPdfAsset(input),
   saveTextFile: input => { const result = store.saveTextFile(input || {}); if (/\.(csv|tsv)$/i.test(result.file.name)) result.preview = store.readFile(result.file.id, { preserveCsvSource: true }); refresh(); return result; },
   readFile: input => store.readFile(id(input.id), { preserveCsvSource: true }),
@@ -753,7 +755,7 @@ const operations = {
   openFile: async input => {
     const target = store.filePath(id(input.id));
     if (!target) throw new Error('文件不存在。');
-    if (!['.txt','.md','.markdown','.pdf','.docx','.csv','.tsv','.json'].includes(path.extname(target).toLowerCase())) { shell.showItemInFolder(target); return; }
+    if (!['.txt','.md','.markdown','.pdf','.docx','.xlsx','.csv','.tsv','.json'].includes(path.extname(target).toLowerCase())) { shell.showItemInFolder(target); return; }
     const error = await shell.openPath(target);
     if (error) throw new Error(error);
   },

@@ -114,6 +114,7 @@ server.listen(0, '127.0.0.1', async () => {
     visit('scripts/video-fixtures.cjs');
     visit('scripts/pdf-fixtures.cjs');
     visit('scripts/docx-fixtures.cjs');
+    visit('scripts/spreadsheet-fixtures.cjs');
     visit('scripts/docx-zip.cjs');
     return result;
   };

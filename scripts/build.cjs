@@ -6,9 +6,17 @@ const root = path.resolve(__dirname, '..');
 (async () => {
   const out = path.join(root, 'build');
   fs.mkdirSync(out, { recursive: true });
+  // The official browser build is self-contained in both browser and Node
+  // Workers. Only this asset is used at runtime; ExcelJS Node I/O dependencies
+  // are development dependencies and are not copied into the portable app.
+  const exceljsSource=require.resolve('exceljs/dist/exceljs.min.js'),exceljsLicense=require.resolve('exceljs/dist/LICENSE');
+  fs.copyFileSync(exceljsSource,path.join(out,'spreadsheet-exceljs.cjs'));
+  fs.copyFileSync(exceljsLicense,path.join(out,'ExcelJS-LICENSE.txt'));
   await esbuild.build({ entryPoints: [path.join(root, 'renderer', 'App.jsx')], bundle: true, outfile: path.join(out, 'app.js'), platform: 'browser', target: 'chrome130', jsx: 'automatic', sourcemap: true, minify: true, define: { 'process.env.NODE_ENV': '"production"' }, loader: { '.svg': 'dataurl', '.png': 'file', '.woff2': 'file', '.ttf': 'file' } });
   fs.copyFileSync(path.join(root, 'renderer', 'index.html'), path.join(out, 'index.html'));
   fs.copyFileSync(require.resolve('pdfjs-dist/build/pdf.worker.min.mjs'), path.join(out, 'pdf.worker.mjs'));
+  const spreadsheet=await esbuild.build({entryPoints:[path.join(root,'renderer','spreadsheet-worker.js')],bundle:true,outfile:path.join(out,'spreadsheet-worker.js'),platform:'browser',format:'iife',target:'chrome130',minify:true,legalComments:'eof',metafile:true});
+  fs.writeFileSync(path.join(out,'spreadsheet-worker.json'),JSON.stringify({schema:'muse-owned-spreadsheet-worker-v1',sha256:crypto.createHash('sha256').update(fs.readFileSync(path.join(out,'spreadsheet-worker.js'))).digest('hex'),vendorSources:Object.fromEntries([exceljsSource,exceljsLicense,require.resolve('exceljs/package.json')].map(file=>[path.relative(root,file).replace(/\\/g,'/'),crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')])),sourceInputs:Object.fromEntries(Object.keys(spreadsheet.metafile.inputs).map(file=>[file.replace(/\\/g,'/'),crypto.createHash('sha256').update(fs.readFileSync(path.resolve(root,file))).digest('hex')]))},null,2));
   const docx=await esbuild.build({entryPoints:[path.join(root,'renderer','docx-sandbox.js')],bundle:true,write:false,platform:'browser',format:'iife',target:'chrome130',minify:true,legalComments:'eof',metafile:true});
   const script=docx.outputFiles[0].text.replace(/<\/script/gi,'<\\/script');
   const scriptHash='sha256-'+crypto.createHash('sha256').update(script).digest('base64');

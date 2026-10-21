@@ -6,7 +6,7 @@ const { TextDecoder } = require('node:util');
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_TEXT_CHARS = 200000;
 const TEXT_EXTENSIONS = new Set('txt md markdown mdx csv tsv json jsonl ndjson yaml yml toml ini cfg conf log xml html htm css scss sass less js jsx cjs mjs ts tsx py pyw rb rs go java c h cpp hpp cc cs swift kt kts sql sh bash zsh ps1 bat cmd r lua vue svelte graphql gql env properties dockerfile gitignore'.split(' '));
-const MIME = { md: 'text/markdown', markdown: 'text/markdown', csv: 'text/csv', tsv: 'text/tab-separated-values', json: 'application/json', jsonl: 'application/x-ndjson', html: 'text/html', htm: 'text/html', pdf: 'application/pdf', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
+const MIME = { md: 'text/markdown', markdown: 'text/markdown', csv: 'text/csv', tsv: 'text/tab-separated-values', json: 'application/json', jsonl: 'application/x-ndjson', html: 'text/html', htm: 'text/html', pdf: 'application/pdf', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
 
 function extension(name) {
   const ext = path.extname(name).slice(1).toLowerCase();
@@ -15,7 +15,7 @@ function extension(name) {
 
 function describeFile(name) {
   const ext = extension(name);
-  return { ext, mime: MIME[ext] || (TEXT_EXTENSIONS.has(ext) ? 'text/plain' : 'application/octet-stream'), managedExtension: TEXT_EXTENSIONS.has(ext) || ext === 'docx' || ext === 'pdf' ? ext : 'bin' };
+  return { ext, mime: MIME[ext] || (TEXT_EXTENSIONS.has(ext) ? 'text/plain' : 'application/octet-stream'), managedExtension: TEXT_EXTENSIONS.has(ext) || ext === 'docx' || ext === 'pdf' || ext === 'xlsx' ? ext : 'bin' };
 }
 
 function trimText(text) {
@@ -87,6 +87,10 @@ async function extractDocument(buffer, name) {
   let text;
   try {
     if (TEXT_EXTENSIONS.has(ext)) text = decodeText(buffer);
+    else if(ext==='xlsx'){
+      const extracted=await require('./spreadsheet-text.cjs').extractSpreadsheetText(buffer);
+      return {mime,textStatus:'ready',text:extracted.text,truncated:extracted.truncated};
+    }
     else if (ext === 'docx') {
       validateDocxZip(buffer);
       let unzipSync;
@@ -121,7 +125,7 @@ async function extractDocument(buffer, name) {
     return { mime, textStatus: 'ready', ...trimText(text) };
   } catch (error) {
     // Do not expose parser internals, relationship targets or source paths.
-    const message = TEXT_EXTENSIONS.has(ext) ? '文本编码或内容无效；请使用 UTF-8 或带 BOM 的 UTF-16 文件。' : ext === 'pdf' ? 'PDF 文字提取失败，文件可能损坏、加密或不受支持。' : 'DOCX 文字提取失败，文件可能损坏、加密或超出限制。';
+    const message = TEXT_EXTENSIONS.has(ext) ? '文本编码或内容无效；请使用 UTF-8 或带 BOM 的 UTF-16 文件。' : ext === 'xlsx' ? 'Excel 文字提取失败，文件可能损坏、加密或超出限制。' : ext === 'pdf' ? 'PDF 文字提取失败，文件可能损坏、加密或不受支持。' : 'DOCX 文字提取失败，文件可能损坏、加密或超出限制。';
     return { mime, textStatus: 'error', text: '', truncated: false, error: message };
   }
 }
