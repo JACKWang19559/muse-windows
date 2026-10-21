@@ -108,6 +108,7 @@ export default function ArtifactPanel({ requestedArtifact, artifacts, workspaceI
   const scoped = artifacts.filter(item => (item.workspaceId ?? null) === workspaceId);
   const [selectedId, setSelectedId] = useState(null), [name, setName] = useState(''), [runtime, setRuntime] = useState('react');
   const selected = scoped.find(item => item.id === selectedId);
+  useEffect(()=>{if(selectedId&&!artifacts.some(item=>item.id===selectedId))setSelectedId(null);},[artifacts,selectedId]);
   const [workbenchView, setWorkbenchView] = useState('preview');
   const activeArtifactCallback = useRef(onActiveArtifactChange); activeArtifactCallback.current = onActiveArtifactChange;
   useLayoutEffect(() => { activeArtifactCallback.current?.(selected?.id || null); }, [selected?.id]);

@@ -26,6 +26,60 @@ API_METHODS.push('readPdfFile');
 API_METHODS.push('readPdfAsset');
 API_METHODS.push('readDocxFile');
 API_METHODS.push('readSpreadsheetFile','openSpreadsheetLink');
+API_METHODS.push('setLibraryPin','removeLibraryItem');
+
+test('Library host pins use real persistence with scope and stale-state checks',async t=>{
+ const host=fixture(t),w=host.store.createWorkspace({name:'Library host'}),f=(await host.operations.createTextFile({workspaceId:w.id,name:'pinned.md',content:'unchanged'})).file;
+ const p={kind:'file',id:f.id,workspaceId:w.id};
+ const state=host.operations.setLibraryPin({...p,pinned:true,expectedPinned:false});assert.deepEqual(Array.from(state.libraryPins,x=>({...x})),[p]);
+ assert.throws(()=>host.operations.setLibraryPin({...p,workspaceId:null,pinned:false,expectedPinned:true}),/空间/);
+ assert.throws(()=>host.operations.setLibraryPin({...p,pinned:false,expectedPinned:false}),/变化/);
+ assert.throws(()=>host.operations.setLibraryPin({...p,pinned:false,expectedPinned:true,path:'outside'}),/不支持/);
+ assert.equal(host.store.readFile(f.id).text,'unchanged');assert.equal(host.scheduled.length,0);
+ assert.equal(host.operations.setLibraryPin({...p,pinned:false,expectedPinned:true}).libraryPins.length,0);
+});
+
+test('Scoped Library deletion reuses managed file and application cleanup',async t=>{
+ const host=fixture(t),w=host.store.createWorkspace({name:'Library delete'}),source=path.join(host.dir,'original.txt');fs.writeFileSync(source,'outside original');
+ const f=await host.store.addFile({sourcePath:source,workspaceId:w.id}),a=host.store.createArtifact({workspaceId:w.id,name:'Owned app',runtime:'html'}),chat=host.store.createChat({workspaceId:w.id});host.store.appendMessage(chat.id,{role:'user',content:'reference',attachmentIds:[f.id]});
+ for(const p of[{kind:'file',id:f.id,workspaceId:w.id},{kind:'artifact',id:a.id,workspaceId:w.id}])host.operations.setLibraryPin({...p,pinned:true,expectedPinned:false});
+ assert.throws(()=>host.operations.removeLibraryItem({kind:'file',id:f.id,workspaceId:null}),/空间/);assert(host.store.getFile(f.id));
+ host.operations.removeLibraryItem({kind:'file',id:f.id,workspaceId:w.id});assert.equal(fs.readFileSync(source,'utf8'),'outside original');assert.deepEqual(host.store.getChat(chat.id).messages[0].attachmentIds,[]);
+ const state=host.operations.removeLibraryItem({kind:'artifact',id:a.id,workspaceId:w.id});assert.equal(state.libraryPins.length,0);assert(!state.artifacts.some(x=>x.id===a.id));
+ assert.throws(()=>host.operations.removeLibraryItem({kind:'artifact',id:a.id,workspaceId:w.id}),/不存在/);assert.equal(host.scheduled.length,0);
+});
+
+test('Library removal cleanup failure returns committed state with a safe warning and still cancels affected schedules',async t=>{
+ for(const operation of ['removeFile','removeLibraryItem']){
+  const host=fixture(t),workspace=host.store.createWorkspace({name:'cleanup failure'}),created=await host.operations.createTextFile({workspaceId:workspace.id,name:'kept-on-disk.md',content:'SYNTHETIC_RETAINED_DISK_BYTES'}),file=created.file;
+  const tuple={kind:'file',id:file.id,workspaceId:workspace.id};host.operations.setLibraryPin({...tuple,pinned:true,expectedPinned:false});
+  const chat=host.store.createChat({workspaceId:workspace.id});host.store.appendMessage(chat.id,{role:'user',content:'unchanged visible history',attachmentIds:[file.id]});
+  const task=host.operations.createSchedule(scheduleInput(host,{workspaceId:workspace.id,attachmentIds:[file.id]})),unrelated=host.operations.createSchedule(scheduleInput(host,{workspaceId:workspace.id}));
+  const managed=host.store.filePath(file.id),bytes=fs.readFileSync(managed),cancelled=[];host.setSchedulerForTest({cancel:id=>cancelled.push(id)});
+  host.store._discardFile=()=>{throw Object.assign(Error('SYNTHETIC_UNLINK_PRIVATE_PATH must not be returned'),{code:'EPERM'});};
+  const eventCount=host.events.length,result=host.operations[operation](operation==='removeFile'?{id:file.id}:tuple);
+  assert.equal(result.removalWarning,'资料已从工作台移除，部分磁盘副本未能清理。');assert.equal(result.files.some(item=>item.id===file.id),false);assert.equal(result.libraryPins.length,0);
+  assert.deepEqual(cancelled,[task.id]);assert.equal(cancelled.includes(unrelated.id),false);assert.equal(host.store.getSchedule(task.id).enabled,false);assert.deepEqual(host.store.getSchedule(task.id).attachmentIds,[]);
+  assert.deepEqual(host.store.getChat(chat.id).messages[0].attachmentIds,[]);assert.equal(host.store.getChat(chat.id).messages[0].content,'unchanged visible history');
+  assert.deepEqual(fs.readFileSync(managed),bytes);assert.equal(host.events.length,eventCount+1);assert.equal(host.events.at(-1).type,'snapshot');assert.equal(host.events.at(-1).snapshot.files.some(item=>item.id===file.id),false);
+  const reopened=new Store(host.store.dataDir);assert.equal(reopened.snapshot().files.some(item=>item.id===file.id),false);assert.deepEqual(reopened.snapshot().libraryPins,[]);
+  assert.equal(JSON.stringify(result).includes('SYNTHETIC_UNLINK_PRIVATE_PATH'),false);assert.equal(host.scheduled.length,0);
+ }
+});
+
+test('Library removal commit failure and absent targets reject without warning cancellation refresh or reference loss',async t=>{
+ for(const operation of ['removeFile','removeLibraryItem']){
+  const host=fixture(t),file=(await host.operations.createTextFile({name:'retained-after-commit-failure.md',content:'SYNTHETIC_UNCOMMITTED_FILE'})).file,tuple={kind:'file',id:file.id,workspaceId:null};
+  host.operations.setLibraryPin({...tuple,pinned:true,expectedPinned:false});const task=host.operations.createSchedule(scheduleInput(host,{attachmentIds:[file.id]})),cancelled=[];host.setSchedulerForTest({cancel:id=>cancelled.push(id)});
+  const before=structuredClone(host.store.state),primary=fs.readFileSync(host.store.statePath),backup=fs.readFileSync(host.store.backupPath),managed=host.store.filePath(file.id),bytes=fs.readFileSync(managed),eventCount=host.events.length,persist=host.store._persistState;
+  let discards=0;host.store._discardFile=()=>{discards++;};host.store._persistState=()=>{throw Error('SYNTHETIC_PRECOMMIT_FAILURE');};
+  try{assert.throws(()=>host.operations[operation](operation==='removeFile'?{id:file.id}:tuple),/SYNTHETIC_PRECOMMIT_FAILURE/);}finally{host.store._persistState=persist;}
+  assert.deepEqual(host.store.state,before);assert.deepEqual(fs.readFileSync(host.store.statePath),primary);assert.deepEqual(fs.readFileSync(host.store.backupPath),backup);assert.deepEqual(fs.readFileSync(managed),bytes);
+  assert.deepEqual(host.store.getSchedule(task.id).attachmentIds,[file.id]);assert.deepEqual(host.store.snapshot().libraryPins,[tuple]);assert.equal(discards,0);assert.deepEqual(cancelled,[]);assert.equal(host.events.length,eventCount);
+  const missing=operation==='removeFile'?{id:'missing_file'}:{kind:'file',id:'missing_file',workspaceId:null};assert.throws(()=>host.operations[operation](missing),/不存在/);
+  assert.equal(host.events.length,eventCount);assert.deepEqual(cancelled,[]);assert.deepEqual(host.store.state,before);assert.equal(host.scheduled.length,0);
+ }
+});
 
 test('main XLSX reader preserves managed bytes and the dedicated link handler rejects unsafe protocols',async t=>{
  const host=fixture(t),source=path.join(host.dir,'owned.xlsx'),bytes=require('../scripts/spreadsheet-fixtures.cjs').spreadsheetFixture();fs.writeFileSync(source,bytes);
@@ -146,7 +200,7 @@ function fixture(t, overrides = {}) {
     Buffer, URL, AbortController, AbortSignal, setTimeout, clearTimeout,
     setImmediate: callback => { scheduled.push(callback); }
   };
-  const expose = '\n;globalThis.hostUnderTest={operations,active,sendAdmissions,assertSender,contextMessages,cleanError,createWindow,disposeAudio,disposeDictation:()=>dictation?.dispose(),setState:(s,w)=>{store=s;window=w;previewRuntime={closeAll(){},document(){throw new Error("not a preview");}};}};';
+  const expose = '\n;globalThis.hostUnderTest={operations,active,sendAdmissions,assertSender,contextMessages,cleanError,createWindow,disposeAudio,disposeDictation:()=>dictation?.dispose(),setSchedulerForTest:value=>{scheduler=value;},setState:(s,w)=>{store=s;window=w;previewRuntime={closeAll(){},document(){throw new Error("not a preview");}};}};';
   vm.runInNewContext(fs.readFileSync(mainFile, 'utf8') + expose, sandbox, { filename: mainFile });
   // Production main and Store share a realm; the VM fixture serializes its
   // host-owned data at this test boundary without relaxing JSON validators.

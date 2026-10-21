@@ -572,6 +572,8 @@ async function addFiles(paths, workspaceId) {
 }
 const operations = {
   bootstrap: () => snapshot(),
+  setLibraryPin: input => { store.setLibraryPin(input); return refresh(); },
+  removeLibraryItem: input => { const target = store.libraryItem(input); return target.kind === 'file' ? operations.removeFile({ id: target.id }) : operations.deleteArtifact({ id: target.id }); },
   getMemoryDocument: input => store.getMemoryDocument({workspaceId:input?.workspaceId??null}),
   saveMemoryDocument: input => knowledgeChanged(store.saveMemoryDocument(input)),
   deleteMemoryDocument: input => knowledgeChanged(store.deleteMemoryDocument(input)),
@@ -739,7 +741,17 @@ const operations = {
     return choice.canceled ? [] : addFiles(choice.filePaths, input?.workspaceId);
   },
   importDroppedPaths: input => { if (!Array.isArray(input.paths) || input.paths.some(p => typeof p !== 'string')) throw new Error('拖入的文件无效。'); return addFiles(input.paths, input.workspaceId); },
-  removeFile: input => { const fileId=id(input.id),affected=(store.snapshot().schedules||[]).filter(task=>task.attachmentIds.includes(fileId));store.removeFile(fileId);for(const task of affected)scheduler?.cancel(task.id);return refresh(); },
+  removeFile: input => {
+    const fileId=id(input.id),before=store.snapshot(),wasPresent=before.files.some(file=>file.id===fileId),affected=(before.schedules||[]).filter(task=>task.attachmentIds.includes(fileId));
+    let removalWarning;
+    try { store.removeFile(fileId); }
+    catch(error) {
+      if(!wasPresent||store.snapshot().files.some(file=>file.id===fileId))throw error;
+      removalWarning='资料已从工作台移除，部分磁盘副本未能清理。';
+    }
+    for(const task of affected)scheduler?.cancel(task.id);
+    const value=refresh();return removalWarning?{...value,removalWarning}:value;
+  },
   createTextFile: async input => { const result = await store.createTextFile(input || {}); refresh(); return result; },
   renameFile: async input => { const result = await store.renameFile(input || {}); refresh(); return result; },
   readImageFile: input => require('./backend/image-file.cjs').readManagedImage(store, input),

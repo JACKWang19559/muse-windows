@@ -15,3 +15,17 @@ test('Library documents, media, applications and all-file views keep distinct so
 test('Library search is trimmed case-insensitive literal name matching with no content search',()=>{const x=libraryItems({files,artifacts,workspaceId:'w'});assert.deepEqual(selectLibraryItems(x,{query:' [LITERAL] '}).map(v=>v.id),['image']);assert.equal(selectLibraryItems(x,{query:'[.*'}).length,0);assert.equal(selectLibraryItems(x,{query:'私有'}).length,0);assert.equal(selectLibraryItems(x,{view:'documents',query:'PNG'}).length,0);});
 test('Library date, natural name and size sorts are deterministic without mutating snapshot arrays',()=>{const x=libraryItems({files,artifacts,workspaceId:'w'}),keys=x.map(v=>v.key);assert.deepEqual(selectLibraryItems(x).slice(0,3).map(v=>v.key),['app:same','file:new','file:same']);assert.deepEqual(selectLibraryItems(x,{view:'documents',sort:'name'}).map(v=>v.id),['same','new']);assert.deepEqual(selectLibraryItems(x,{sort:'size'}).map(v=>v.key),['file:new','file:image','file:same','app:same']);assert.deepEqual(x.map(v=>v.key),keys);});
 test('Wide creation targets current chat while narrow creation resolves the destination new-draft key first',()=>{for(const[kind,prompt]of Object.entries(LIBRARY_INTENTS)){assert.deepEqual(libraryIntentTarget({kind,workspaceId:'w',composerKey:'chat:old'}),{prompt,key:'chat:old',route:null});assert.deepEqual(libraryIntentTarget({kind,workspaceId:'w',composerKey:'chat:old',narrow:true}),{prompt,key:'new:w',route:{type:'welcome',workspaceId:'w'}});}assert.equal(libraryIntentTarget({kind:'document',composerKey:'chat:personal',narrow:true}).key,'new:personal');assert.throws(()=>libraryIntentTarget({kind:'__proto__'}));});
+
+test('Library pin identities distinguish same-ID files and apps and stay inside their scope',()=>{
+ const x=libraryItems({files,artifacts,workspaceId:'w',pins:[{kind:'file',id:'same',workspaceId:'w'},{kind:'artifact',id:'same',workspaceId:'other'}]});
+ assert.equal(x.find(x=>x.key==='file:same').pinned,true);assert.equal(x.find(x=>x.key==='app:same').pinned,false);assert.equal(x.filter(x=>x.pinned).length,1);
+});
+test('Artifact Library views put pins first in persisted order before each chosen secondary sort',()=>{
+ const x=libraryItems({files,artifacts,workspaceId:'w',pins:[{kind:'file',id:'same',workspaceId:'w'},{kind:'artifact',id:'same',workspaceId:'w'}]});
+ for(const sort of['date','name','size'])assert.deepEqual(selectLibraryItems(x,{sort}).slice(0,2).map(x=>x.key),['file:same','app:same']);
+ assert.deepEqual(selectLibraryItems(x,{query:'网页'}).map(x=>x.key),['app:same']);assert.deepEqual(files.map(x=>x.id),['same','new','image','personal','other']);
+});
+test('Filesystem and media Library views retain their ordinary sort instead of applying artifact pin order',()=>{
+ const x=libraryItems({files,artifacts,workspaceId:'w',pins:[{kind:'file',id:'same',workspaceId:'w'}]});
+ assert.equal(selectLibraryItems(x,{view:'files'})[0].id,'new');assert.deepEqual(selectLibraryItems(x,{view:'images'}).map(x=>x.id),['image']);
+});

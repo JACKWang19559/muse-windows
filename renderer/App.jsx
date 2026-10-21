@@ -34,7 +34,7 @@ import { useAudioPlayback, AudioControls, isAudioFile as legacyIsAudioFile } fro
 const api = window.muse;
 const isAudioFile = file => legacyIsAudioFile(file) && !isVideoFile(file?.name);
 const COLORS = ['#47766a', '#607eb3', '#a07cb5', '#c49456', '#bd7777', '#7c8992'];
-const EMPTY = { settings: {}, chats: [], workspaces: [], files: [], artifacts: [], schedules: [], scheduleRuns: [], memoryDocuments:[],memories:[],skills:[],agentProfiles:[],memoryIndexes:[],approvals: [], pendingSends: [], app: {} };
+const EMPTY = { libraryPins: [], settings: {}, chats: [], workspaces: [], files: [], artifacts: [], schedules: [], scheduleRuns: [], memoryDocuments:[],memories:[],skills:[],agentProfiles:[],memoryIndexes:[],approvals: [], pendingSends: [], app: {} };
 
 function Brand({ size = 28, className = '' }) {
   return <svg width={size} height={size} viewBox="0 0 40 40" fill="none" className={`brand-mark ${className}`} aria-hidden="true">
@@ -308,6 +308,8 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(() => window.location.hash === '#settings');
   const [searchOpen, setSearchOpen] = useState(false);
   const [libraryOpen,setLibraryOpen]=useState(false);
+  const [libraryDeleting,setLibraryDeleting]=useState(false);
+  const libraryDeleteFlight=useRef(false);
   const [requestedArtifact,setRequestedArtifact]=useState(null);
   const [artifactsOpen, writeArtifactsOpen] = useState(false);
   const [activeArtifactId, writeActiveArtifactId] = useState(null);
@@ -687,9 +689,30 @@ function App() {
     setEntity(null);
   };
   const updateChat = async input => { try { const saved = await api.updateChat(input); setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, saved) })); } catch (error) { notify(error.message, 'error'); } setMenu(null); };
-  const askRemoveFile = file => setConfirm({ title: '移除这份文件？', body: `“${file.name}”及其未保存修改将从工作台中移除。你电脑中的原始文件不会改变。`, action: '移除文件', run: async () => { replaceSnapshot(await api.removeFile({ id: file.id })); setAttachments(previous => Object.fromEntries(Object.entries(previous).map(([key, ids]) => [key, ids.filter(id => id !== file.id)]))); closeFilePreview(file.id); } });
+  const askRemoveFile = file => setConfirm({ title: '移除这份文件？', body: `“${file.name}”及其未保存修改将从工作台中移除。你电脑中的原始文件不会改变。`, action: '移除文件', run: async () => { const result=await api.removeFile({ id: file.id });replaceSnapshot(result); setAttachments(previous => Object.fromEntries(Object.entries(previous).map(([key, ids]) => [key, ids.filter(id => id !== file.id)]))); closeFilePreview(file.id);if(result.removalWarning)notify(result.removalWarning,'error'); } });
   const quoteMessage = message => { setQuotes(previous => ({ ...previous, [composerKey]: message.id })); window.dispatchEvent(new Event('muse-focus-composer')); };
   const playAudioAttachment=(file,message)=>{if(chatAudio.view?.owner?.fileId===file.id){if(chatAudio.view.state==='playing')chatAudio.pause();else if(chatAudio.view.state==='paused')chatAudio.resume();return;}chatAudio.play({chatId:chat.id,messageId:message.id,fileId:file.id},{label:file.name});};
+  const pinLibraryItem = async item => {
+    try { replaceSnapshot(await api.setLibraryPin({kind:item.kind,id:item.id,workspaceId:item.source.workspaceId??null,pinned:!item.pinned,expectedPinned:item.pinned})); }
+    catch(error){notify(error.message,'error');try{replaceSnapshot(await api.bootstrap());}catch{}}
+  };
+  const askDeleteLibraryItems = (items,onStarted) => {
+    if(!items.length||libraryDeleteFlight.current)return;
+    const captured=items.map(item=>({...item}));
+    setConfirm({title:'删除这 '+captured.length+' 项资料？',body:captured.map(item=>'• '+item.name).join('\n')+'\n\n仅删除确认时当前结果中的所选条目。文件及未保存修改会从工作台移除，电脑中的原始文件保留；应用的源码、构建及本地数据将删除。聊天和计划中的文件引用也会清理。此操作不能撤销。',action:'删除所选资料',run:async()=>{
+      if(libraryDeleteFlight.current)return;libraryDeleteFlight.current=true;setLibraryDeleting(true);
+      try{
+        onStarted();
+        const outcomes=await Promise.all(captured.map(async item=>{try{const result=await api.removeLibraryItem({kind:item.kind,id:item.id,workspaceId:item.workspaceId});return{...item,removed:true,cleanupWarning:Boolean(result?.removalWarning)};}catch{return{...item,removed:false};}}));
+        const removed=outcomes.filter(item=>item.removed),fileIds=new Set(removed.filter(item=>item.kind==='file').map(item=>item.id));
+        setAttachments(previous=>Object.fromEntries(Object.entries(previous).map(([key,ids])=>[key,ids.filter(id=>!fileIds.has(id))])));
+        setFilePreviewIds(previous=>previous.filter(id=>!fileIds.has(id)));selectFilePreview(previous=>fileIds.has(previous)?null:previous);
+        setImageViewer(previous=>previous&&fileIds.has(previous.initialId)?null:previous);
+        let refreshFailed=false;try{replaceSnapshot(await api.bootstrap());}catch{refreshFailed=true;}
+        const failed=outcomes.length-removed.length,warnings=removed.filter(item=>item.cleanupWarning).length;notify('已删除 '+removed.length+' 项'+(failed?'，'+failed+' 项未删除，请刷新后重试。':'。')+(warnings?' 其中 '+warnings+' 项的本机副本未能完全清理。':'')+(refreshFailed?' 显示未能刷新，请重新打开资料库。':''),failed||warnings||refreshFailed?'error':'success');
+      }finally{libraryDeleteFlight.current=false;setLibraryDeleting(false);}
+    }});
+  };
   const askDeleteTurn = message => setConfirm({ title: '删除这条消息？', body: '这条用户消息的正文、附件关联、应用引用、页面选区和引用摘录将被清除，并保留删除占位。其他回复和已经完成的文件操作记录会保留。', action: '删除消息', run: async () => {
     const result = await api.deleteTurn({ chatId: chat.id, messageId: message.id });
     setSnapshot(previous => ({ ...previous, chats: upsert(previous.chats, result.chat) }));
@@ -766,7 +789,7 @@ function App() {
     <ApprovalQueue approvals={data.approvals} chats={data.chats} files={data.files} onRespond={input => api.respondApproval(input)} onOpenChat={id => openRoute({ type: 'chat', id })} notify={notify} />
     <AudioControls player={chatAudio}/>
     {imageViewer && <ImageLightbox selection={imageViewer} files={data.files} onClose={() => setImageViewer(null)} onOpenFile={openFileTab} onRemove={askRemoveFile} notify={notify} />}
-    <LibraryPanel open={libraryOpen} files={data.files} artifacts={data.artifacts} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={closeLibrary} onCreate={prefillLibraryIntent} onImport={()=>addFiles(null,workspaceId,false)} importing={importing} onOpenFile={(id,ids)=>{setLibraryOpen(false);setFilePreviewId(id,ids);}} onOpenArtifact={id=>{setRequestedArtifact({id,requestId:crypto.randomUUID()});setArtifactsOpen(true);setLibraryOpen(false);setSidebarOpen(false);}}/>
+    <LibraryPanel open={libraryOpen} files={data.files} artifacts={data.artifacts} pins={data.libraryPins} onPin={pinLibraryItem} onDelete={askDeleteLibraryItems} deleting={libraryDeleting} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={closeLibrary} onCreate={prefillLibraryIntent} onImport={()=>addFiles(null,workspaceId,false)} importing={importing} onOpenFile={(id,ids)=>{setLibraryOpen(false);setFilePreviewId(id,ids);}} onOpenArtifact={id=>{setRequestedArtifact({id,requestId:crypto.randomUUID()});setArtifactsOpen(true);setLibraryOpen(false);setSidebarOpen(false);}}/>
     {artifactsOpen && <ArtifactPanel requestedArtifact={requestedArtifact} artifacts={data.artifacts} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={()=>setArtifactsOpen(false)} onActiveArtifactChange={setActiveArtifactId} notify={notify} annotationTarget={chat?.title || '新对话'} annotationTargetKey={composerKey} annotationUseTools={useTools} onAnnotationToolsChange={composerProps.onToolsChange} onAnnotate={(note,context)=>send(note,context)} onAnnotationSent={annotationSent}/>}
     {knowledgeOpen&&<KnowledgePanel data={data} workspaceId={knowledgeOpen.workspaceId} workspaceName={knowledgeOpen.workspaceName} onClose={()=>setKnowledgeOpen(false)} notify={notify}/>}
     {contextPreview&&<Modal title="将发送的知识上下文" subtitle="包含所选配置的资料；不包含密钥和其他未选择的知识。" onClose={()=>setContextPreview(null)} wide><div className="context-preview">{contextPreview.messages.map((message,index)=><pre key={index}>{message.content}</pre>)}<details><summary>来源与版本记录</summary><pre>{JSON.stringify(contextPreview.receipt,null,2)}</pre></details></div></Modal>}

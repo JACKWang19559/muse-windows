@@ -21,6 +21,54 @@ function fixture(t) {
   return { root, dataDir, options, source, store: new Store(dataDir, options) };
 }
 
+test('state replacement retries Windows transient rename failures without removing either durable copy', { skip: process.platform !== 'win32' }, t => {
+  const { store } = fixture(t); store.createWorkspace({ name: 'before' }); store.flush();
+  const before = fs.readFileSync(store.statePath), rename = fs.renameSync, attempts = new Map();
+  fs.renameSync = function (from, to) {
+    if (to === store.statePath || to === store.backupPath) {
+      const count = (attempts.get(to) || 0) + 1; attempts.set(to, count);
+      if (count <= 2) {
+        assert.deepEqual(fs.readFileSync(store.statePath), before);
+        assert.deepEqual(fs.readFileSync(store.backupPath), before);
+        assert.equal(fs.existsSync(from), true);
+        throw Object.assign(new Error('synthetic transient rename'), { code: count === 1 ? 'EPERM' : 'EBUSY' });
+      }
+    }
+    return rename.call(this, from, to);
+  };
+  try { store.createWorkspace({ name: 'after' }); } finally { fs.renameSync = rename; }
+  assert.equal(attempts.get(store.statePath), 3); assert.equal(attempts.get(store.backupPath), 3);
+  assert.deepEqual(fs.readFileSync(store.backupPath), before);
+  assert.deepEqual(new Store(store.dataDir).snapshot().workspaces.map(x => x.name), ['before', 'after']);
+  assert.equal(fs.readdirSync(store.dataDir).some(n => /^\.(state|backup)-.*\.tmp$/.test(n)), false);
+});
+
+test('persistent Windows rename failure has a finite retry budget and preserves committed state', { skip: process.platform !== 'win32' }, t => {
+  for (const destination of ['statePath', 'backupPath']) {
+    const { store } = fixture(t); store.createWorkspace({ name: 'keep' }); store.flush();
+    const before = fs.readFileSync(store.statePath), snapshot = store.snapshot(), rename = fs.renameSync; let calls = 0;
+    fs.renameSync = function (from, to) {
+      if (to === store[destination]) { calls++; throw Object.assign(new Error('synthetic persistent rename'), { code: 'EACCES' }); }
+      return rename.call(this, from, to);
+    };
+    try { assert.throws(() => store.createWorkspace({ name: 'not committed' }), /无法保存本地数据/); } finally { fs.renameSync = rename; }
+    assert.equal(calls, 6); assert.deepEqual(store.snapshot(), snapshot);
+    assert.deepEqual(fs.readFileSync(store.statePath), before); assert.deepEqual(fs.readFileSync(store.backupPath), before);
+    assert.deepEqual(new Store(store.dataDir).snapshot().workspaces.map(x => x.name), ['keep']);
+    assert.equal(fs.readdirSync(store.dataDir).some(n => /^\.(state|backup)-.*\.tmp$/.test(n)), false);
+  }
+});
+
+test('state replacement does not retry unrelated filesystem failures', t => {
+  const { store } = fixture(t), rename = fs.renameSync, before = store.snapshot(); let calls = 0;
+  fs.renameSync = function (from, to) {
+    if (to === store.statePath) { calls++; throw Object.assign(new Error('synthetic IO failure'), { code: 'EIO' }); }
+    return rename.call(this, from, to);
+  };
+  try { assert.throws(() => store.createWorkspace({ name: 'not committed' }), /无法保存本地数据/); } finally { fs.renameSync = rename; }
+  assert.equal(calls, 1); assert.deepEqual(store.snapshot(), before);
+});
+
 test('store persists settings/chats atomically and keeps API keys out of public data and exports', t => {
   const { store, dataDir, options } = fixture(t), key = 'test-key-that-must-not-appear-in-json';
   store.saveSettings({ baseUrl: 'http://localhost:1234/v1', model: 'local', apiKey: key });
