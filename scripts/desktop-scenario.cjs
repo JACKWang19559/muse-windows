@@ -44,6 +44,10 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await new Promise(r=>setTimeout(r,300));
     await window.webContents.capturePage().then(image=>fs.writeFileSync(path.join(folder,'settings.png'),image.toPNG()));
     await page(()=>Array.from(document.querySelectorAll('.settings-footer button')).find(x=>x.textContent==='关闭').click());
+    if(process.env.MUSE_E2E_SCENARIO==='library'){
+      await require('./library-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+      fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'library only',provider:'local deterministic HTTP server only',target_mac_app_executed:false},null,2));app.exit(0);return;
+    }
     if(process.env.MUSE_E2E_SPREADSHEET_ONLY==='1'||process.env.MUSE_E2E_SCENARIO==='spreadsheet-preview'){
       await require('./spreadsheet-preview-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
       fs.writeFileSync(path.join(folder,'desktop-checks.json'),JSON.stringify({passed:true,checks,check_count:checks.length,scenario:'spreadsheet-preview only',provider:'local deterministic test server only',target_mac_app_executed:false},null,2));app.exit(0);return;
@@ -293,6 +297,7 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await require('./artifact-editing-scenario.cjs')({window,store,operations,folder,page,wait,check,fill});
     await require('./artifact-annotation-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./active-panel-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
+    await require('./library-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./scheduler-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./quit-cancel-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});
     await require('./knowledge-scenario.cjs')({app,window,store,operations,folder,page,wait,check,fill});

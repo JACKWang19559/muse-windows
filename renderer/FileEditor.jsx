@@ -103,12 +103,12 @@ export default function FileEditor({ ids, activeId, files, previewSuspended = fa
   useEffect(() => {
     const unload = event => { if (latest.current.ids.some(id => dirty(latest.current.tabs[id]))) { event.preventDefault(); event.returnValue = false; } };
     const shortcut = event => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); if (!saving) save(latest.current.activeId); }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); if (!saving && !previewSuspended) save(latest.current.activeId); }
     };
     window.addEventListener('beforeunload', unload);
     window.addEventListener('keydown', shortcut);
     return () => { window.removeEventListener('beforeunload', unload); window.removeEventListener('keydown', shortcut); };
-  }, [saving]);
+  }, [saving, previewSuspended]);
   const tab = tabs[activeId] || { loading: true };
   const file = files.find(item => item.id === activeId) || { id: activeId, name: tab.name || '文件已移除' };
   const previewName = dirty(tab) ? tab.name : file.name;

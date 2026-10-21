@@ -85,7 +85,7 @@ module.exports=async({window,store,operations,folder,page,wait,check,fill})=>{
   await page(()=>document.querySelector('[data-testid="knowledge-tab-profile"]').click());
   await wait(()=>!!document.querySelector('[data-testid="knowledge-item"]'));
   await page(()=>document.querySelector('[data-testid="knowledge-item"]').click());
-  await wait(()=>!!document.querySelector('[data-testid="profile-skill"]'));
+  await wait(name=>document.querySelector('[data-testid="knowledge-name"]')?.value===name&&!document.querySelector('.knowledge-panel fieldset')?.disabled&&document.querySelector('.knowledge-title h3')?.textContent===name,profile.name);
   check('An already selected revoked skill remains removable',await page(()=>{const input=document.querySelector('[data-testid="profile-skill"]');return input.checked&&!input.disabled;}));
   await page(()=>{document.querySelector('[data-testid="profile-skill"]').click();document.querySelector('[data-testid="knowledge-save"]').click();});
   await wait(async id=>(await window.muse.getAgentProfile({id})).skillRefs.length===0,profile.id);

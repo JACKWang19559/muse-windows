@@ -24,6 +24,8 @@ import { AgentActivity, ApprovalQueue } from './AgentActivity.jsx';
 import SearchDialog from './SearchDialog.jsx';
 import PendingSends from './PendingSends.jsx';
 import ArtifactPanel from './ArtifactPanel.jsx';
+import LibraryPanel from './LibraryPanel.jsx';
+import {libraryIntentTarget} from '../backend/library-model.cjs';
 import SchedulePanel from './SchedulePanel.jsx';
 import KnowledgePanel from './KnowledgePanel.jsx';
 import { useDictation } from './DictationControl.jsx';
@@ -305,6 +307,8 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(() => window.location.hash === '#settings');
   const [searchOpen, setSearchOpen] = useState(false);
+  const [libraryOpen,setLibraryOpen]=useState(false);
+  const [requestedArtifact,setRequestedArtifact]=useState(null);
   const [artifactsOpen, writeArtifactsOpen] = useState(false);
   const [activeArtifactId, writeActiveArtifactId] = useState(null);
   const artifactTarget = useRef({open:artifactsOpen,id:activeArtifactId});artifactTarget.current={open:artifactsOpen,id:activeArtifactId};
@@ -454,7 +458,7 @@ function App() {
   const attachedIds = attachments[composerKey] || [];
   const attachedFiles = attachedIds.map(id => data.files.find(file => file.id === id)).filter(Boolean);
   const quote = chat?.messages.find(message => message.id === quotes[composerKey] && !message.isDeleted);
-  const visibleArtifact = artifactsOpen && data.artifacts.find(item => item.id === activeArtifactId && (item.workspaceId ?? null) === workspaceId);
+  const visibleArtifact = artifactsOpen && !libraryOpen && data.artifacts.find(item => item.id === activeArtifactId && (item.workspaceId ?? null) === workspaceId);
   const activePanel = panelDraftContexts[composerKey] || (visibleArtifact ? {kind:'artifact',artifactId:visibleArtifact.id,artifactName:visibleArtifact.name} : null);
   const configured = !!data.settings.baseUrl && !!data.settings.model;
   const sending = admittingKeys.has(composerKey);
@@ -486,6 +490,16 @@ function App() {
   }, [route.messageId, route.jumpToken, chat?.id, chat?.messages.length]);
 
   const updateDraft = value => { draftState.current.drafts = { ...draftState.current.drafts, [composerKey]: value }; setDrafts(previous => ({ ...previous, [composerKey]: value })); };
+  const openLibrary=()=>{setLibraryOpen(true);setSidebarOpen(false);};
+  const closeLibrary=()=>{setLibraryOpen(false);requestAnimationFrame(()=>window.dispatchEvent(new Event('muse-focus-composer')));};
+  const prefillLibraryIntent=kind=>{
+    const target=libraryIntentTarget({kind,workspaceId,composerKey,narrow:window.innerWidth<1024});
+    // Resolve the destination key before changing routes: the current render's
+    // composerKey can still belong to a different chat during that transition.
+    setDrafts(previous=>({...previous,[target.key]:target.prompt}));
+    if(target.route){openRoute(target.route);setLibraryOpen(false);}
+    requestAnimationFrame(()=>window.dispatchEvent(new Event('muse-focus-composer')));
+  };
   const addFiles = async (dropped, scope = workspaceId, attach = true) => {
     if (importing) return;
     setImporting(true);
@@ -700,12 +714,12 @@ function App() {
     {menu === item.id && <div className="popmenu sidebar-popmenu"><button onClick={() => { setEntity({ kind: 'chat', id: item.id, name: item.title }); setMenu(null); }}><Pencil size={14} />重命名</button><button onClick={() => updateChat({ id: item.id, pinned: !item.pinned })}><Pin size={14} />{item.pinned ? '取消置顶' : '置顶对话'}</button>{data.workspaces.length > 0 && <><div className="popmenu-label">移动到工作区</div><button onClick={() => updateChat({ id: item.id, workspaceId: null })}><MessageCircle size={14} />个人对话{!item.workspaceId && <Check size={13} />}</button>{data.workspaces.map(space => <button key={space.id} onClick={() => updateChat({ id: item.id, workspaceId: space.id })}><Folder size={14} style={{ color: space.color }} /><span>{space.name}</span>{item.workspaceId === space.id && <Check size={13} />}</button>)}</>}<div className="menu-divider" /><button className="danger-text" disabled={item.messages.some(message => message.status === 'streaming')} onClick={() => askDeleteChat(item)}><Trash2 size={14} />删除对话</button></div>}
   </div>;
 
-  return <div className={`desktop-app${artifactsOpen?' artifact-docked':''}`} onDragEnter={event => { if (Array.from(event.dataTransfer.types).includes('Files')) { event.preventDefault(); dragCount.current += 1; setDragging(true); } }} onDragOver={event => { if (Array.from(event.dataTransfer.types).includes('Files')) event.preventDefault(); }} onDragLeave={event => { event.preventDefault(); dragCount.current = Math.max(0, dragCount.current - 1); if (!dragCount.current) setDragging(false); }} onDrop={event => { event.preventDefault(); dragCount.current = 0; setDragging(false); const files = Array.from(event.dataTransfer.files); if (files.length) addFiles(files, workspaceId, route.type !== 'workspace'); }}>
+  return <div className={`desktop-app${artifactsOpen?' artifact-docked':''}${libraryOpen?' library-docked':''}`} onDragEnter={event => { if (Array.from(event.dataTransfer.types).includes('Files')) { event.preventDefault(); dragCount.current += 1; setDragging(true); } }} onDragOver={event => { if (Array.from(event.dataTransfer.types).includes('Files')) event.preventDefault(); }} onDragLeave={event => { event.preventDefault(); dragCount.current = Math.max(0, dragCount.current - 1); if (!dragCount.current) setDragging(false); }} onDrop={event => { event.preventDefault(); dragCount.current = 0; setDragging(false); const files = Array.from(event.dataTransfer.files); if (files.length) addFiles(files, workspaceId, !libraryOpen && route.type !== 'workspace'); }}>
     <header className="titlebar"><div className="titlebar-brand" onDoubleClick={() => api.windowControl('maximize')}><Brand size={19} /><span>Muse</span><span className="titlebar-separator" /><span className="titlebar-subtitle">灵感工作台</span></div><div className="window-controls"><button aria-label="最小化" onClick={() => api.windowControl('minimize')}><Minus size={15} /></button><button aria-label="最大化或还原" onClick={() => api.windowControl('maximize')}><Square size={12} /></button><button className="window-close" aria-label="关闭窗口" onClick={() => api.windowControl('close')}><X size={16} /></button></div></header>
     <div className="app-body">{sidebarOpen && <div className="sidebar-mobile-backdrop" onClick={() => setSidebarOpen(false)} />}
       <aside className={`sidebar ${sidebarOpen ? 'open' : 'closed'}`}>
         <div className="sidebar-top"><button className="personal-space" onClick={() => newChat()}><span className="personal-avatar"><Brand size={19} /></span><span><strong>我的工作台</strong><small>让想法慢慢成形</small></span></button><IconButton icon={PanelLeft} label="收起侧栏" onClick={() => setSidebarOpen(false)} /></div>
-        <div className="sidebar-primary"><button className="new-chat-button" onClick={() => newChat()} data-testid="new-chat"><Plus size={18} /><span>新对话</span><kbd>Ctrl N</kbd></button><button className="sidebar-search" onClick={() => setSearchOpen(true)} data-testid="search-open"><Search size={17} /><span>搜索</span><kbd>Ctrl K</kbd></button><button className="sidebar-search" onClick={() => {setArtifactsOpen(true);setSidebarOpen(false);}} data-testid="artifacts-open"><Monitor size={17}/><span>本地应用</span><small>{data.artifacts.filter(item=>(item.workspaceId??null)===workspaceId).length||''}</small></button></div>
+        <div className="sidebar-primary"><button className="new-chat-button" onClick={() => newChat()} data-testid="new-chat"><Plus size={18} /><span>新对话</span><kbd>Ctrl N</kbd></button><button className="sidebar-search" onClick={() => setSearchOpen(true)} data-testid="search-open"><Search size={17} /><span>搜索</span><kbd>Ctrl K</kbd></button><button className={`sidebar-search${libraryOpen?' active':''}`} onClick={openLibrary} data-testid="library-open"><FolderOpen size={17}/><span>资料库</span></button><button className="sidebar-search" onClick={() => {setArtifactsOpen(true);setSidebarOpen(false);}} data-testid="artifacts-open"><Monitor size={17}/><span>本地应用</span><small>{data.artifacts.filter(item=>(item.workspaceId??null)===workspaceId).length||''}</small></button></div>
         <div className="sidebar-scroll"><div className="sidebar-group"><div className="sidebar-group-heading"><span>工作区</span><IconButton icon={Plus} label="创建工作区" data-testid="workspace-new" onClick={() => setEntity({ kind: 'workspace' })} /></div>{data.workspaces.length ? data.workspaces.map(space => <button key={space.id} className={`workspace-nav ${workspace?.id === space.id && route.type === 'workspace' ? 'active' : ''}`} onClick={() => openRoute({ type: 'workspace', id: space.id })} data-testid="workspace-nav"><Folder size={17} style={{ color: space.color || COLORS[0] }} /><span>{space.name}</span><span className="workspace-count">{data.chats.filter(item => item.workspaceId === space.id).length || ''}</span></button>) : <button className="workspace-empty-link" onClick={() => setEntity({ kind: 'workspace' })}><FolderPlus size={15} /><span>创建你的第一个工作区</span></button>}</div>
           {sortedChats.some(item => item.pinned) && <div className="sidebar-group"><div className="sidebar-group-heading"><span>置顶</span></div>{sortedChats.filter(item => item.pinned).map(renderChatItem)}</div>}
           <div className="sidebar-group conversation-group"><div className="sidebar-group-heading"><span>最近对话</span>{sortedChats.length > 0 && <small>{sortedChats.length}</small>}</div>{sortedChats.some(item => !item.pinned) ? sortedChats.filter(item => !item.pinned).map(renderChatItem) : <div className="sidebar-chat-empty"><MessageCircle size={23} strokeWidth={1.2} /><span>好想法，从一句话开始</span><small>你的对话会出现在这里</small></div>}</div>
@@ -747,12 +761,13 @@ function App() {
           {!configured && <button className="welcome-connect-note" onClick={() => setSettingsOpen(true)}><span><KeyRound size={17} /></span><div><strong>带上你喜欢的模型</strong><small>连接自己的 API，开始真实对话。</small></div><ArrowRight size={16} /></button>}
         </section><footer className="welcome-footer"><ShieldCheck size={13} /><span>本地保存，安静思考。使用你自己的模型服务。</span></footer></div>}
       </main>
-      {filePreviewIds.length > 0 && <FileEditor ids={filePreviewIds} activeId={filePreviewId} files={data.files} previewSuspended={Boolean(imageViewer)} onSelect={openFileTab} onOpenImage={setFilePreviewId} onCloseTab={closeFilePreview} onClose={() => { setFilePreviewIds([]); selectFilePreview(null); }} onRemove={askRemoveFile} onRename={setRenameFile} notify={notify} Modal={Modal} renderMarkdown={content => <Markdown content={content} notify={notify} />} />}
+      {filePreviewIds.length > 0 && <FileEditor ids={filePreviewIds} activeId={filePreviewId} files={data.files} previewSuspended={Boolean(imageViewer)||libraryOpen} onSelect={openFileTab} onOpenImage={setFilePreviewId} onCloseTab={closeFilePreview} onClose={() => { setFilePreviewIds([]); selectFilePreview(null); }} onRemove={askRemoveFile} onRename={setRenameFile} notify={notify} Modal={Modal} renderMarkdown={content => <Markdown content={content} notify={notify} />} />}
     </div>
     <ApprovalQueue approvals={data.approvals} chats={data.chats} files={data.files} onRespond={input => api.respondApproval(input)} onOpenChat={id => openRoute({ type: 'chat', id })} notify={notify} />
     <AudioControls player={chatAudio}/>
     {imageViewer && <ImageLightbox selection={imageViewer} files={data.files} onClose={() => setImageViewer(null)} onOpenFile={openFileTab} onRemove={askRemoveFile} notify={notify} />}
-    {artifactsOpen && <ArtifactPanel artifacts={data.artifacts} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={()=>setArtifactsOpen(false)} onActiveArtifactChange={setActiveArtifactId} notify={notify} annotationTarget={chat?.title || '新对话'} annotationTargetKey={composerKey} annotationUseTools={useTools} onAnnotationToolsChange={composerProps.onToolsChange} onAnnotate={(note,context)=>send(note,context)} onAnnotationSent={annotationSent}/>}
+    <LibraryPanel open={libraryOpen} files={data.files} artifacts={data.artifacts} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={closeLibrary} onCreate={prefillLibraryIntent} onImport={()=>addFiles(null,workspaceId,false)} importing={importing} onOpenFile={(id,ids)=>{setLibraryOpen(false);setFilePreviewId(id,ids);}} onOpenArtifact={id=>{setRequestedArtifact({id,requestId:crypto.randomUUID()});setArtifactsOpen(true);setLibraryOpen(false);setSidebarOpen(false);}}/>
+    {artifactsOpen && <ArtifactPanel requestedArtifact={requestedArtifact} artifacts={data.artifacts} workspaceId={workspaceId} workspaceName={workspace?.name} onClose={()=>setArtifactsOpen(false)} onActiveArtifactChange={setActiveArtifactId} notify={notify} annotationTarget={chat?.title || '新对话'} annotationTargetKey={composerKey} annotationUseTools={useTools} onAnnotationToolsChange={composerProps.onToolsChange} onAnnotate={(note,context)=>send(note,context)} onAnnotationSent={annotationSent}/>}
     {knowledgeOpen&&<KnowledgePanel data={data} workspaceId={knowledgeOpen.workspaceId} workspaceName={knowledgeOpen.workspaceName} onClose={()=>setKnowledgeOpen(false)} notify={notify}/>}
     {contextPreview&&<Modal title="将发送的知识上下文" subtitle="包含所选配置的资料；不包含密钥和其他未选择的知识。" onClose={()=>setContextPreview(null)} wide><div className="context-preview">{contextPreview.messages.map((message,index)=><pre key={index}>{message.content}</pre>)}<details><summary>来源与版本记录</summary><pre>{JSON.stringify(contextPreview.receipt,null,2)}</pre></details></div></Modal>}
     {schedulesOpen&&<SchedulePanel schedules={data.schedules} runs={data.scheduleRuns} workspaceId={workspaceId} workspaces={data.workspaces} files={data.files} settings={data.settings} app={data.app} notify={notify} onClose={()=>setSchedulesOpen(false)} onOpenChat={id=>{setSchedulesOpen(false);openRoute({type:'chat',id});}}/>}

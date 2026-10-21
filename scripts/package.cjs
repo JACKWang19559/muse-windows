@@ -16,7 +16,7 @@ fs.cpSync(runtime, destination, { recursive: true });
 fs.renameSync(path.join(destination, 'electron.exe'), path.join(destination, 'Muse.exe'));
 const application = path.join(destination, 'resources', 'app');
 fs.mkdirSync(application, { recursive: true });
-for (const item of ['main.cjs','preload.cjs','backend','build','assets','scripts/desktop-scenario.cjs','scripts/json-file-scenario.cjs','scripts/file-export-scenario.cjs','scripts/csv-file-scenario.cjs','scripts/file-rename-scenario.cjs','scripts/image-preview-scenario.cjs','scripts/video-preview-scenario.cjs','scripts/video-fixtures.cjs','scripts/pdf-preview-scenario.cjs','scripts/pdf-fixtures.cjs','scripts/docx-fixtures.cjs','scripts/spreadsheet-fixtures.cjs','scripts/spreadsheet-preview-scenario.cjs','scripts/docx-zip.cjs','scripts/docx-preview-scenario.cjs','scripts/chat-lifecycle-scenario.cjs','scripts/queue-scenario.cjs','scripts/cancel-admission-scenario.cjs','scripts/artifact-scenario.cjs','scripts/artifact-editing-scenario.cjs','scripts/artifact-annotation-scenario.cjs','scripts/active-panel-scenario.cjs','scripts/scheduler-scenario.cjs','scripts/knowledge-scenario.cjs','scripts/dictation-scenario.cjs','scripts/audio-scenario.cjs','scripts/quit-cancel-scenario.cjs','scripts/live-provider-scenario.cjs']) {
+for (const item of ['main.cjs','preload.cjs','backend','build','assets','scripts/desktop-scenario.cjs','scripts/library-scenario.cjs','scripts/json-file-scenario.cjs','scripts/file-export-scenario.cjs','scripts/csv-file-scenario.cjs','scripts/file-rename-scenario.cjs','scripts/image-preview-scenario.cjs','scripts/video-preview-scenario.cjs','scripts/video-fixtures.cjs','scripts/pdf-preview-scenario.cjs','scripts/pdf-fixtures.cjs','scripts/docx-fixtures.cjs','scripts/spreadsheet-fixtures.cjs','scripts/spreadsheet-preview-scenario.cjs','scripts/docx-zip.cjs','scripts/docx-preview-scenario.cjs','scripts/chat-lifecycle-scenario.cjs','scripts/queue-scenario.cjs','scripts/cancel-admission-scenario.cjs','scripts/artifact-scenario.cjs','scripts/artifact-editing-scenario.cjs','scripts/artifact-annotation-scenario.cjs','scripts/active-panel-scenario.cjs','scripts/scheduler-scenario.cjs','scripts/knowledge-scenario.cjs','scripts/dictation-scenario.cjs','scripts/audio-scenario.cjs','scripts/quit-cancel-scenario.cjs','scripts/live-provider-scenario.cjs']) {
   const source = path.join(root, item);
   if (fs.existsSync(source)) { fs.mkdirSync(path.dirname(path.join(application,item)),{recursive:true}); fs.cpSync(source, path.join(application, item), { recursive: true }); }
 }
@@ -53,6 +53,8 @@ for (const name of ['LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md']) {
   const source = path.join(root, name);
   if (fs.existsSync(source)) fs.copyFileSync(source, path.join(destination, name));
 }
+// Keep the README's local documentation links usable in the portable folder.
+if(fs.existsSync(path.join(root,'docs')))fs.cpSync(path.join(root,'docs'),path.join(destination,'docs'),{recursive:true});
 const executable = path.join(destination, 'Muse.exe');
 const receipt = { version:pkg.version, platform:'win32-x64', executable, sha256:crypto.createHash('sha256').update(fs.readFileSync(executable)).digest('hex'), runtime:require('electron/package.json').version, runtime_dependency_directories:copied.size };
 fs.writeFileSync(path.join(releaseRoot, 'release-manifest.json'), JSON.stringify(receipt, null, 2));
