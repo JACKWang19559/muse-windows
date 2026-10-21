@@ -573,6 +573,7 @@ async function addFiles(paths, workspaceId) {
 const operations = {
   bootstrap: () => snapshot(),
   setLibraryPin: input => { store.setLibraryPin(input); return refresh(); },
+  moveLibraryPin: input => { store.moveLibraryPin(input); return refresh(); },
   removeLibraryItem: input => { const target = store.libraryItem(input); return target.kind === 'file' ? operations.removeFile({ id: target.id }) : operations.deleteArtifact({ id: target.id }); },
   getMemoryDocument: input => store.getMemoryDocument({workspaceId:input?.workspaceId??null}),
   saveMemoryDocument: input => knowledgeChanged(store.saveMemoryDocument(input)),

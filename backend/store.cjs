@@ -476,6 +476,13 @@ class Store {
       return { ...tuple, pinned: value.pinned };
     });
   }
+  moveLibraryPin(input) {
+    const value = library.moveInput(input);
+    return this._commit(next => {
+      next.libraryPins = library.movePins(value, next.libraryPins, next.files, next.artifacts);
+      return next.libraryPins.filter(pin => pin.workspaceId === value.item.workspaceId);
+    });
+  }
   settings() { return { ...copy(this.state.settings), hasApiKey: Boolean(this.state.encryptedApiKey), hasSpeechApiKey: Boolean(this.state.encryptedSpeechApiKey) }; }
   speechSecret() {
     if (!this.state.encryptedSpeechApiKey) return '';

@@ -25,6 +25,7 @@ import SearchDialog from './SearchDialog.jsx';
 import PendingSends from './PendingSends.jsx';
 import ArtifactPanel from './ArtifactPanel.jsx';
 import LibraryPanel from './LibraryPanel.jsx';
+import PinnedLibrary from './PinnedLibrary.jsx';
 import {libraryIntentTarget} from '../backend/library-model.cjs';
 import SchedulePanel from './SchedulePanel.jsx';
 import KnowledgePanel from './KnowledgePanel.jsx';
@@ -696,6 +697,17 @@ function App() {
     try { replaceSnapshot(await api.setLibraryPin({kind:item.kind,id:item.id,workspaceId:item.source.workspaceId??null,pinned:!item.pinned,expectedPinned:item.pinned})); }
     catch(error){notify(error.message,'error');try{replaceSnapshot(await api.bootstrap());}catch{}}
   };
+  const moveLibraryPin = async input => {
+    // The committed snapshot arrives on the subscription. A delayed command
+    // reply may predate another edit and must not replace that newer state.
+    try { await api.moveLibraryPin(input); return true; }
+    catch(error){notify(error.message,'error');try{replaceSnapshot(await api.bootstrap());}catch{}return false;}
+  };
+  const openPinnedItem = (item,items) => {
+    setLibraryOpen(false);
+    if(item.kind==='artifact'){setRequestedArtifact({id:item.id,requestId:crypto.randomUUID()});setArtifactsOpen(true);setSidebarOpen(false);}
+    else setFilePreviewId(item.id,items.filter(x=>x.kind==='file').map(x=>x.id));
+  };
   const askDeleteLibraryItems = (items,onStarted) => {
     if(!items.length||libraryDeleteFlight.current)return;
     const captured=items.map(item=>({...item}));
@@ -744,6 +756,7 @@ function App() {
         <div className="sidebar-top"><button className="personal-space" onClick={() => newChat()}><span className="personal-avatar"><Brand size={19} /></span><span><strong>我的工作台</strong><small>让想法慢慢成形</small></span></button><IconButton icon={PanelLeft} label="收起侧栏" onClick={() => setSidebarOpen(false)} /></div>
         <div className="sidebar-primary"><button className="new-chat-button" onClick={() => newChat()} data-testid="new-chat"><Plus size={18} /><span>新对话</span><kbd>Ctrl N</kbd></button><button className="sidebar-search" onClick={() => setSearchOpen(true)} data-testid="search-open"><Search size={17} /><span>搜索</span><kbd>Ctrl K</kbd></button><button className={`sidebar-search${libraryOpen?' active':''}`} onClick={openLibrary} data-testid="library-open"><FolderOpen size={17}/><span>资料库</span></button><button className="sidebar-search" onClick={() => {setArtifactsOpen(true);setSidebarOpen(false);}} data-testid="artifacts-open"><Monitor size={17}/><span>本地应用</span><small>{data.artifacts.filter(item=>(item.workspaceId??null)===workspaceId).length||''}</small></button></div>
         <div className="sidebar-scroll"><div className="sidebar-group"><div className="sidebar-group-heading"><span>工作区</span><IconButton icon={Plus} label="创建工作区" data-testid="workspace-new" onClick={() => setEntity({ kind: 'workspace' })} /></div>{data.workspaces.length ? data.workspaces.map(space => <button key={space.id} className={`workspace-nav ${workspace?.id === space.id && route.type === 'workspace' ? 'active' : ''}`} onClick={() => openRoute({ type: 'workspace', id: space.id })} data-testid="workspace-nav"><Folder size={17} style={{ color: space.color || COLORS[0] }} /><span>{space.name}</span><span className="workspace-count">{data.chats.filter(item => item.workspaceId === space.id).length || ''}</span></button>) : <button className="workspace-empty-link" onClick={() => setEntity({ kind: 'workspace' })}><FolderPlus size={15} /><span>创建你的第一个工作区</span></button>}</div>
+          {sidebarOpen&&<PinnedLibrary key={workspaceId??'personal'} files={data.files} artifacts={data.artifacts} pins={data.libraryPins} workspaceId={workspaceId} disabled={libraryDeleting} onOpen={openPinnedItem} onManage={openLibrary} onMove={moveLibraryPin}/>}
           {sortedChats.some(item => item.pinned) && <div className="sidebar-group"><div className="sidebar-group-heading"><span>置顶</span></div>{sortedChats.filter(item => item.pinned).map(renderChatItem)}</div>}
           <div className="sidebar-group conversation-group"><div className="sidebar-group-heading"><span>最近对话</span>{sortedChats.length > 0 && <small>{sortedChats.length}</small>}</div>{sortedChats.some(item => !item.pinned) ? sortedChats.filter(item => !item.pinned).map(renderChatItem) : <div className="sidebar-chat-empty"><MessageCircle size={23} strokeWidth={1.2} /><span>好想法，从一句话开始</span><small>你的对话会出现在这里</small></div>}</div>
         </div>

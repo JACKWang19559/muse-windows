@@ -26,7 +26,7 @@ API_METHODS.push('readPdfFile');
 API_METHODS.push('readPdfAsset');
 API_METHODS.push('readDocxFile');
 API_METHODS.push('readSpreadsheetFile','openSpreadsheetLink');
-API_METHODS.push('setLibraryPin','removeLibraryItem');
+API_METHODS.push('setLibraryPin','moveLibraryPin','removeLibraryItem');
 
 test('Library host pins use real persistence with scope and stale-state checks',async t=>{
  const host=fixture(t),w=host.store.createWorkspace({name:'Library host'}),f=(await host.operations.createTextFile({workspaceId:w.id,name:'pinned.md',content:'unchanged'})).file;
@@ -37,6 +37,15 @@ test('Library host pins use real persistence with scope and stale-state checks',
  assert.throws(()=>host.operations.setLibraryPin({...p,pinned:false,expectedPinned:true,path:'outside'}),/不支持/);
  assert.equal(host.store.readFile(f.id).text,'unchanged');assert.equal(host.scheduled.length,0);
  assert.equal(host.operations.setLibraryPin({...p,pinned:false,expectedPinned:true}).libraryPins.length,0);
+});
+
+test('Library relative pin operation refreshes only after a real atomic scope-order commit',async t=>{
+ const host=fixture(t),w=host.store.createWorkspace({name:'host reorder'}),file=(await host.operations.createTextFile({workspaceId:w.id,name:'reorder.md',content:'retained managed bytes'})).file,app=host.store.createArtifact({workspaceId:w.id,name:'Pinned app',runtime:'html'}),other=(await host.operations.createTextFile({name:'other.md',content:'other scope'})).file;
+ const f={kind:'file',id:file.id,workspaceId:w.id},a={kind:'artifact',id:app.id,workspaceId:w.id},p={kind:'file',id:other.id,workspaceId:null};for(const item of[f,p,a])host.operations.setLibraryPin({...item,pinned:true,expectedPinned:false});
+ const input={item:a,position:{before:f},expectedOrder:[f,a]},events=host.events.length,result=host.operations.moveLibraryPin(input);assert.deepEqual(Array.from(result.libraryPins,x=>({...x})),[a,p,f]);assert.equal(host.events.length,events+1);assert.equal(host.events.at(-1).type,'snapshot');assert.deepEqual(host.store.snapshot().libraryPins,[a,p,f]);assert.deepEqual(new Store(host.store.dataDir).snapshot().libraryPins,[a,p,f]);
+ const committedEvents=host.events.length;assert.throws(()=>host.operations.moveLibraryPin(input),/顺序已变化/);assert.throws(()=>host.operations.moveLibraryPin({item:a,position:{after:p},expectedOrder:[a,f]}),/同一空间/);assert.equal(host.events.length,committedEvents);assert.equal(host.store.readFile(file.id).text,'retained managed bytes');assert.equal(host.scheduled.length,0);assert.equal(host.external.length,0);
+ const persist=host.store._persistState;host.store._persistState=()=>{throw Error('SYNTHETIC_REORDER_SAVE_FAILURE');};try{assert.throws(()=>host.operations.moveLibraryPin({item:f,position:{before:a},expectedOrder:[a,f]}),/SYNTHETIC_REORDER_SAVE_FAILURE/);}finally{host.store._persistState=persist;}
+ assert.equal(host.events.length,committedEvents);assert.deepEqual(host.store.snapshot().libraryPins,[a,p,f]);
 });
 
 test('Scoped Library deletion reuses managed file and application cleanup',async t=>{
@@ -1498,6 +1507,8 @@ test('preload exposes the documented minimal API and accepts drop paths only thr
   assert.equal(exposed.invoke, undefined);
   assert.equal(exposed.ipcRenderer, undefined);
   assert.ok(Object.isFrozen(exposed));
+  const movePayload={item:{kind:'artifact',id:'app-id',workspaceId:null},position:{before:{kind:'file',id:'file-id',workspaceId:null}},expectedOrder:[{kind:'file',id:'file-id',workspaceId:null},{kind:'artifact',id:'app-id',workspaceId:null}]};
+  await exposed.moveLibraryPin(movePayload);assert.equal(calls[0][0],'muse:invoke');assert.equal(calls[0][1],'moveLibraryPin');assert.equal(calls[0][2],movePayload);calls.length=0;
   await assert.rejects(exposed.importDroppedFiles([{ path: 'C:\\untrusted-renderer-path.txt' }]), /真实文件/);
   assert.equal(calls.length, 0);
   const genuineFile = {};

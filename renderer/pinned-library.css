@@ -1,0 +1,15 @@
+.pinned-library .sidebar-group-heading .text-button{font-size:10px;padding:2px 4px;color:var(--text-secondary)}
+.pinned-library-list{display:flex;flex-direction:column;gap:2px}
+.pinned-library-row{position:relative;display:flex;align-items:center;min-height:35px;border-radius:7px}
+.pinned-library-row:hover,.pinned-library-row:focus-within{background:var(--hover)}
+.pinned-library-open{display:flex;align-items:center;gap:9px;flex:1;min-width:0;padding:8px 7px 8px 11px;border:0;background:none;text-align:left;font-size:11px;border-radius:7px}
+.pinned-library-open svg{flex-shrink:0;color:var(--text-secondary)}
+.pinned-library-open span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pinned-library-grip{display:flex;align-items:center;justify-content:center;width:27px;height:29px;padding:0;margin-right:3px;border:0;border-radius:5px;background:none;color:var(--text-secondary);cursor:grab;touch-action:none;user-select:none}
+.pinned-library-grip:hover{background:var(--active);color:var(--text)}
+.pinned-library-grip:active{cursor:grabbing}
+.pinned-library-row.dragging{opacity:.55}
+.pinned-library-row.drop-before:before,.pinned-library-row.drop-after:after{content:'';height:2px;background:var(--accent);position:absolute;left:7px;right:5px;border-radius:2px;pointer-events:none}
+.pinned-library-row.drop-before:before{top:-2px}.pinned-library-row.drop-after:after{bottom:-2px}
+.pinned-library[aria-busy=true] .pinned-library-grip{cursor:wait;opacity:.5}
+.pinned-instructions{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}

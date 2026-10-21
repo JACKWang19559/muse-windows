@@ -122,3 +122,77 @@ test('invalid pin records in both local state and its recovery backup are reject
  const bytes=[store.statePath,store.backupPath].map(f=>fs.readFileSync(f));assert.throws(()=>new Store(data),/自动备份均无法读取/);
  assert.deepEqual([store.statePath,store.backupPath].map(f=>fs.readFileSync(f)),bytes);assert.deepEqual(fs.readdirSync(data).filter(n=>n.includes('.corrupt-')),[]);
 });
+
+const scopeOrder=(store,workspaceId)=>store.snapshot().libraryPins.filter(p=>p.workspaceId===workspaceId);
+const move=(store,item,edge,anchor,expectedOrder=scopeOrder(store,item.workspaceId))=>store.moveLibraryPin({item,position:{[edge]:anchor},expectedOrder});
+
+test('relative pin movement changes only its scope slots across file and app kinds and preserves all content and references',async t=>{
+ const {store}=fixture(t),ws=store.createWorkspace({name:'reorder scope'}),other=store.createWorkspace({name:'untouched scope'}),x=await items(store,ws.id),y=await items(store,ws.id),personal=await items(store),foreign=await items(store,other.id);
+ const chat=store.createChat({workspaceId:ws.id,title:'retained history'});store.appendMessage(chat.id,{role:'user',content:'SYNTHETIC_REORDER_DOES_NOT_EDIT_CHAT',attachmentIds:[x.file.id],activePanel:{kind:'artifact',artifactId:x.artifact.id,artifactName:x.artifact.name}});
+ const original=[personal.f,x.f,foreign.a,x.a,personal.a,y.f,foreign.f,y.a];for(const p of original)pin(store,p);
+ const before=retained(store),input={item:y.a,position:{before:x.f},expectedOrder:[x.f,x.a,y.f,y.a]},copy=structuredClone(input),result=store.moveLibraryPin(input);
+ const expected=[personal.f,y.a,foreign.a,x.f,personal.a,x.a,foreign.f,y.f];assert.deepEqual(store.snapshot().libraryPins,expected);assert.deepEqual(result,[y.a,x.f,x.a,y.f]);assert.deepEqual(input,copy);
+ result[0].id='caller-edited';assert.deepEqual(store.snapshot().libraryPins,expected);
+ const after=retained(store);assert.deepEqual({...after.state,libraryPins:before.state.libraryPins},before.state);assert.deepEqual(after.attachments,before.attachments);
+ assert.deepEqual(move(store,y.a,'after',x.a),[x.f,x.a,y.a,y.f]);assert.deepEqual(store.snapshot().libraryPins,[personal.f,x.f,foreign.a,x.a,personal.a,y.a,foreign.f,y.f]);
+ const scopedSlots=store.snapshot().libraryPins.map((p,i)=>p.workspaceId===ws.id?i:null).filter(i=>i!==null);assert.deepEqual(scopedSlots,[1,3,5,7]);
+ move(store,personal.a,'before',personal.f);assert.deepEqual(store.snapshot().libraryPins,[personal.a,x.f,foreign.a,x.a,personal.f,y.a,foreign.f,y.f]);
+});
+
+test('reorder compares the entire current scope order, rejecting omissions extras changed kinds and stale concurrent writes',async t=>{
+ const {store}=fixture(t),x=await items(store),y=await items(store);for(const p of[x.f,x.a,y.f])pin(store,p);const expected=scopeOrder(store,null);
+ for(const order of [[x.f,x.a],expected.slice().reverse(),[x.f,x.a,y.f,y.a],[x.f,{...x.a,kind:'file'},y.f]]){const before=retained(store);assert.throws(()=>move(store,x.f,'after',x.a,order),/顺序已变化/);unchanged(store,before);}
+ pin(store,y.a);let before=retained(store);assert.throws(()=>move(store,x.f,'after',x.a,expected),/顺序已变化/);unchanged(store,before);
+ const current=scopeOrder(store,null);move(store,y.a,'before',x.f,current);before=retained(store);assert.throws(()=>move(store,x.a,'after',y.f,current),/顺序已变化/);unchanged(store,before);
+ pin(store,y.a,false,true);before=retained(store);assert.throws(()=>move(store,x.f,'after',x.a,[y.a,x.f,x.a,y.f]),/顺序已变化/);unchanged(store,before);
+});
+
+test('reorder requires live pinned distinct item and anchor in exactly the same workspace',async t=>{
+ const {store}=fixture(t),ws=store.createWorkspace({name:'scope'}),x=await items(store,ws.id),personal=await items(store),y=await items(store,ws.id);for(const p of[x.f,x.a,personal.a])pin(store,p);
+ const invalid=[{item:x.f,position:{before:x.f},expectedOrder:[x.f,x.a]},{item:x.f,position:{after:personal.a},expectedOrder:[x.f,x.a]},{item:{...x.f,workspaceId:null},position:{before:personal.a},expectedOrder:[personal.a]},{item:y.f,position:{before:x.f},expectedOrder:[x.f,x.a]},{item:x.f,position:{before:y.a},expectedOrder:[x.f,x.a]},{item:{...x.f,kind:'artifact'},position:{before:x.a},expectedOrder:[x.f,x.a]},{item:x.f,position:{before:{kind:'artifact',id:'missing',workspaceId:ws.id}},expectedOrder:[x.f,x.a]}];
+ for(const input of invalid){const before=retained(store);assert.throws(()=>store.moveLibraryPin(input));unchanged(store,before);}
+ store.removeFile(x.file.id);let before=retained(store);assert.throws(()=>move(store,x.f,'before',x.a,[x.f,x.a]),/不存在/);unchanged(store,before);
+ store.deleteArtifact(x.artifact.id);before=retained(store);assert.throws(()=>move(store,y.f,'after',x.a,[]),/不存在/);unchanged(store,before);
+});
+
+test('workspace deletion invalidates captured reorder tuples and permits a fresh personal-scope order only',async t=>{
+ const {store}=fixture(t),ws=store.createWorkspace({name:'removed scope'}),x=await items(store,ws.id),personal=await items(store);for(const p of[x.f,personal.a,x.a])pin(store,p);
+ const old=[x.f,x.a];store.deleteWorkspace(ws.id);const before=retained(store);assert.throws(()=>move(store,x.a,'before',x.f,old),/空间/);unchanged(store,before);
+ const f={...x.f,workspaceId:null},a={...x.a,workspaceId:null};assert.deepEqual(move(store,a,'before',f),[a,f,personal.a]);
+});
+
+test('reorder strict envelopes positions tuples and order arrays reject accessors proxies symbols and inherited data without invoking hooks',async t=>{
+ const {store}=fixture(t),x=await items(store);pin(store,x.f);pin(store,x.a);const good={item:x.f,position:{after:x.a},expectedOrder:[x.f,x.a]},before=retained(store);let accesses=0;
+ const getter=(object,key)=>{const result={...object};Object.defineProperty(result,key,{enumerable:true,get(){accesses++;return object[key];}});return result;};
+ const proxy=value=>new Proxy(value,{ownKeys(){accesses++;throw Error('PROXY_MUST_NOT_BE_INSPECTED');},get(){accesses++;throw Error('PROXY_MUST_NOT_BE_READ');}});
+ const arrayGetter=[x.f,x.a];Object.defineProperty(arrayGetter,'0',{enumerable:true,get(){accesses++;return x.f;}});const extra=[x.f,x.a];extra.extra=true;const oversize=[];oversize.length=20001;
+ const inputs=[null,[],Object.assign(Object.create(null),good),Object.assign(Object.create({item:x.f}),{position:good.position,expectedOrder:good.expectedOrder}),getter(good,'item'),getter(good,'position'),getter(good,'expectedOrder'),proxy(good),{...good,extra:true},{...good,[Symbol('hidden')]:true},{...good,item:getter(x.f,'id')},{...good,item:proxy(x.f)},{...good,position:null},{...good,position:{}},{...good,position:{before:x.a,after:x.a}},{...good,position:{before:x.a,extra:true}},{...good,position:getter(good.position,'after')},{...good,position:proxy(good.position)},{...good,position:{after:getter(x.a,'id')}},{...good,position:{after:proxy(x.a)}},{...good,position:Object.assign(Object.create(null),good.position)},{...good,expectedOrder:undefined},{...good,expectedOrder:null},{...good,expectedOrder:Array(2)},{...good,expectedOrder:arrayGetter},{...good,expectedOrder:extra},{...good,expectedOrder:oversize},{...good,expectedOrder:proxy(good.expectedOrder)},{...good,expectedOrder:[x.f,getter(x.a,'workspaceId')]},{...good,expectedOrder:[x.f,proxy(x.a)]},{...good,expectedOrder:[x.f,x.f]}];
+ const hidden={...good};Object.defineProperty(hidden,'extra',{value:true,enumerable:false});inputs.push(hidden);
+ for(const input of inputs){assert.throws(()=>store.moveLibraryPin(input));unchanged(store,before);}
+ assert.equal(accesses,0);
+});
+
+test('reorder rejects an order containing another workspace even when identifiers otherwise match',async t=>{
+ const {store}=fixture(t),ws=store.createWorkspace({name:'specific scope'}),x=await items(store,ws.id),personal=await items(store);for(const p of[x.f,personal.f,x.a])pin(store,p);const before=retained(store);
+ assert.throws(()=>move(store,x.a,'before',x.f,[x.f,personal.f,x.a]),/其他空间/);unchanged(store,before);
+ assert.throws(()=>move(store,x.a,'before',x.f,[{...x.f,workspaceId:null},x.a]),/其他空间/);unchanged(store,before);
+});
+
+test('real persistence path failure does not acknowledge or publish a reordered state and a later retry persists it',async t=>{
+ const {store,data}=fixture(t),x=await items(store);pin(store,x.f);pin(store,x.a);const before=retained(store),open=fs.openSync;let failures=0;
+ fs.openSync=function(filename,...args){if(typeof filename==='string'&&path.dirname(filename)===store.dataDir&&/^\.state-.*\.tmp$/.test(path.basename(filename))){failures++;throw Object.assign(Error('SYNTHETIC_DISK_OPEN_FAILURE'),{code:'EIO'});}return open.call(this,filename,...args);};
+ try{assert.throws(()=>move(store,x.a,'before',x.f),/无法保存本地数据/);}finally{fs.openSync=open;}
+ assert.equal(failures,1);unchanged(store,before);assert.deepEqual(new Store(data).snapshot().libraryPins,[x.f,x.a]);assert.deepEqual(fs.readdirSync(data).filter(name=>/^\.(state|backup)-/.test(name)),[]);
+ assert.deepEqual(move(store,x.a,'before',x.f),[x.a,x.f]);assert.deepEqual(new Store(data).snapshot().libraryPins,[x.a,x.f]);
+});
+
+test('relative order survives restart export and ID-remapped import without changing local pins or imported document bytes',async t=>{
+ const a=fixture(t),b=fixture(t),ws=a.store.createWorkspace({name:'reordered imported scope'}),x=await items(a.store,ws.id),y=await items(a.store,ws.id),personal=await items(a.store),local=await items(b.store);
+ for(const p of[x.f,personal.f,x.a,y.f,personal.a,y.a])pin(a.store,p);move(a.store,y.a,'before',x.f);move(a.store,x.a,'after',y.f);pin(b.store,local.a);pin(b.store,local.f);
+ const order=a.store.snapshot().libraryPins;assert.deepEqual(order,[y.a,personal.f,x.f,y.f,personal.a,x.a]);assert.deepEqual(new Store(a.data).snapshot().libraryPins,order);
+ const backup=a.store.exportData(),copy=structuredClone(backup);assert.deepEqual(backup.libraryPins,order);await b.store.importData(backup);assert.deepEqual(backup,copy);
+ const snapshot=b.store.snapshot(),imported=snapshot.libraryPins.slice(2),newWs=snapshot.workspaces.find(w=>w.name===ws.name),files=snapshot.files.filter(f=>f.id!==local.file.id),artifacts=snapshot.artifacts.filter(v=>v.id!==local.artifact.id),fileIds=new Map(backup.files.map((file,i)=>[file.id,files[i].id])),artifactIds=new Map(backup.artifacts.map((artifact,i)=>[artifact.id,artifacts[i].id]));
+ const expected=order.map(p=>({kind:p.kind,id:(p.kind==='file'?fileIds:artifactIds).get(p.id),workspaceId:p.workspaceId===null?null:newWs.id}));assert.deepEqual(imported,expected);assert.deepEqual(snapshot.libraryPins.slice(0,2),[local.a,local.f]);
+ for(const p of imported){assert.deepEqual(b.store.libraryItem(p),p);if(p.kind==='file')assert.equal(b.store.readFile(p.id).text,'synthetic original bytes');}
+ assert.deepEqual(new Store(b.data).snapshot().libraryPins,[local.a,local.f,...expected]);
+});

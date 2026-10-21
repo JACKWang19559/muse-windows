@@ -1,0 +1,88 @@
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
+module.exports=async({app,window,store,operations,folder,page,wait,check,fill})=>{
+ assert.equal(path.resolve(app.getPath('userData')).toLowerCase(),path.resolve(folder,'data').toLowerCase());
+ assert.equal(path.resolve(store.dataDir).toLowerCase(),path.resolve(folder,'data').toLowerCase());
+ const bounds=window.getBounds(),visible=window.isVisible(),focusable=window.isFocusable(),debug=window.webContents.debugger,attached=!debug.isAttached();
+ const originalMove=operations.moveLibraryPin,originalSend=operations.sendMessage,owned={workspaces:[],files:[],apps:[],chats:[]},calls=[],mouseInputs=[];
+ let gate=null,release=null,mode='',sends=0,mouseDown=false,failed=false;
+ if(attached)debug.attach('1.3');
+ const pause=ms=>new Promise(r=>setTimeout(r,ms));
+ const item=(kind,x)=>({kind,id:x.id,workspaceId:x.workspaceId});
+ const row=x=>'[data-pinned-id="'+x.id+'"]';
+ const grip=x=>row(x)+' [data-testid=pinned-library-grip]';
+ const point=async(selector,text,edge)=>page(({selector,text,edge})=>{
+  const e=[...document.querySelectorAll(selector)].find(e=>(text==null||e.textContent.includes(text))&&e.getBoundingClientRect().width>0);if(!e)throw Error('Missing pinned-library control '+selector);
+  e.scrollIntoView({block:'nearest'});const r=e.getBoundingClientRect(),x=r.x+r.width/2,y=edge==='before'?r.y+5:edge==='after'?r.bottom-5:r.y+r.height/2;
+  if(!e.contains(document.elementFromPoint(x,y)))throw Error('Covered pinned-library control '+selector);return{x,y};
+ },{selector,text,edge});
+ const mouse=async(type,p)=>{const down=type==='mousePressed'||type==='mouseMoved'&&mouseDown,input={type,...p,button:type==='mouseMoved'&&!down?'none':'left',buttons:down?1:0,force:down?.5:0,pointerType:'mouse',...type==='mouseMoved'?{}:{clickCount:1}};mouseInputs.push(input);await debug.sendCommand('Input.dispatchMouseEvent',input);mouseDown=down;await pause(30);};
+ const click=async(selector,text)=>{const p=await point(selector,text);await mouse('mouseMoved',p);await mouse('mousePressed',p);await mouse('mouseReleased',p);await pause(50);};
+ const key=async(key,code,vk,modifiers=0)=>{await debug.sendCommand('Input.dispatchKeyEvent',{type:'keyDown',key,code,windowsVirtualKeyCode:vk,modifiers});if(key==='Enter')await debug.sendCommand('Input.dispatchKeyEvent',{type:'char',key,code,windowsVirtualKeyCode:vk,text:'\r',unmodifiedText:'\r',modifiers});await debug.sendCommand('Input.dispatchKeyEvent',{type:'keyUp',key,code,windowsVirtualKeyCode:vk,modifiers});await pause(60);};
+ const personalByKeyboard=async()=>{for(let i=0;i<80;i++){if(await page(()=>document.activeElement?.matches('.personal-space')))return key('Enter','Enter',13);await key('Tab','Tab',9,8);}throw Error('Personal workspace button was not reachable by keyboard');};
+ const sidebar=async()=>{if(await page(()=>document.querySelector('.sidebar.closed')!=null))await click('[aria-label="展开侧栏"]');await page(async()=>{const sidebar=document.querySelector('.sidebar');await Promise.all(sidebar.getAnimations({subtree:true}).map(animation=>animation.finished.catch(()=>{})));await new Promise(requestAnimationFrame);});await wait(()=>{const sidebar=document.querySelector('.sidebar'),r=sidebar?.getBoundingClientRect();return sidebar&&!sidebar.classList.contains('closed')&&r.left>=-.1&&r.width>=240;});};
+ const beginDrag=async(source,target,side)=>{const a=await point(grip(source)),b=await point(row(target),null,side);await mouse('mouseMoved',a);await mouse('mousePressed',a);for(let i=1;i<=6;i++)await mouse('mouseMoved',{x:a.x+(b.x-a.x)*i/6,y:a.y+(b.y-a.y)*i/6});await wait(({source,target,side})=>document.querySelector('[data-pinned-id="'+source+'"]')?.classList.contains('dragging')&&document.querySelector('[data-pinned-id="'+target+'"]')?.classList.contains('drop-'+side),{source:source.id,target:target.id,side});return b;};
+ const drag=async(source,target,side)=>{const p=await beginDrag(source,target,side);await mouse('mouseReleased',p);};
+ const actual=scope=>store.state.libraryPins.filter(x=>x.workspaceId===scope).map(x=>x.id);
+ const displayed=()=>page(()=>[...document.querySelectorAll('[data-pinned-id]')].map(e=>e.dataset.pinnedId));
+ const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+ const settled=async expected=>wait(expected=>{const group=document.querySelector('[data-testid=pinned-library]');return group?.getAttribute('aria-busy')==='false'&&JSON.stringify([...group.querySelectorAll('[data-pinned-id]')].map(e=>e.dataset.pinnedId))===JSON.stringify(expected);},expected);
+ operations.moveLibraryPin=async input=>{calls.push(structuredClone(input));if(mode==='delay')await gate;if(mode==='fail')throw Error('SYNTHETIC_PIN_ORDER_FAILURE');const result=originalMove(input);if(mode==='delayAck')await gate;return result;};
+ operations.sendMessage=input=>{sends++;return originalSend(input);};
+ try{
+  window.setIgnoreMouseEvents(true);window.setFocusable(false);window.setSize(1440,960);window.showInactive();await pause(100);
+  await page(()=>{window.__pinEvents39=[];window.__pinEventHandler39=e=>{window.__pinEvents39.push({type:e.type,trusted:e.isTrusted,id:e.pointerId??null,x:e.clientX??null,y:e.clientY??null,target:e.target?.closest?.('[data-pinned-id]')?.dataset.pinnedId??null,button:e.button??null,buttons:e.buttons??null,pressure:e.pressure??null,pointerType:e.pointerType??null,captured:e.target?.hasPointerCapture?.(e.pointerId)??false,documentFocused:document.hasFocus(),visibility:document.visibilityState});};for(const type of ['pointerdown','pointermove','pointerup','pointercancel','gotpointercapture','lostpointercapture','blur'])window.addEventListener(type,window.__pinEventHandler39,true);});
+  const w=await operations.createWorkspace({name:'PIN_ORDER_SCOPE_39'}),other=await operations.createWorkspace({name:'PIN_ORDER_OTHER_39'});owned.workspaces.push(w.id,other.id);
+  const file=async(name,scope=w.id)=>{const x=(await operations.createTextFile({workspaceId:scope,name,content:'PINNED_FILE_'+name})).file;owned.files.push(x.id);return x;};
+  const a=await file('Pin Alpha.txt'),b=await operations.createArtifact({workspaceId:w.id,name:'Pin Beta App',runtime:'html'}),c=await file('Pin Gamma.txt'),d=await file('Pin Delta.txt'),foreign=await file('Pin Foreign.txt',other.id),personal=await file('Pin Personal.txt',null);owned.apps.push(b.id);
+  for(const tuple of[item('file',a),item('file',foreign),item('artifact',b),item('file',personal),item('file',c),item('file',d)])await operations.setLibraryPin({...tuple,pinned:true,expectedPinned:false});
+  const chat=await operations.createChat({workspaceId:w.id,title:'PIN_ORDER_CHAT_39'});owned.chats.push(chat.id);
+  await sidebar();await click('.sidebar-chat-main',chat.title);await sidebar();await fill('composer-input','PIN_ORDER_UNSENT_DRAFT_39');
+  await settled([a.id,b.id,c.id,d.id]);const foreignSlots=store.state.libraryPins.map((p,i)=>({p:{...p},i})).filter(x=>x.p.workspaceId!==w.id);
+  check('Sidebar pins show the current workspace files and apps in persistent order',same(await displayed(),[a.id,b.id,c.id,d.id])&&!await page(id=>!!document.querySelector('[data-pinned-id="'+id+'"]'),foreign.id));
+  mode='delay';gate=new Promise(r=>{release=r;});await drag(d,a,'before');await wait(()=>document.querySelector('[data-testid=pinned-library]')?.getAttribute('aria-busy')==='true');
+  check('Trusted pointer drag sends a before anchor and full captured order through real IPC',calls.length===1&&calls[0].item.id===d.id&&calls[0].position.before.id===a.id&&same(calls[0].expectedOrder.map(x=>x.id),[a.id,b.id,c.id,d.id]));
+  await key('ArrowUp','ArrowUp',38);
+  check('Pending reorder keeps the acknowledged order and blocks a second keyboard move',calls.length===1&&same(actual(w.id),[a.id,b.id,c.id,d.id])&&same(await displayed(),[a.id,b.id,c.id,d.id])&&await page(()=>[...document.querySelectorAll('[data-testid=pinned-library-grip]')].every(e=>e.getAttribute('aria-disabled')==='true')));
+  mode='';release();release=null;await settled([d.id,a.id,b.id,c.id]);
+  check('Before reorder persists without moving another workspace or personal pin slots',same(actual(w.id),[d.id,a.id,b.id,c.id])&&foreignSlots.every(x=>same(store.state.libraryPins[x.i],x.p)));
+  await drag(d,c,'after');await settled([a.id,b.id,c.id,d.id]);check('Trusted after drop moves to the last pinned position',calls.at(-1).position.after.id===c.id&&same(actual(w.id),[a.id,b.id,c.id,d.id]));
+  await click(grip(d));await key('ArrowUp','ArrowUp',38);await settled([a.id,b.id,d.id,c.id]);check('Focused reorder handle supports keyboard Up across file and app entries',same(actual(w.id),[a.id,b.id,d.id,c.id]));
+  await key('Home','Home',36);await settled([d.id,a.id,b.id,c.id]);await key('End','End',35);await settled([a.id,b.id,c.id,d.id]);check('Keyboard Home and End use real relative moves with stable item focus',await page(id=>document.activeElement?.closest('[data-pinned-id]')?.dataset.pinnedId===id,d.id));
+  let before=calls.length,p=await beginDrag(d,a,'before');await key('Escape','Escape',27);await mouse('mouseReleased',p);check('Escape cancels pointer ordering without a host request',calls.length===before&&same(actual(w.id),[a.id,b.id,c.id,d.id]));
+  p=await beginDrag(d,a,'before');const outside=await point('.sidebar-group-heading');await mouse('mouseMoved',outside);await mouse('mouseReleased',outside);check('Dropping outside the pinned list leaves the order unchanged',calls.length===before&&same(actual(w.id),[a.id,b.id,c.id,d.id]));
+  mode='fail';await drag(d,a,'before');await settled([a.id,b.id,c.id,d.id]);mode='';check('Rejected order reports failure without optimistic persistence or automatic retry',calls.length===before+1&&same(actual(w.id),[a.id,b.id,c.id,d.id])&&await page(()=>document.body.textContent.includes('SYNTHETIC_PIN_ORDER_FAILURE')));
+  await click('[aria-label="关闭提示"]');
+  await page(()=>{window.__pinCapture39=Element.prototype.setPointerCapture;Element.prototype.setPointerCapture=function(id){if(this.matches('[data-testid=pinned-library-grip]'))throw Error('SYNTHETIC_POINTER_CAPTURE_FAILURE');return window.__pinCapture39.call(this,id);};});
+  await drag(d,a,'before');await settled([d.id,a.id,b.id,c.id]);await page(()=>{Element.prototype.setPointerCapture=window.__pinCapture39;delete window.__pinCapture39;});check('Real pointer drag still completes when capture is deliberately unavailable',same(actual(w.id),[d.id,a.id,b.id,c.id]));
+  const stale=store.state.libraryPins.filter(x=>x.workspaceId===w.id).map(x=>({...x}));before=calls.length;p=await beginDrag(c,d,'before');await operations.setLibraryPin({...item('file',d),pinned:false,expectedPinned:true});await settled([a.id,b.id,c.id]);await mouse('mouseReleased',p);
+  check('A live pin-list change cancels an old gesture before it can dispatch',calls.length===before&&same(actual(w.id),[a.id,b.id,c.id]));
+  const rejected=await page(async input=>{try{await window.muse.moveLibraryPin(input);return false;}catch{return true;}},{item:item('file',c),position:{before:item('file',a)},expectedOrder:stale});
+  check('Host IPC independently rejects a stale full-order snapshot',rejected&&same(actual(w.id),[a.id,b.id,c.id]));
+  await operations.setLibraryPin({...item('file',d),pinned:true,expectedPinned:false});await settled([a.id,b.id,c.id,d.id]);before=calls.length;p=await beginDrag(d,a,'before');await personalByKeyboard();await mouse('mouseReleased',p);await sidebar();await settled([personal.id]);
+  check('Changing workspace context during a gesture cancels it and displays only the new scope',calls.length===before&&same(actual(w.id),[a.id,b.id,c.id,d.id]));
+  await click('.sidebar-chat-main',chat.title);await sidebar();await settled([a.id,b.id,c.id,d.id]);
+  mode='delay';gate=new Promise(r=>{release=r;});await drag(d,a,'before');await wait(()=>document.querySelector('[data-testid=pinned-library]')?.getAttribute('aria-busy')==='true');await click('[data-testid=new-chat]');await sidebar();await settled([personal.id]);mode='';release();release=null;await wait(()=>document.querySelector('[data-testid=pinned-library]')?.getAttribute('aria-busy')==='false');await pause(120);
+  check('An acknowledged request finishing after navigation changes its captured scope without navigating back',same(actual(w.id),[d.id,a.id,b.id,c.id])&&same(await displayed(),[personal.id])&&same(actual(null),[personal.id]));
+  await click('.sidebar-chat-main',chat.title);await sidebar();await settled([d.id,a.id,b.id,c.id]);
+  mode='delayAck';gate=new Promise(r=>{release=r;});await drag(c,d,'before');await wait(ids=>document.querySelector('[data-testid=pinned-library]')?.getAttribute('aria-busy')==='true'&&JSON.stringify([...document.querySelectorAll('[data-pinned-id]')].map(e=>e.dataset.pinnedId))===JSON.stringify(ids),[c.id,d.id,a.id,b.id]);
+  const late=await file('Pin Late Acknowledgement.txt');await operations.setLibraryPin({...item('file',late),pinned:true,expectedPinned:false});await wait(ids=>JSON.stringify([...document.querySelectorAll('[data-pinned-id]')].map(e=>e.dataset.pinnedId))===JSON.stringify(ids),[c.id,d.id,a.id,b.id,late.id]);before=calls.length;mode='';release();release=null;await settled([c.id,d.id,a.id,b.id,late.id]);
+  check('A delayed committed reply cannot replace a newer subscribed pin list or file snapshot',calls.length===before&&same(actual(w.id),[c.id,d.id,a.id,b.id,late.id])&&await page(title=>document.querySelector('.content-heading h1')?.textContent===title,chat.title));
+  await operations.setLibraryPin({...item('file',late),pinned:false,expectedPinned:true});await settled([c.id,d.id,a.id,b.id]);await click(row(a)+' [data-testid=pinned-library-open]');await wait(()=>!!document.querySelector('[data-testid=file-preview]')&&!document.querySelector('.loading-inline'));
+  check('Pinned file opens through the existing file preview while preserving the unsent chat draft',await page(()=>document.querySelector('[data-testid=composer-input]')?.value==='PIN_ORDER_UNSENT_DRAFT_39'&&!!document.querySelector('[data-testid=file-preview]')));
+  await click('[aria-label="关闭文件预览"]');await sidebar();await click(row(b)+' [data-testid=pinned-library-open]');await wait(name=>document.querySelector('.artifact-workbench h3')?.textContent===name,b.name);check('Pinned app opens through the existing app workbench',await page(name=>document.querySelector('.artifact-workbench h3')?.textContent===name,b.name));await click('[aria-label="关闭本地应用"]');await sidebar();
+  check('The saved pin order agrees with the actual on-disk synthetic profile',same(JSON.parse(fs.readFileSync(store.statePath,'utf8')).libraryPins,store.state.libraryPins));
+  fs.writeFileSync(path.join(folder,'pinned-library-wide.png'),(await window.webContents.capturePage()).toPNG());window.setSize(960,860);await sidebar();await pause(100);check('Narrow sidebar keeps visible, reachable reorder handles',await page(()=>[...document.querySelectorAll('[data-testid=pinned-library-grip]')].every(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.left>=0&&r.right<=innerWidth;})));fs.writeFileSync(path.join(folder,'pinned-library-narrow.png'),(await window.webContents.capturePage()).toPNG());
+  check('Pin ordering and navigation never send a model request',sends===0);
+  fs.writeFileSync(path.join(folder,'pinned-library-observations.json'),JSON.stringify({schema:'muse-pinned-library-desktop-v1',requests:calls,automatic_send_calls:sends,accepted_scope_order:actual(w.id),mouse_inputs:mouseInputs,pointer_events:await page(()=>window.__pinEvents39??[]),input:'Trusted Chromium pointer/keyboard with native OS mouse and focus disabled for this test window; fixture text uses React input; explicit synthetic host rejection and pointer-capture failure.',original_or_real_provider_executed:false},null,2));
+ }catch(error){failed=true;fs.writeFileSync(path.join(folder,'pinned-library-failure.json'),JSON.stringify({error:error.stack,requests:calls,automatic_send_calls:sends,mouse_inputs:mouseInputs,pointer_events:await page(()=>window.__pinEvents39??[]).catch(()=>[]),window:{visible:window.isVisible(),focused:window.isFocused(),offscreen:window.webContents.isOffscreen()}},null,2));try{fs.writeFileSync(path.join(folder,'pinned-library-failure.png'),(await window.webContents.capturePage()).toPNG());}catch{}throw error;}
+ finally{
+  release?.();operations.moveLibraryPin=originalMove;operations.sendMessage=originalSend;
+  if(mouseDown)await mouse('mouseReleased',{x:5,y:5}).catch(()=>{});
+  await page(()=>{if(window.__pinCapture39){Element.prototype.setPointerCapture=window.__pinCapture39;delete window.__pinCapture39;}}).catch(()=>{});
+  await page(()=>{for(const type of ['pointerdown','pointermove','pointerup','pointercancel','gotpointercapture','lostpointercapture','blur'])window.removeEventListener(type,window.__pinEventHandler39,true);delete window.__pinEventHandler39;delete window.__pinEvents39;}).catch(()=>{});
+  for(const id of owned.chats)try{await operations.deleteChat({id});}catch{}for(const id of owned.apps)try{await operations.deleteArtifact({id});}catch{}for(const id of owned.files)try{await operations.removeFile({id});}catch{}for(const id of owned.workspaces)try{await operations.deleteWorkspace({id});}catch{}
+  await page(()=>document.querySelector('[data-testid=new-chat]')?.click()).catch(()=>{});
+  if(attached&&debug.isAttached())debug.detach();window.setBounds(bounds);window.setIgnoreMouseEvents(false);window.setFocusable(focusable);if(!visible&&!failed)window.hide();
+ }
+};

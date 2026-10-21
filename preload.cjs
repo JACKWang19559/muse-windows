@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 const call = operation => payload => ipcRenderer.invoke('muse:invoke', operation, payload);
 const api = {};
 api.setLibraryPin = call('setLibraryPin');
+api.moveLibraryPin = call('moveLibraryPin');
 api.removeLibraryItem = call('removeLibraryItem');
 api.exportFile = call('exportFile');
 api.renameFile = call('renameFile');
