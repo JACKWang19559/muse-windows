@@ -1701,7 +1701,7 @@ test('stopping a stream persists partial output once, drops late deltas and perm
   assert.equal(saved.messages.at(-1).content, 'partial');
   assert.equal(host.events.filter(e => e.type === 'chat-cancelled').length, 1);
   assert.equal(host.events.filter(e => e.type === 'chat-complete').length, 0);
-  assert.equal(host.events.filter(e => e.type === 'chat-delta').length, 1);
+  assert.deepEqual(host.events.filter(e => e.type === 'chat-delta' && e.content).map(e => e.content), ['partial']);
   host.provider.streamCompletion = async () => ({ content: 'retried' });
   await host.operations.retryMessage({ chatId: chat.id });
   await runQueued(host);

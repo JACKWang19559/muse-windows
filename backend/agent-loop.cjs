@@ -14,7 +14,16 @@ const regexpEscape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 function secretFilter(apiKey) {
   const secret = typeof apiKey === 'string' ? apiKey : '';
-  const replacement = secret && '[已隐藏密钥]'.includes(secret) ? '***' : '[已隐藏密钥]';
+  let replacement = secret && '[已隐藏密钥]'.includes(secret) ? '***' : '[已隐藏密钥]';
+  if (secret && (secret.includes(replacement[0]) || secret.includes(replacement.at(-1)))) {
+    // A replacement boundary must not reassemble the credential with adjacent
+    // text. This non-ASCII guard is absent from every literal/escaped key form.
+    const characters = new Set(secret.split(''));
+    let code = 0x2063;
+    while (characters.has(String.fromCharCode(code))) code++;
+    const guard = String.fromCharCode(code);
+    replacement = guard + replacement + guard;
+  }
   const encodings = secret.split('').map(character => {
     const forms = [{ text: character, hex: false }, { text: `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`, hex: true }];
     const short = { '"': '"', '\\': '\\', '/': '/', '\b': 'b', '\f': 'f', '\n': 'n', '\r': 'r', '\t': 't' }[character];
@@ -32,11 +41,12 @@ function secretFilter(apiKey) {
   }).join(''), 'g') : null;
   const contains = value => { if (!pattern || typeof value !== 'string') return false; pattern.lastIndex = 0; return pattern.test(value); };
   const text = value => { const source = String(value ?? '').replace(/\0/g, '\uFFFD'); if (!pattern) return source; pattern.lastIndex = 0; return source.replace(pattern, replacement); };
-  const possiblePrefix = suffix => {
+  const possiblePrefix = (suffix, budget) => {
     let offsets = new Set([0]);
     for (const forms of encodings) {
       const next = new Set();
       for (const offset of offsets) for (const form of forms) {
+        if (--budget.remaining < 0) return null;
         const part = suffix.slice(offset, offset + form.text.length), expected = form.text.slice(0, part.length);
         if ((form.hex ? part.toLowerCase() === expected.toLowerCase() : part === expected)) {
           if (offset + part.length === suffix.length) return true;
@@ -48,18 +58,26 @@ function secretFilter(apiKey) {
     }
     return false;
   };
-  const partial = value => {
-    const source = text(value);
-    if (!secret) return source;
+  const safePrefixLength = source => {
+    if (!secret) return source.length;
     let end = source.length;
     // A stopped stream may finish with a literal key prefix or half of a JSON
     // escape. Discard only that ambiguous suffix; ordinary short text survives.
     const escape = /(?:\\u[0-9a-fA-F]{0,3}|\\)$/.exec(source);
     if (escape) end = escape.index;
-    for (let start = Math.max(0, source.length - secret.length * 6); start < end; start++) if ((source[start] === secret[0] || source[start] === '\\') && possiblePrefix(source.slice(start))) { end = start; break; }
-    return source.slice(0, end);
+    const budget = { remaining: 65536 };
+    for (let start = Math.max(0, source.length - secret.length * 6); start < end; start++) {
+      if (source[start] !== secret[0] && source[start] !== '\\') continue;
+      const matches = possiblePrefix(source.slice(start), budget);
+      // Extremely repetitive credentials can make overlapping prefixes costly.
+      // A full maximum encoded-key window is a conservative bounded fallback.
+      if (matches === null) { end = Math.min(end, Math.max(0, source.length - secret.length * 6)); break; }
+      if (matches) { end = start; break; }
+    }
+    return end;
   };
-  return { contains, text, partial, holdback: secret.length * 6 };
+  const partial = value => { const source = text(value); return source.slice(0, safePrefixLength(source)); };
+  return { contains, text, partial, safePrefixLength };
 }
 
 function safeJson(value, filter, budget = { nodes: 50000 }, depth = 0, seen = new Set()) {
@@ -192,7 +210,9 @@ async function runAgentConversation({ provider, settings, apiKey = '', messages,
       let active = true, pending = '';
       const publish = (text, final = false) => {
         pending = filter.text(pending + text);
-        const count = final ? pending.length : Math.max(0, pending.length - filter.holdback);
+        // Release safe text now; keep only a suffix that could still become a
+        // literal or JSON-escaped credential when the next delta arrives.
+        const count = final ? pending.length : filter.safePrefixLength(pending);
         if (count) { const delta = pending.slice(0, count); pending = pending.slice(count); content += delta; if (content.length > MAX_CONTENT_CHARS) throw failure('content_budget', '模型文字超出本次对话的容量限制。'); queueText({ delta, content }); }
       };
       releasePending = () => {

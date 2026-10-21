@@ -180,7 +180,10 @@ test('page failures are isolated and a real retry performs another render withou
 test('a render that never settles or honours cancel terminates its worker before releasing the canvas', async () => {
   const f = fixture({ manualRender: true, ignoreCancel: true, sessionOptions: { renderTimeout: 5, cancelTimeout: 5, destroyTimeout: 5 } });
   await f.session.load(file); const canvas = {}; f.session.attachPage(1, canvas);
-  await new Promise(resolve => setTimeout(resolve, 35));
+  // Cancellation schedules a second timeout after the render timeout. Under
+  // parallel load a fixed sleep can wake between those two event-loop turns.
+  const deadline = Date.now() + 2000;
+  while ((!f.workers[0].destroyed || f.views.at(-1).status !== 'error') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
   assert.equal(f.workers[0].destroyed, true); assert.equal(canvas.width, 0); assert.equal(canvas.height, 0);
   assert.equal(f.views.at(-1).status, 'error'); assert.match(f.views.at(-1).error, /停止/);
   const count = f.views.length; f.tasks[0].pending.resolve(); await tick(); assert.equal(f.views.length, count);

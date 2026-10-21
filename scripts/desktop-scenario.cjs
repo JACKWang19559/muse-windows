@@ -138,6 +138,15 @@ module.exports = async ({ app, window, store, operations, snapshot }) => {
     await page(input=>window.muse.retryMessage(input), {chatId:chat.id});
     const retried = await wait(async chatId=>{const s=await window.muse.bootstrap();const c=s.chats.find(x=>x.id===chatId);return c?.messages.at(-1)?.status==='complete'?c:false;},chat.id);
     check('Retry replaces the last assistant response', retried.messages.length===2);
+    await page(input=>window.muse.sendMessage(input),{chatId:chat.id,content:'WINDOWS_STREAM_SHORT35'});
+    const shortStream=await wait(async chatId=>{
+      const state=await window.muse.bootstrap(),message=state.chats.find(item=>item.id===chatId)?.messages.at(-1);
+      return message?.status==='streaming'&&message.content==='短回复应当立即可见'&&document.body.textContent.includes(message.content)?message:false;
+    },chat.id,5000);
+    check('A short keyed reply renders while its actual HTTP response is still open',shortStream.status==='streaming'&&shortStream.content==='短回复应当立即可见');
+    await page(input=>window.muse.stopGeneration(input),{chatId:chat.id});
+    const shortStopped=await wait(async chatId=>(await window.muse.bootstrap()).chats.find(item=>item.id===chatId)?.messages.at(-1)?.status==='cancelled',chat.id);
+    check('Stopping the held-open short response preserves its safe visible text',shortStopped&&store.getChat(chat.id).messages.at(-1).content==='短回复应当立即可见');
     await page(input=>window.muse.sendMessage(input),{chatId:chat.id,content:'取消生成测试'});
     await wait(async chatId=>(await window.muse.bootstrap()).chats.find(x=>x.id===chatId)?.messages.at(-1)?.status==='streaming',chat.id);
     await new Promise(r=>setTimeout(r,140));

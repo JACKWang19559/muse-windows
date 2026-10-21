@@ -50,6 +50,12 @@ const server = http.createServer(async (request, response) => {
   const parsed = JSON.parse(body); requests.push(parsed);
   response.writeHead(200, { 'content-type':'text/event-stream' });
   const user = parsed.messages.filter(x => x.role === 'user').at(-1)?.content || '';
+  if(user.includes('WINDOWS_STREAM_SHORT35')){
+    // One short delta, with the real HTTP response deliberately left open.
+    // The UI must display it before Stop; no further text can fill a buffer.
+    response.write('data: '+JSON.stringify({choices:[{delta:{content:'短回复应当立即可见'}}]})+'\n\n');
+    return;
+  }
   if(/CANCEL17_ACTIVE_[A-Z0-9_]+/.test(user)){
     // A real loopback HTTP stream stays active until the production request is
     // aborted. No host acceptance, cancellation receipt or renderer API is faked.
