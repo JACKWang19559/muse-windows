@@ -192,13 +192,31 @@ module.exports = async ({ app, window, store, operations, folder, page, wait, ch
     const capturedSeek = await seekDown(), releasedSeek = await seekUpOutside(capturedSeek);
     const resumedAt = (await snapshotVideo()).time;
     await wait(start => { const video = document.querySelector('[data-testid="image-lightbox"] video'); return video && !video.paused && (video.currentTime - start + video.duration) % video.duration > 0.08; }, resumedAt);
-    const routedOutside = releasedSeek.target === 'video-seek' && (releasedSeek.x < capturedSeek.controls.left || releasedSeek.x > capturedSeek.controls.right || releasedSeek.y < capturedSeek.controls.top || releasedSeek.y > capturedSeek.controls.bottom);
-    seekProofs.push({ kind: 'release-outside', down: capturedSeek.down, up: releasedSeek, effectiveCapture: routedOutside, evidence: 'Actual trusted pointerup outside the controls is routed back to the range; host hasPointerCapture is recorded independently.' });
-    check('Video trusted seek captures and pauses then resumes after release outside the controls', capturedSeek.down.trusted && capturedSeek.down.pausedAfterDispatch && routedOutside && releasedSeek.trusted && !releasedSeek.capturedAfterDispatch && !(await snapshotVideo()).paused);
+    const outsideControls = releasedSeek.x < capturedSeek.controls.left || releasedSeek.x > capturedSeek.controls.right || releasedSeek.y < capturedSeek.controls.top || releasedSeek.y > capturedSeek.controls.bottom;
+    seekProofs.push({ kind: 'release-outside', down: capturedSeek.down, up: releasedSeek, effectiveCapture: releasedSeek.target === 'video-seek', outsideControls, evidence: 'Actual trusted pointerup outside the controls ends the gesture and playback advances. Native range routing/capture is observed separately from the required playback outcome.' });
+    check('Video trusted seek pauses and resumes after release outside the controls with or without native capture', capturedSeek.down.trusted && capturedSeek.down.pausedAfterDispatch && outsideControls && releasedSeek.trusted && releasedSeek.pointerId === capturedSeek.down.pointerId && !releasedSeek.capturedAfterDispatch && !(await snapshotVideo()).paused);
     const replacedSeek = await seekDown(); await navigateTo(order, mp4.id); await pauseVideo();
     const replacementSource = (await snapshotVideo()).src, releasedOldSeek = await seekUpOutside(replacedSeek); await pause(140);
     seekProofs.push({ kind: 'source-replaced-before-release', down: replacedSeek.down, up: releasedOldSeek, replacementSource });
     check('Video ending an old trusted seek gesture cannot start the replacement source', replacedSeek.down.trusted && replacedSeek.down.pausedAfterDispatch && releasedOldSeek.trusted && releasedOldSeek.pointerId === replacedSeek.down.pointerId && releasedOldSeek.fileId === mp4.id && replacementSource !== replacedSeek.down.source && (await snapshotVideo()).paused);
+    await click('video-play-toggle'); await wait(() => !document.querySelector('[data-testid="image-lightbox"] video').paused);
+    const fallback = await page(() => {
+      const range = document.querySelector('[data-testid="video-seek"]'), capture = range.setPointerCapture; let failure = null;
+      range.setPointerCapture = function (id) { try { return capture.call(this, id); } catch (error) { failure = error.name; throw error; } };
+      try { range.dispatchEvent(new PointerEvent('pointerdown', { pointerId: 910038, pointerType: 'mouse', isPrimary: true, button: 0, bubbles: true })); }
+      finally { range.setPointerCapture = capture; }
+      window.dispatchEvent(new PointerEvent('pointerup', { pointerId: 910039 }));
+      return { synthetic: true, failure, paused: document.querySelector('[data-testid="image-lightbox"] video').paused };
+    });
+    await pause(100);
+    check('Video synthetic capture rejection pauses the source and ignores an unrelated pointer release', fallback.failure === 'NotFoundError' && fallback.paused && (await snapshotVideo()).paused);
+    await page(() => window.dispatchEvent(new PointerEvent('pointercancel', { pointerId: 910038 })));
+    await wait(() => !document.querySelector('[data-testid="image-lightbox"] video').paused);
+    const fallbackTime = (await snapshotVideo()).time;
+    await wait(start => { const video = document.querySelector('[data-testid="image-lightbox"] video'); return video && !video.paused && (video.currentTime - start + video.duration) % video.duration > 0.08; }, fallbackTime);
+    seekProofs.push({ kind: 'synthetic-capture-rejection', ...fallback, matching_window_cancel_resumed: true, native_input_claimed: false });
+    check('Video matching window cancellation resumes real playback after synthetic capture rejection', !(await snapshotVideo()).paused);
+    await pauseVideo();
     await screenshot('video-lightbox.png'); await closeViewer();
     await openFile(webm); check('Video new viewer mount restores the default muted state', (await snapshotVideo()).muted === true);
     await navigateTo(order, order[0]); const traversed = [order[0]];

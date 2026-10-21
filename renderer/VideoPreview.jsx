@@ -12,18 +12,23 @@ export default function VideoPreview({ file, variant = 'inline' }) {
   const element = useRef(null), resource = useRef(null), seeking = useRef(null);
   const [view, setView] = useState(null), [attempt, setAttempt] = useState(0);
   const key = videoKey(file);
+  const clearSeek = () => {
+    const gesture = seeking.current;
+    seeking.current = null;
+    gesture?.cleanup();
+  };
   useLayoutEffect(() => {
     const current = new VideoResource({ element: element.current, readFile: input => window.muse.readVideoFile(input), onChange: setView, variant });
     resource.current = current;
     return () => { current.dispose(); if (resource.current === current) resource.current = null; };
   }, [variant]);
-  useLayoutEffect(() => { seeking.current = null; void resource.current?.load(file); }, [key, variant, attempt]);
+  useLayoutEffect(() => { clearSeek(); void resource.current?.load(file); return clearSeek; }, [key, variant, attempt]);
   const current = view?.key === key ? view : { status: 'loading', url: null, decoded: false, paused: true, duration: 0, currentTime: 0 };
   const loading = current.status === 'loading' || current.status === 'prepared';
   const endSeek = event => {
     const gesture = seeking.current;
     if (!gesture || event.pointerId !== gesture.pointerId) return;
-    seeking.current = null;
+    clearSeek();
     // Up, cancellation and lost capture finish the same gesture exactly once.
     // Only its original source may resume; a replacement must remain untouched.
     if (gesture.resume && resource.current === gesture.controller && gesture.controller.epoch === gesture.epoch && gesture.controller.key === gesture.key) void gesture.controller.play();
@@ -38,8 +43,16 @@ export default function VideoPreview({ file, variant = 'inline' }) {
       <span className="video-time" data-testid="video-current-time">{timeText(current.currentTime)}</span>
       <input type="range" min="0" max={current.duration || 0} step="0.1" value={Math.min(current.currentTime || 0, current.duration || 0)} aria-label="视频播放进度" data-testid="video-seek" disabled={!current.decoded || !current.duration} onChange={event => resource.current?.seek(Number(event.target.value))} onPointerDown={event => {
         if (event.isPrimary === false || event.button !== 0 || !current.decoded || !resource.current) return;
-        const controller = resource.current;
-        seeking.current = { controller, epoch: controller.epoch, key, pointerId: event.pointerId, resume: !current.paused };
+        clearSeek();
+        const controller = resource.current, owner = event.currentTarget.ownerDocument.defaultView;
+        // Listen only while dragging. Native range controls can fail to retain
+        // capture; an outside release must still finish the original gesture.
+        seeking.current = { controller, epoch: controller.epoch, key, pointerId: event.pointerId, resume: !current.paused, cleanup: () => {
+          owner.removeEventListener('pointerup', endSeek, true);
+          owner.removeEventListener('pointercancel', endSeek, true);
+        } };
+        owner.addEventListener('pointerup', endSeek, true);
+        owner.addEventListener('pointercancel', endSeek, true);
         try { event.currentTarget.setPointerCapture(event.pointerId); } catch {}
         if (!current.paused) controller.pause();
       }} onPointerUp={endSeek} onPointerCancel={endSeek} onLostPointerCapture={endSeek} />
